@@ -267,7 +267,8 @@ def parse_args():
                         default="red,wooden,chair,stone,floor",
                         help="Comma-separated list of content words to visualise")
     parser.add_argument("--seed",       type=int, default=42)
-    parser.add_argument("--n_steps",    type=int, default=15)
+    parser.add_argument("--n_steps",    type=int, default=4,
+                        help="Denoising steps (default 4 for speed; paper uses 15)")
     parser.add_argument("--device",     type=str, default="cuda")
     parser.add_argument("--cpu_offload", action="store_true")
     parser.add_argument("--fixed_layer", type=int, default=5,

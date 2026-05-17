@@ -1,11 +1,23 @@
 # =============================================================================
-# StableFlow Experiment Commands  (CPU-offload mode)
-# Run all commands from the repo root: e:/Cherry_on_top  (or stable-flow/)
+# StableFlow Experiment Commands  — Quick Run (~1 hour, CPU-offload mode)
+# Run all commands from the repo root: e:/Cherry_on_top
 # Set HF_TOKEN to your Hugging Face token before running.
 #
-# --cpu_offload uses enable_sequential_cpu_offload(): model layers are kept in
-# RAM and moved to GPU one at a time, so you only need ~6-8 GB VRAM instead
-# of ~24 GB, at the cost of significantly slower inference.
+# Time budget breakdown (cpu_offload, ~20-30s per image at 4 steps):
+#   1b. Vitality sweep  :  4 refs + 57×4 ablated  = 232 images  ~35 min
+#   2a. Semantic sweep  :  14 full (pre-cached) + 19×7×2 ablated =  ~15 min
+#   3.  Attention maps  :  1 prompt, 4 steps                      ~3 min
+#   4.  Attn balance    :  2 prompts, 4 steps                     ~5 min
+#   Plots               :  negligible
+#   Total                                                         ~58 min
+#
+# Key speed tricks applied in the scripts:
+#   - Reference / full-model images are pre-generated ONCE before the layer
+#     loop (not regenerated 57× inside it).
+#   - n_steps=4  (down from 15)
+#   - n_prompts=4, n_seeds=1 for vitality
+#   - n_pairs=1, --only_mm for semantic (19 layers instead of 57)
+#   - prompts_n=2 for attention balance
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -14,42 +26,38 @@
 
 conda env create -f environment.yml
 conda activate stable-flow
-
-# Install the custom FLUX diffusers fork in editable mode
 pip install -e src/diffusers
-
-# Install additional experiment dependencies
 pip install transformers accelerate torchvision matplotlib seaborn openai
 
 # ---------------------------------------------------------------------------
-# 1a. Generate prompts  (no GPU needed)
+# 1a. Generate prompts  (no GPU, ~1s)
 # ---------------------------------------------------------------------------
 
-# Option A: use built-in hardcoded prompts (no API key needed)
 python generate_prompts.py
 
-# Option B: generate via OpenAI GPT-4o-mini
-python generate_prompts.py --openai_key YOUR_OPENAI_KEY
-
 # Output:
-#   prompts/vitality_prompts.json     (64 diverse prompts)
-#   prompts/semantic_prompts.json     (7 categories × 50 contrastive pairs)
+#   prompts/vitality_prompts.json
+#   prompts/semantic_prompts.json
 
 # ---------------------------------------------------------------------------
-# 1b. Vitality sweep  (saves incrementally — safe to interrupt and resume)
+# 1b. Vitality sweep  (~35 min)
+#   232 images: 4 refs (pre-cached) + 57 layers × 4 prompts × 1 seed
+#   Saves incrementally — safe to interrupt and resume.
 # ---------------------------------------------------------------------------
 
 python experiments/vitality_sweep.py \
     --model_path black-forest-labs/FLUX.1-dev \
     --hf_token $HF_TOKEN \
-    --n_steps 15 \
+    --n_prompts 4 \
+    --n_seeds 1 \
+    --n_steps 4 \
     --device cuda \
     --cpu_offload
 
 # Output: results/vitality_scores.json
 
 # ---------------------------------------------------------------------------
-# 1c. Plot vitality bar chart  (no GPU needed)
+# 1c. Plot vitality  (~1s)
 # ---------------------------------------------------------------------------
 
 python experiments/plot_vitality.py \
@@ -60,22 +68,24 @@ python experiments/plot_vitality.py \
 # Output: results/vitality_plot.png
 
 # ---------------------------------------------------------------------------
-# 2a. Semantic sensitivity sweep
+# 2a. Semantic sensitivity sweep  (~15 min)
+#   14 full-model images pre-cached, then 19 MM layers × 7 categories × 2 ablated
+#   --only_mm skips the 38 single-stream blocks for speed.
 # ---------------------------------------------------------------------------
 
 python experiments/semantic_sensitivity.py \
     --model_path black-forest-labs/FLUX.1-dev \
     --hf_token $HF_TOKEN \
-    --n_pairs 10 \
-    --n_steps 15 \
+    --n_pairs 1 \
+    --n_steps 4 \
+    --only_mm \
     --device cuda \
     --cpu_offload
 
-# Use --n_pairs 5 for a faster run (fewer contrastive pairs per category).
-# Output: results/semantic_sensitivity.npy  +  results/semantic_sensitivity.json
+# Output: results/semantic_sensitivity.npy + results/semantic_sensitivity.json
 
 # ---------------------------------------------------------------------------
-# 2b. Plot semantic heatmap  (no GPU needed)
+# 2b. Plot semantic heatmap  (~1s)
 # ---------------------------------------------------------------------------
 
 python experiments/plot_semantic_heatmap.py \
@@ -88,7 +98,7 @@ python experiments/plot_semantic_heatmap.py \
 #   results/vitality_semantic_combined.png
 
 # ---------------------------------------------------------------------------
-# 3. Attention maps
+# 3. Attention maps  (~3 min)
 # ---------------------------------------------------------------------------
 
 python experiments/attention_maps.py \
@@ -97,7 +107,7 @@ python experiments/attention_maps.py \
     --prompt "a red wooden chair on a stone floor" \
     --tokens "red,wooden,chair,stone,floor" \
     --seed 42 \
-    --n_steps 15 \
+    --n_steps 4 \
     --device cuda \
     --fixed_layer 5 \
     --cpu_offload
@@ -109,15 +119,15 @@ python experiments/attention_maps.py \
 #   results/attention_data.pt
 
 # ---------------------------------------------------------------------------
-# 4. Attention balance
+# 4. Attention balance  (~5 min)
 # ---------------------------------------------------------------------------
 
 python experiments/attention_balance.py \
     --model_path black-forest-labs/FLUX.1-dev \
     --hf_token $HF_TOKEN \
-    --prompts_n 8 \
+    --prompts_n 2 \
     --vitality results/vitality_scores.json \
-    --n_steps 15 \
+    --n_steps 4 \
     --device cuda \
     --cpu_offload
 
@@ -126,7 +136,7 @@ python experiments/attention_balance.py \
 #   results/vitality_attention_correlation.png
 
 # ---------------------------------------------------------------------------
-# 4b. Regenerate correlation plot from saved results  (no GPU needed)
+# 4b. Regenerate correlation plot only  (~1s)
 # ---------------------------------------------------------------------------
 
 python experiments/plot_correlation.py \
@@ -136,7 +146,7 @@ python experiments/plot_correlation.py \
     --threshold 0.92
 
 # ---------------------------------------------------------------------------
-# Full pipeline  (copy-paste to run end-to-end)
+# Full pipeline  (copy-paste to run end-to-end, ~1 hour)
 # ---------------------------------------------------------------------------
 
 export HF_TOKEN=your_hf_token_here
@@ -145,13 +155,13 @@ python generate_prompts.py
 
 python experiments/vitality_sweep.py \
     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
-    --n_steps 15 --device cuda --cpu_offload
+    --n_prompts 4 --n_seeds 1 --n_steps 4 --device cuda --cpu_offload
 
 python experiments/plot_vitality.py
 
 python experiments/semantic_sensitivity.py \
     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
-    --n_pairs 10 --n_steps 15 --device cuda --cpu_offload
+    --n_pairs 1 --n_steps 4 --only_mm --device cuda --cpu_offload
 
 python experiments/plot_semantic_heatmap.py
 
@@ -159,13 +169,35 @@ python experiments/attention_maps.py \
     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
     --prompt "a red wooden chair on a stone floor" \
     --tokens "red,wooden,chair,stone,floor" \
-    --seed 42 --n_steps 15 --device cuda --fixed_layer 5 --cpu_offload
+    --seed 42 --n_steps 4 --device cuda --fixed_layer 5 --cpu_offload
 
 python experiments/attention_balance.py \
     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
-    --prompts_n 8 --n_steps 15 --device cuda --cpu_offload
+    --prompts_n 2 --n_steps 4 --device cuda --cpu_offload
 
 python experiments/plot_correlation.py
+
+# ---------------------------------------------------------------------------
+# Higher-quality run  (use when you have more time / a full GPU)
+# Replace the 4 inference commands above with:
+# ---------------------------------------------------------------------------
+
+# python experiments/vitality_sweep.py \
+#     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
+#     --n_prompts 64 --n_seeds 4 --n_steps 15 --device cuda
+
+# python experiments/semantic_sensitivity.py \
+#     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
+#     --n_pairs 10 --n_steps 15 --device cuda
+
+# python experiments/attention_maps.py \
+#     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
+#     --prompt "a red wooden chair on a stone floor" \
+#     --tokens "red,wooden,chair,stone,floor" --n_steps 15 --device cuda
+
+# python experiments/attention_balance.py \
+#     --model_path black-forest-labs/FLUX.1-dev --hf_token $HF_TOKEN \
+#     --prompts_n 8 --n_steps 15 --device cuda
 
 # ---------------------------------------------------------------------------
 # Expected output files

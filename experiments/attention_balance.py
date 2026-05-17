@@ -224,10 +224,11 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path",  type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--hf_token",    type=str, required=True)
-    parser.add_argument("--prompts_n",   type=int, default=8,
-                        help="Number of prompts to average over")
+    parser.add_argument("--prompts_n",   type=int, default=2,
+                        help="Number of prompts to average over (default 2 for speed)")
     parser.add_argument("--vitality",    type=str, default="results/vitality_scores.json")
-    parser.add_argument("--n_steps",     type=int, default=15)
+    parser.add_argument("--n_steps",     type=int, default=4,
+                        help="Denoising steps (default 4 for speed; paper uses 15)")
     parser.add_argument("--device",      type=str, default="cuda")
     parser.add_argument("--cpu_offload", action="store_true")
     return parser.parse_args()
