@@ -190,8 +190,13 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                   cpu_offload: bool = False):
     """
     Auto-detect and load FluxPipeline or StableDiffusion3Pipeline.
+
+    FLUX.2-dev workaround: the local diffusers fork predates AutoencoderKLFlux2.
+    If that class is missing we pre-load the VAE as plain AutoencoderKL and inject
+    it, bypassing the model-config class lookup.  mm_skip_blocks / single_skip_blocks
+    still work because the pipeline itself comes from the local fork.
     """
-    from diffusers import FluxPipeline, StableDiffusion3Pipeline
+    from diffusers import FluxPipeline, StableDiffusion3Pipeline, AutoencoderKL
 
     name = model_path.lower()
 
@@ -203,12 +208,34 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
         )
     else:
         # FLUX.1-dev, FLUX.1-schnell, FLUX.2-dev
-        pipe = FluxPipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            visualize_attention=False,
-            token=hf_token,
-        )
+        try:
+            pipe = FluxPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                visualize_attention=False,
+                token=hf_token,
+            )
+        except AttributeError as exc:
+            if "AutoencoderKLFlux2" not in str(exc) and "has no attribute" not in str(exc):
+                raise
+            print(
+                f"[load_pipeline] Local diffusers fork missing {exc}.\n"
+                "  Retrying with VAE pre-loaded as AutoencoderKL (FLUX.2-dev workaround).\n"
+                "  Layer-bypass comparisons remain valid; absolute image quality may differ slightly."
+            )
+            vae = AutoencoderKL.from_pretrained(
+                model_path,
+                subfolder="vae",
+                torch_dtype=torch.float16,
+                token=hf_token,
+            )
+            pipe = FluxPipeline.from_pretrained(
+                model_path,
+                vae=vae,
+                torch_dtype=torch.float16,
+                visualize_attention=False,
+                token=hf_token,
+            )
 
     if cpu_offload:
         pipe.enable_sequential_cpu_offload()
