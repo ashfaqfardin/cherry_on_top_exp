@@ -1,20 +1,29 @@
 """
 Experiment 2 — Semantic specialisation of layers.
 
-For each of the 57 FLUX blocks, measure how much bypassing the block changes
-the CLIP-space distance between semantically contrastive image pairs.
+Uses the same methodology as the paper's vitality sweep:
+  - DINOv2 perceptual similarity (not CLIP)
+  - Contrastive pairs share the same seed so the only variable is the prompt
+  - Sensitivity = |sim_full_pair − sim_ablated_pair|
+
+Intuition
+---------
+Paper vitality asks:   "does this layer change the image?"
+                        compare  same_prompt_full  vs  same_prompt_ablated
+
+We ask:                "does this layer distinguish semantic category X?"
+                        compare  pair_sim_full      vs  pair_sim_ablated
+
+If bypassing layer L makes "red apple" and "green apple" look MORE similar
+to DINOv2 (sim rises), then L was responsible for encoding colour.
 
 Speed note
 ----------
-Full-model images for all pairs are pre-generated ONCE before the layer loop.
-The original approach called generate_pair() inside the layer loop, paying the
-full-model cost 57× per pair.  With pre-caching it is paid only once.
+Full-model images pre-generated ONCE before the layer loop (same pattern as
+the paper's vitality pre-caching approach).
 
-Quick-run defaults (fits ~15-20 min with cpu_offload):
-  --n_pairs 1  --n_steps 4  --only_mm
-
-Full sweep (all 57 layers, 10 pairs/category):
-  --n_pairs 10  --n_steps 15  (no --only_mm)
+Quick-run (~15-20 min cpu_offload):  --n_pairs 1 --n_steps 4 --only_mm
+Paper-style (all layers, 10 pairs):  --n_pairs 10 --n_steps 28
 
 Outputs
 -------
@@ -39,107 +48,128 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torchvision import transforms  # type: ignore
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.layer_bypass import generate_with_bypass, load_pipeline
+from experiments.layer_bypass import generate_with_bypass, load_pipeline, get_block_counts, detect_model_type
 
-N_MM     = 19
-N_SINGLE = 38
 CATEGORIES = ["colour", "style", "material", "texture", "shape", "layout", "object"]
 
+DINO_PREPROCESS = transforms.Compose([
+    transforms.Resize(224),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
+
 
 # ---------------------------------------------------------------------------
-# CLIP helpers
+# DINOv2 helpers  (same as vitality_sweep.py — paper's chosen metric)
 # ---------------------------------------------------------------------------
 
-def load_clip(device: str = "cuda"):
-    from transformers import CLIPProcessor, CLIPModel
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    model.eval()
-    return model, processor
+def load_dino(device: str = "cuda"):
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14",
+                           pretrained=True)
+    model.eval().to(device)
+    return model
 
 
 @torch.no_grad()
-def clip_embed(img: Image.Image, model, processor, device: str) -> torch.Tensor:
-    inputs = processor(images=img, return_tensors="pt").to(device)
-    feats  = model.get_image_features(**inputs)
-    return F.normalize(feats, dim=-1)
-
-
-def clip_distance(img_a: Image.Image, img_b: Image.Image,
-                  model, processor, device: str) -> float:
-    fa = clip_embed(img_a, model, processor, device)
-    fb = clip_embed(img_b, model, processor, device)
-    return float(1.0 - F.cosine_similarity(fa, fb, dim=-1).item())
+def dino_similarity(img_a: Image.Image, img_b: Image.Image,
+                    dino_model, device: str) -> float:
+    """DINOv2 cosine similarity between two images. Higher = more similar."""
+    ta = DINO_PREPROCESS(img_a).unsqueeze(0).to(device)
+    tb = DINO_PREPROCESS(img_b).unsqueeze(0).to(device)
+    fa = dino_model(ta)
+    fb = dino_model(tb)
+    return float(F.cosine_similarity(fa, fb, dim=-1).item())
 
 
 # ---------------------------------------------------------------------------
 # Main sweep
 # ---------------------------------------------------------------------------
 
+def model_tag(model_path: str) -> str:
+    """Derive a short filesystem-safe tag from a model path."""
+    name = model_path.split("/")[-1]          # e.g. "FLUX.1-dev"
+    return name.replace(".", "").replace("-", "_").lower()  # "flux1_dev"
+
+
 def run_sweep(args):
     os.makedirs("results", exist_ok=True)
-    npy_path  = "results/semantic_sensitivity.npy"
-    json_path = "results/semantic_sensitivity.json"
+    tag       = args.out_tag or model_tag(args.model_path)
+    npy_path  = f"results/semantic_sensitivity_{tag}.npy"
+    json_path = f"results/semantic_sensitivity_{tag}.json"
+    print(f"Output tag: {tag}")
 
     with open("prompts/semantic_prompts.json") as f:
         semantic_prompts = json.load(f)
 
+    pipe = load_pipeline(args.model_path, args.hf_token, args.device, args.cpu_offload)
+    N_MM, N_SINGLE = get_block_counts(pipe)
+    model_type = detect_model_type(pipe)
+    print(f"Model type : {model_type}  |  MM blocks: {N_MM}  Single blocks: {N_SINGLE}")
+
+    # SD3 has no single-stream blocks — silently cap
+    if model_type == "sd3" and N_SINGLE == 0:
+        print("  SD3 has no single-stream blocks — sweeping all MM blocks only.")
+
     block_list = [("mm", i) for i in range(N_MM)]
-    if not args.only_mm:
+    if N_SINGLE > 0:
         block_list += [("single", i) for i in range(N_SINGLE)]
     n_layers = len(block_list)
 
     # Load or initialise result matrix
     if os.path.exists(npy_path):
         matrix = np.load(npy_path)
-        # Resize if layer count changed (e.g. only_mm resumed from full run)
         if matrix.shape[0] != n_layers:
-            print(f"  Warning: saved matrix has {matrix.shape[0]} rows, expected {n_layers}. Starting fresh.")
+            print(f"  Saved matrix has {matrix.shape[0]} rows, expected {n_layers}. Starting fresh.")
             matrix = np.full((n_layers, len(CATEGORIES)), np.nan)
         else:
             print(f"Resuming from {npy_path}")
     else:
         matrix = np.full((n_layers, len(CATEGORIES)), np.nan)
 
-    pipe       = load_pipeline(args.model_path, args.hf_token, args.device, args.cpu_offload)
-    clip_model, clip_proc = load_clip(args.device)
+    dino = load_dino(args.device)
 
     # ------------------------------------------------------------------
-    # Pre-generate ALL full-model images for every pair we will use
-    # Key: (cat, pair_idx, 'a'/'b') → PIL image
+    # Pre-generate ALL full-model images for every pair — done ONCE
+    # Each pair (a, b) uses the same seed so the only difference is the prompt.
+    # Seed per pair = pair index (mirrors paper's per-prompt seed strategy).
     # ------------------------------------------------------------------
-    print("Pre-generating full-model reference images for all pairs...")
-    full_cache: dict = {}
+    print("Pre-generating full-model images for all pairs (seed = pair index)...")
+    full_cache: dict = {}   # (cat, p_idx, 'a'/'b') → PIL Image
     for cat in CATEGORIES:
         pairs = semantic_prompts.get(cat, [])[:args.n_pairs]
         for p_idx, (prompt_a, prompt_b) in enumerate(pairs):
+            seed = p_idx          # unique seed per pair, same for both sides
             for side, prompt in [("a", prompt_a), ("b", prompt_b)]:
-                cache_key = (cat, p_idx, side)
-                if cache_key not in full_cache:
-                    img = generate_with_bypass(
-                        pipe, prompt, seed=42,
-                        block_type="mm", bypass_idx=None,
-                        num_inference_steps=args.n_steps, device=args.device,
-                    )
-                    full_cache[cache_key] = img
-    n_cached = len(full_cache)
-    print(f"  Cached {n_cached} full-model images.\n")
+                full_cache[(cat, p_idx, side)] = generate_with_bypass(
+                    pipe, prompt, seed=seed,
+                    block_type="mm", bypass_idx=None,
+                    num_inference_steps=args.n_steps, device=args.device,
+                )
+    print(f"  Cached {len(full_cache)} full-model images.\n")
 
-    # Pre-compute full-model CLIP distances (once)
-    dist_full_cache: dict = {}
+    # Pre-compute full-model DINOv2 similarity for each pair (once)
+    sim_full_cache: dict = {}   # (cat, p_idx) → float
     for cat in CATEGORIES:
         pairs = semantic_prompts.get(cat, [])[:args.n_pairs]
-        for p_idx, _ in enumerate(pairs):
-            img_a = full_cache[(cat, p_idx, "a")]
-            img_b = full_cache[(cat, p_idx, "b")]
-            dist_full_cache[(cat, p_idx)] = clip_distance(
-                img_a, img_b, clip_model, clip_proc, args.device
+        for p_idx in range(len(pairs)):
+            sim_full_cache[(cat, p_idx)] = dino_similarity(
+                full_cache[(cat, p_idx, "a")],
+                full_cache[(cat, p_idx, "b")],
+                dino, args.device,
             )
 
     # ------------------------------------------------------------------
-    # Layer sweep — only generate ablated images
+    # Layer sweep — generate ablated images only, compare with DINOv2
+    #
+    # sensitivity = |sim_full_pair - sim_ablated_pair|
+    #
+    # High sensitivity: bypassing this layer made the two images look MORE
+    # similar → that layer was responsible for the semantic difference.
     # ------------------------------------------------------------------
     for global_idx, (block_type, layer_idx) in enumerate(block_list):
         if not np.any(np.isnan(matrix[global_idx])):
@@ -157,20 +187,25 @@ def run_sweep(args):
             pairs = semantic_prompts.get(cat, [])[:args.n_pairs]
             deltas = []
             for p_idx, (prompt_a, prompt_b) in enumerate(pairs):
-                # Only generate ablated images — full images come from cache
+                seed = p_idx      # same seed used when generating full-model refs
+
                 img_a_abl = generate_with_bypass(
-                    pipe, prompt_a, seed=42,
+                    pipe, prompt_a, seed=seed,
                     block_type=block_type, bypass_idx=layer_idx,
                     num_inference_steps=args.n_steps, device=args.device,
                 )
                 img_b_abl = generate_with_bypass(
-                    pipe, prompt_b, seed=42,
+                    pipe, prompt_b, seed=seed,
                     block_type=block_type, bypass_idx=layer_idx,
                     num_inference_steps=args.n_steps, device=args.device,
                 )
-                dist_abl = clip_distance(img_a_abl, img_b_abl, clip_model, clip_proc, args.device)
-                dist_full = dist_full_cache[(cat, p_idx)]
-                deltas.append(abs(dist_full - dist_abl))
+
+                sim_abl  = dino_similarity(img_a_abl, img_b_abl, dino, args.device)
+                sim_full = sim_full_cache[(cat, p_idx)]
+
+                # Positive delta: images became MORE similar after bypass
+                # → this layer was encoding the semantic difference
+                deltas.append(abs(sim_full - sim_abl))
 
             matrix[global_idx, cat_idx] = float(np.mean(deltas)) if deltas else 0.0
 
@@ -180,15 +215,15 @@ def run_sweep(args):
     # Save JSON
     layer_labels = (
         [f"MM-{i}" for i in range(N_MM)] +
-        ([f"S-{i}" for i in range(N_SINGLE)] if not args.only_mm else [])
-    )
-    result_dict = {
-        "categories":  CATEGORIES,
-        "layers":      layer_labels[:n_layers],
-        "matrix":      matrix.tolist(),
-    }
+        [f"S-{i}" for i in range(N_SINGLE)]
+    )[:n_layers]
     with open(json_path, "w") as f:
-        json.dump(result_dict, f, indent=2)
+        json.dump({
+            "metric":     "DINOv2 cosine similarity (same as paper vitality metric)",
+            "categories": CATEGORIES,
+            "layers":     layer_labels[:n_layers],
+            "matrix":     matrix.tolist(),
+        }, f, indent=2)
 
     print(f"\nDone. Saved:\n  {npy_path}\n  {json_path}")
 
@@ -199,15 +234,16 @@ def run_sweep(args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="black-forest-labs/FLUX.1-dev")
-    parser.add_argument("--hf_token",   type=str, required=True)
-    parser.add_argument("--n_pairs",    type=int, default=1,
+    parser.add_argument("--model_path",  type=str, default="black-forest-labs/FLUX.1-dev")
+    parser.add_argument("--hf_token",    type=str, required=True)
+    parser.add_argument("--n_pairs",     type=int, default=1,
                         help="Contrastive pairs per category (default 1; max 50)")
-    parser.add_argument("--n_steps",    type=int, default=4,
-                        help="Denoising steps (default 4; paper uses 15)")
-    parser.add_argument("--only_mm",    action="store_true",
-                        help="Only sweep MM-DiT blocks (19 layers) — faster")
-    parser.add_argument("--device",     type=str, default="cuda")
+    parser.add_argument("--n_steps",     type=int, default=4,
+                        help="Denoising steps (default 4 quick; use 28 for paper-style)")
+    parser.add_argument("--out_tag",     type=str, default=None,
+                        help="Tag for output filenames e.g. 'flux1_dev'. "
+                             "Auto-derived from model name if omitted.")
+    parser.add_argument("--device",      type=str, default="cuda")
     parser.add_argument("--cpu_offload", action="store_true")
     return parser.parse_args()
 

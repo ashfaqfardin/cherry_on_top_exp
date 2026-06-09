@@ -5,18 +5,22 @@ For each of the 57 FLUX blocks (19 MM-DiT + 38 single-stream), bypass the
 block during generation and measure how much the output changes via DINOv2
 cosine similarity.  Low similarity → high vitality.
 
+Paper's exact methodology
+--------------------------
+- 64 prompts, each paired with its own unique seed (seed = prompt index)
+- Reference image for prompt i  → full model,   seed = i
+- Ablated  image for prompt i  → layer bypassed, seed = i   (same latent noise)
+- Vitality(ℓ) = 1 − mean( DINOv2_cosine_sim(ref_i, ablated_i) )
+- Threshold τ = 0.92 used to classify vital vs non-vital
+
 Speed note
 ----------
-Reference images are pre-generated ONCE before the sweep begins — the original
-approach regenerated them inside the layer loop (×57 wasteful).  This alone
-cuts total image count from  N_PROMPTS × (1+N_SEEDS) × 57  down to
-N_PROMPTS + N_PROMPTS × N_SEEDS × 57.
+Reference images are pre-generated ONCE before the sweep begins.
+Total images: 64 refs + 57 layers × 64 = 3,712
+At ~30s/image with cpu_offload ≈ 31h.
+At ~3s/image on a full GPU           ≈ 3h.
 
-Quick-run defaults (fits ~30-40 min with cpu_offload):
-  --n_prompts 4   --n_seeds 1   --n_steps 4
-
-Full-paper reproduction:
-  --n_prompts 64  --n_seeds 4   --n_steps 15
+Quick-run mode (--quick): 8 prompts, 4 steps  (~20 min cpu_offload)
 
 Outputs
 -------
@@ -24,11 +28,11 @@ results/vitality_scores.json
 
 Usage
 -----
-python experiments/vitality_sweep.py \
-    --model_path black-forest-labs/FLUX.1-dev \
-    --hf_token YOUR_TOKEN \
-    [--n_prompts 4] [--n_seeds 1] [--n_steps 4] \
-    [--cpu_offload] [--device cuda]
+# Paper-accurate (full GPU recommended):
+python experiments/vitality_sweep.py --hf_token YOUR_TOKEN
+
+# Quick sanity-check (cpu_offload friendly):
+python experiments/vitality_sweep.py --hf_token YOUR_TOKEN --quick --cpu_offload
 """
 
 import argparse
@@ -69,8 +73,8 @@ def load_dino(device: str = "cuda"):
 
 
 @torch.no_grad()
-def dino_similarity(img_a: Image.Image, img_b: Image.Image, dino_model,
-                    device: str = "cuda") -> float:
+def dino_similarity(img_a: Image.Image, img_b: Image.Image,
+                    dino_model, device: str) -> float:
     ta = DINO_PREPROCESS(img_a).unsqueeze(0).to(device)
     tb = DINO_PREPROCESS(img_b).unsqueeze(0).to(device)
     fa = dino_model(ta)
@@ -79,14 +83,13 @@ def dino_similarity(img_a: Image.Image, img_b: Image.Image, dino_model,
 
 
 # ---------------------------------------------------------------------------
-# Main sweep  (references pre-cached outside the layer loop)
+# Main sweep
 # ---------------------------------------------------------------------------
 
 def run_sweep(args):
     os.makedirs("results", exist_ok=True)
     output_path = "results/vitality_scores.json"
 
-    # Resume from partial results
     if os.path.exists(output_path):
         with open(output_path) as f:
             results = json.load(f)
@@ -96,37 +99,42 @@ def run_sweep(args):
 
     with open("prompts/vitality_prompts.json") as f:
         all_prompts = json.load(f)
-    prompts = all_prompts[:args.n_prompts]
-    seeds   = list(range(args.n_seeds))
 
-    n_total = (len(results["mm"]) + len(results["single"]))
-    n_remaining = (N_MM + N_SINGLE) - n_total
-    n_images_remaining = n_remaining * len(prompts) * len(seeds)
-    print(f"Prompts: {len(prompts)}  Seeds: {len(seeds)}  Steps: {args.n_steps}")
-    print(f"Layers remaining: {n_remaining} / {N_MM + N_SINGLE}")
-    print(f"Estimated images to generate: {n_images_remaining}")
-    print(f"  (references pre-cached once = {len(prompts)} extra images)\n")
+    # --- paper: 64 prompts, each with its own seed (seed = prompt index) ---
+    n_prompts = args.n_prompts
+    prompts   = all_prompts[:n_prompts]
+    # Each prompt i uses seed=i — same latent noise for ref and ablated
+    prompt_seeds = list(range(n_prompts))
+
+    n_done      = len(results["mm"]) + len(results["single"])
+    n_remaining = (N_MM + N_SINGLE) - n_done
+    print(f"Paper mode: {n_prompts} prompts, 1 seed per prompt (seed = prompt index)")
+    print(f"Steps: {args.n_steps}   Layers remaining: {n_remaining} / {N_MM + N_SINGLE}")
+    print(f"Total images to generate: {n_prompts} refs + {n_remaining}×{n_prompts} ablated "
+          f"= {n_prompts + n_remaining * n_prompts}\n")
 
     pipe = load_pipeline(args.model_path, args.hf_token, args.device,
                          args.cpu_offload)
     dino = load_dino(args.device)
 
     # ------------------------------------------------------------------
-    # Pre-generate reference images (full model, seed 0) — done ONCE
+    # Pre-generate reference images — full model, seed = prompt index
+    # (paper: each prompt paired with its own unique seed)
     # ------------------------------------------------------------------
-    print("Pre-generating reference images (full model, seed 0)...")
+    print("Pre-generating reference images (full model, seed = prompt index)...")
     ref_images: list[Image.Image] = []
     for i, prompt in enumerate(prompts):
-        img = generate_with_bypass(
-            pipe, prompt, seed=0,
+        seed = prompt_seeds[i]
+        img  = generate_with_bypass(
+            pipe, prompt, seed=seed,
             block_type="mm", bypass_idx=None,
             num_inference_steps=args.n_steps, device=args.device,
         )
         ref_images.append(img)
-        print(f"  ref {i+1}/{len(prompts)} done")
+        print(f"  ref {i+1:2d}/{n_prompts}  seed={seed}")
 
     # ------------------------------------------------------------------
-    # Sweep all blocks, reusing the cached references
+    # Sweep all 57 blocks
     # ------------------------------------------------------------------
     block_list = (
         [("mm",     i) for i in range(N_MM)]    +
@@ -134,30 +142,31 @@ def run_sweep(args):
     )
 
     for block_type, layer_idx in block_list:
-        key = str(layer_idx)
-        store = results[block_type if block_type == "mm" else "single"]
-        if key in store:
-            tag = f"MM-{layer_idx}" if block_type == "mm" else f"S-{layer_idx}"
+        bucket = "mm" if block_type == "mm" else "single"
+        key    = str(layer_idx)
+        tag    = f"MM-{layer_idx:2d}" if block_type == "mm" else f"S-{layer_idx:2d}"
+
+        if key in results[bucket]:
             print(f"  {tag}: cached, skipping")
             continue
 
-        tag = f"MM-{layer_idx:2d}" if block_type == "mm" else f"S-{layer_idx:2d}"
         print(f"  {tag} ...", end=" ", flush=True)
 
         scores = []
         for i, prompt in enumerate(prompts):
-            ref_img = ref_images[i]          # reuse — no regeneration
-            for seed in seeds:
-                ablated = generate_with_bypass(
-                    pipe, prompt, seed=seed,
-                    block_type=block_type, bypass_idx=layer_idx,
-                    num_inference_steps=args.n_steps, device=args.device,
-                )
-                scores.append(dino_similarity(ref_img, ablated, dino, args.device))
+            seed    = prompt_seeds[i]       # same seed as the reference
+            ablated = generate_with_bypass(
+                pipe, prompt, seed=seed,
+                block_type=block_type, bypass_idx=layer_idx,
+                num_inference_steps=args.n_steps, device=args.device,
+            )
+            sim = dino_similarity(ref_images[i], ablated, dino, args.device)
+            scores.append(sim)
 
-        bucket = "mm" if block_type == "mm" else "single"
         results[bucket][key] = scores
-        print(f"mean sim = {float(np.mean(scores)):.4f}")
+        # vitality as paper defines it: 1 - mean(sim)
+        vitality = 1.0 - float(np.mean(scores))
+        print(f"vitality = {vitality:.4f}  (mean sim = {1-vitality:.4f})")
 
         with open(output_path, "w") as f:
             json.dump(results, f, indent=2)
@@ -171,19 +180,24 @@ def run_sweep(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FLUX layer vitality sweep")
-    parser.add_argument("--model_path", type=str,
+    parser.add_argument("--model_path",  type=str,
                         default="black-forest-labs/FLUX.1-dev")
-    parser.add_argument("--hf_token",  type=str, required=True)
-    parser.add_argument("--n_prompts", type=int, default=4,
-                        help="Prompts to use (default 4; paper uses 64)")
-    parser.add_argument("--n_seeds",   type=int, default=1,
-                        help="Seeds per prompt (default 1; paper uses 4)")
-    parser.add_argument("--n_steps",   type=int, default=4,
-                        help="Denoising steps (default 4; paper uses 15)")
-    parser.add_argument("--device",    type=str, default="cuda")
+    parser.add_argument("--hf_token",   type=str, required=True)
+    parser.add_argument("--n_prompts",  type=int, default=64,
+                        help="Number of prompts (paper uses 64)")
+    parser.add_argument("--n_steps",    type=int, default=28,
+                        help="Denoising steps (paper default is 28 for FLUX.1-dev)")
+    parser.add_argument("--device",     type=str, default="cuda")
     parser.add_argument("--cpu_offload", action="store_true")
+    parser.add_argument("--quick",      action="store_true",
+                        help="Quick mode: 8 prompts, 4 steps — for cpu_offload testing")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_sweep(parse_args())
+    args = parse_args()
+    if args.quick:
+        args.n_prompts = 8
+        args.n_steps   = 4
+        print("Quick mode: n_prompts=8, n_steps=4")
+    run_sweep(args)
