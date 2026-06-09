@@ -1,0 +1,34 @@
+# Core ML
+torch>=2.4.0
+torchvision>=0.19.0
+
+# Diffusers — install from local fork (provides mm_skip_blocks / single_skip_blocks)
+# pip install -e src/diffusers
+# The line below is a fallback if you want the upstream version (no layer bypass support):
+# diffusers>=0.30.0
+
+# HuggingFace ecosystem
+transformers>=4.45.0
+accelerate>=0.34.0
+huggingface-hub>=0.25.0
+safetensors>=0.4.5
+tokenizers>=0.20.0
+sentencepiece>=0.2.0
+
+# Image processing
+Pillow>=10.4.0
+
+# Visualisation
+matplotlib>=3.9.0
+seaborn>=0.13.0         # optional — plot_semantic_heatmap.py works without it
+
+# Numerical
+numpy>=2.0.0
+scipy>=1.14.0
+
+# Misc utilities
+tqdm>=4.66.0
+packaging>=24.0
+
+# Optional — only needed if generating prompts via OpenAI API
+# openai>=1.0.0
