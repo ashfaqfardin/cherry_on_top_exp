@@ -186,26 +186,92 @@ def generate_with_bypass(
 # Pipeline loader
 # ---------------------------------------------------------------------------
 
+def _load_with_upstream_diffusers(model_path: str, hf_token: str, pipeline_class_name: str):
+    """
+    Load a pipeline using the system (upstream) diffusers installation,
+    bypassing the local fork in sys.path.
+
+    Needed for models that require features the local fork doesn't have
+    (e.g. SD 3.5 Large needs qk_norm, FLUX.2-dev needs AutoencoderKLFlux2).
+    Safe because SD3 uses monkey-patch bypass — mm_skip_blocks not needed.
+    """
+    import sys
+    import site
+
+    # Find system site-packages directories that contain a real diffusers install
+    sys_diff_dirs = [
+        sp for sp in (site.getsitepackages() + [site.getusersitepackages()])
+        if os.path.isfile(os.path.join(sp, "diffusers", "__init__.py"))
+    ]
+    if not sys_diff_dirs:
+        raise RuntimeError(
+            "System diffusers not found. Install it first:\n"
+            "  pip install 'diffusers>=0.32.0'"
+        )
+
+    # Snapshot current state
+    saved_path   = list(sys.path)
+    saved_mods   = {k: v for k, v in sys.modules.items()
+                    if k == "diffusers" or k.startswith("diffusers.")}
+
+    # Build new sys.path: system site-packages first, local fork paths removed
+    stripped = [p for p in sys.path
+                if not os.path.isfile(os.path.join(p, "diffusers", "__init__.py"))
+                or p in sys_diff_dirs]
+    sys.path[:] = sys_diff_dirs + [p for p in stripped if p not in sys_diff_dirs]
+    for k in list(saved_mods):
+        del sys.modules[k]
+
+    try:
+        import diffusers as _diffusers_upstream
+        PipelineClass = getattr(_diffusers_upstream, pipeline_class_name)
+        pipe = PipelineClass.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            token=hf_token,
+        )
+    finally:
+        sys.path[:] = saved_path
+        for k in list(sys.modules.keys()):
+            if k == "diffusers" or k.startswith("diffusers."):
+                del sys.modules[k]
+        sys.modules.update(saved_mods)
+
+    return pipe
+
+
 def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                   cpu_offload: bool = False):
     """
     Auto-detect and load FluxPipeline or StableDiffusion3Pipeline.
 
-    FLUX.2-dev workaround: the local diffusers fork predates AutoencoderKLFlux2.
-    If that class is missing we pre-load the VAE as plain AutoencoderKL and inject
-    it, bypassing the model-config class lookup.  mm_skip_blocks / single_skip_blocks
-    still work because the pipeline itself comes from the local fork.
+    Compatibility fallbacks for models newer than the local diffusers fork:
+      FLUX.2-dev   — AutoencoderKLFlux2 missing → pre-load VAE as AutoencoderKL
+      SD 3.5 Large — qk_norm / norm_added_k missing → load via upstream diffusers
+    Both fallbacks keep the bypass mechanism intact (mm_skip_blocks for FLUX,
+    monkey-patch for SD3).
     """
     from diffusers import FluxPipeline, StableDiffusion3Pipeline, AutoencoderKL
 
     name = model_path.lower()
 
     if "stable-diffusion-3" in name or "sd3" in name:
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            token=hf_token,
-        )
+        try:
+            pipe = StableDiffusion3Pipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                token=hf_token,
+            )
+        except (ValueError, AttributeError) as exc:
+            if "norm_added_k" not in str(exc) and "qk_norm" not in str(exc) and "no attribute" not in str(exc):
+                raise
+            print(
+                "[load_pipeline] Local fork missing qk_norm support (SD 3.5 Large feature).\n"
+                "  Retrying with system/upstream diffusers — monkey-patch bypass unaffected."
+            )
+            pipe = _load_with_upstream_diffusers(
+                model_path, hf_token, "StableDiffusion3Pipeline"
+            )
     else:
         # FLUX.1-dev, FLUX.1-schnell, FLUX.2-dev
         try:
@@ -216,10 +282,25 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 token=hf_token,
             )
         except AttributeError as exc:
-            if "AutoencoderKLFlux2" not in str(exc) and "has no attribute" not in str(exc):
+            exc_str = str(exc)
+
+            if "Mistral3ForConditionalGeneration" in exc_str:
+                raise RuntimeError(
+                    "FLUX.2-dev requires transformers>=4.52 (Mistral3/Pixtral text encoder).\n"
+                    "The current transformers version is too old.\n\n"
+                    "Upgrade with:\n"
+                    "  pip install -q --upgrade transformers\n"
+                    "Then RESTART the Colab runtime and re-run.\n\n"
+                    "If the latest stable release still fails, try the dev build:\n"
+                    "  pip install -q git+https://github.com/huggingface/transformers"
+                ) from exc
+
+            if "AutoencoderKLFlux2" not in exc_str:
                 raise
+
+            # AutoencoderKLFlux2 missing from local fork — pre-load VAE as plain AutoencoderKL
             print(
-                f"[load_pipeline] Local diffusers fork missing {exc}.\n"
+                "[load_pipeline] Local fork missing AutoencoderKLFlux2.\n"
                 "  Retrying with VAE pre-loaded as AutoencoderKL (FLUX.2-dev workaround).\n"
                 "  Layer-bypass comparisons remain valid; absolute image quality may differ slightly."
             )
