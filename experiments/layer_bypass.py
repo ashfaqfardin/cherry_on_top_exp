@@ -20,10 +20,19 @@ img = generate_with_bypass(pipe, prompt, seed=0, block_type="mm", bypass_idx=5)
 
 import contextlib
 import os
+import sys
 from typing import Optional
 
 import torch
 from PIL import Image
+
+# Ensure the local diffusers fork takes precedence over any system install.
+# The local fork lives in <repo_root>/src/; this file is in <repo_root>/experiments/.
+_LOCAL_DIFFUSERS_SRC = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+)
+if os.path.isdir(_LOCAL_DIFFUSERS_SRC) and _LOCAL_DIFFUSERS_SRC not in sys.path:
+    sys.path.insert(0, _LOCAL_DIFFUSERS_SRC)
 
 
 # ---------------------------------------------------------------------------
@@ -329,18 +338,18 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
       FLUX.2-dev            — Flux2Pipeline (upstream diffusers, bfloat16)
       SD 3.5 Large          — StableDiffusion3Pipeline (upstream if qk_norm missing)
     """
-    from diffusers import FluxPipeline, StableDiffusion3Pipeline, AutoencoderKL
-
     name = model_path.lower()
 
     if "flux.2" in name or "flux2" in name:
-        # FLUX.2-dev requires Flux2Pipeline from upstream diffusers and bfloat16
+        # FLUX.2-dev: go directly to upstream — do NOT import from local fork here,
+        # as that would drag in system diffusers if the local fork isn't first in sys.path.
         print("[load_pipeline] FLUX.2-dev detected — loading Flux2Pipeline via upstream diffusers.")
         pipe = _load_with_upstream_diffusers(
             model_path, hf_token, "Flux2Pipeline", torch_dtype=torch.bfloat16
         )
 
     elif "stable-diffusion-3" in name or "sd3" in name:
+        from diffusers import StableDiffusion3Pipeline  # local fork
         # SD3.5 Large uses bfloat16; SD3-medium uses float16
         sd_dtype = torch.bfloat16 if "3.5" in name else torch.float16
         try:
@@ -362,6 +371,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
             )
 
     else:
+        from diffusers import FluxPipeline, AutoencoderKL  # local fork
         # FLUX.1-dev, FLUX.1-schnell — use local fork for mm_skip_blocks support
         try:
             pipe = FluxPipeline.from_pretrained(
