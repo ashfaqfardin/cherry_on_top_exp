@@ -234,7 +234,7 @@ def generate_with_bypass(
 
         with ctx:
             result = pipe(
-                prompt,
+                prompt=prompt,
                 height=height,
                 width=width,
                 guidance_scale=gs,
