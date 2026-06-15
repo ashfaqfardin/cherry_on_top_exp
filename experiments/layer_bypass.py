@@ -3,22 +3,23 @@ Layer bypass utilities — supports FLUX and SD3 model families.
 
 Model          Pipeline class               Bypass mechanism
 -----------    -------------------------    -----------------------------------------
-FLUX.1-dev     FluxPipeline                 mm_skip_blocks / single_skip_blocks (built-in)
-FLUX.1-schnell FluxPipeline                 same, guidance_scale=0.0
-FLUX.2-dev     FluxPipeline                 same as FLUX.1-dev
+FLUX.1-dev     FluxPipeline (local fork)    mm_skip_blocks / single_skip_blocks (built-in)
+FLUX.1-schnell FluxPipeline (local fork)    same, guidance_scale=0.0
+FLUX.2-dev     Flux2Pipeline (upstream)     monkey-patch block.forward, bfloat16
 SD 3.5 Large   StableDiffusion3Pipeline     monkey-patch block.forward (no built-in skip)
 
 Usage
 -----
 from experiments.layer_bypass import load_pipeline, get_block_counts, generate_with_bypass
 
-pipe = load_pipeline("stabilityai/stable-diffusion-3.5-large", hf_token, device)
-n_mm, n_single = get_block_counts(pipe)   # (38, 0) for SD3.5
+pipe = load_pipeline("black-forest-labs/FLUX.2-dev", hf_token, device)
+n_mm, n_single = get_block_counts(pipe)   # (19, 38) for FLUX.2-dev
 
 img = generate_with_bypass(pipe, prompt, seed=0, block_type="mm", bypass_idx=5)
 """
 
 import contextlib
+import os
 from typing import Optional
 
 import torch
@@ -30,8 +31,10 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 
 def detect_model_type(pipe) -> str:
-    """Return 'flux' or 'sd3' based on pipeline class."""
+    """Return 'flux', 'flux2', or 'sd3' based on pipeline class."""
     cls_name = type(pipe).__name__
+    if "Flux2" in cls_name:
+        return "flux2"
     if "Flux" in cls_name:
         return "flux"
     if "StableDiffusion3" in cls_name:
@@ -51,7 +54,7 @@ def get_block_counts(pipe) -> tuple[int, int]:
     SD 3.5 Large                        → (38,  0)
     """
     model_type = detect_model_type(pipe)
-    if model_type == "flux":
+    if model_type in ("flux", "flux2"):
         n_mm     = len(pipe.transformer.transformer_blocks)
         n_single = len(pipe.transformer.single_transformer_blocks)
         return n_mm, n_single
@@ -65,7 +68,9 @@ def _default_guidance(pipe) -> float:
     model_type = detect_model_type(pipe)
     if model_type == "sd3":
         return 7.0
-    # FLUX: schnell uses 0.0, dev/FLUX.2 use 3.5
+    if model_type == "flux2":
+        return 4.0
+    # FLUX.1: schnell uses 0.0, dev uses 3.5
     model_id = getattr(pipe, "name_or_path", "") or ""
     if "schnell" in model_id.lower():
         return 0.0
@@ -99,6 +104,53 @@ def _sd3_bypass_block(pipe, layer_idx: int):
 
 
 # ---------------------------------------------------------------------------
+# FLUX.2 bypass context managers (monkey-patch block.forward)
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _flux2_bypass_mm_block(pipe, layer_idx: int):
+    """
+    Bypass a FLUX.2 double-stream (MM) block via monkey-patch.
+
+    FluxTransformerBlock.forward() signature:
+        (hidden_states, encoder_hidden_states, temb, ...) → (encoder_hidden_states, hidden_states)
+    Note the swapped return order — the skip must preserve it.
+    """
+    block = pipe.transformer.transformer_blocks[layer_idx]
+    original_forward = block.forward
+
+    def _skip(hidden_states, encoder_hidden_states, temb=None, **kwargs):
+        return encoder_hidden_states, hidden_states  # preserve return order
+
+    block.forward = _skip
+    try:
+        yield
+    finally:
+        block.forward = original_forward
+
+
+@contextlib.contextmanager
+def _flux2_bypass_single_block(pipe, layer_idx: int):
+    """
+    Bypass a FLUX.2 single-stream block via monkey-patch.
+
+    FluxSingleTransformerBlock.forward() signature:
+        (hidden_states, temb, ...) → hidden_states
+    """
+    block = pipe.transformer.single_transformer_blocks[layer_idx]
+    original_forward = block.forward
+
+    def _skip(hidden_states, temb=None, **kwargs):
+        return hidden_states
+
+    block.forward = _skip
+    try:
+        yield
+    finally:
+        block.forward = original_forward
+
+
+# ---------------------------------------------------------------------------
 # Unified generation function
 # ---------------------------------------------------------------------------
 
@@ -119,11 +171,11 @@ def generate_with_bypass(
     """
     Generate one image, optionally bypassing a single transformer block.
 
-    Works for FLUX (dev, schnell, FLUX.2) and SD 3.5.
+    Works for FLUX.1 (dev, schnell), FLUX.2-dev, and SD 3.5.
 
     Parameters
     ----------
-    pipe          : loaded pipeline (FluxPipeline or StableDiffusion3Pipeline)
+    pipe          : loaded pipeline
     prompt        : text prompt
     seed          : RNG seed
     block_type    : "mm" (double-stream / joint) or "single" (FLUX only)
@@ -136,6 +188,7 @@ def generate_with_bypass(
     generator = torch.Generator(device=device).manual_seed(seed)
 
     if model_type == "flux":
+        # FLUX.1: local fork supports mm_skip_blocks / single_skip_blocks natively
         latents = torch.randn(
             (1, 4096, 64),
             generator=generator,
@@ -157,6 +210,27 @@ def generate_with_bypass(
             mm_skip_blocks=mm_skip,
             single_skip_blocks=single_skip,
         )
+        return result.images[0]
+
+    elif model_type == "flux2":
+        # FLUX.2: upstream Flux2Pipeline — use monkey-patch bypass
+        if bypass_idx is not None and block_type == "mm":
+            ctx = _flux2_bypass_mm_block(pipe, bypass_idx)
+        elif bypass_idx is not None and block_type == "single":
+            ctx = _flux2_bypass_single_block(pipe, bypass_idx)
+        else:
+            ctx = contextlib.nullcontext()
+
+        with ctx:
+            result = pipe(
+                prompt,
+                height=height,
+                width=width,
+                guidance_scale=gs,
+                output_type="pil",
+                num_inference_steps=num_inference_steps,
+                generator=torch.Generator(device=device).manual_seed(seed),
+            )
         return result.images[0]
 
     else:  # sd3
@@ -186,14 +260,17 @@ def generate_with_bypass(
 # Pipeline loader
 # ---------------------------------------------------------------------------
 
-def _load_with_upstream_diffusers(model_path: str, hf_token: str, pipeline_class_name: str):
+def _load_with_upstream_diffusers(model_path: str, hf_token: str,
+                                   pipeline_class_name: str,
+                                   torch_dtype=torch.float16):
     """
     Load a pipeline using the system (upstream) diffusers installation,
     bypassing the local fork in sys.path.
 
-    Needed for models that require features the local fork doesn't have
-    (e.g. SD 3.5 Large needs qk_norm, FLUX.2-dev needs AutoencoderKLFlux2).
-    Safe because SD3 uses monkey-patch bypass — mm_skip_blocks not needed.
+    Needed for models that require features the local fork doesn't have:
+      FLUX.2-dev   — Flux2Pipeline + bfloat16
+      SD 3.5 Large — qk_norm / norm_added_k
+    Both use monkey-patch bypass so mm_skip_blocks is not needed.
     """
     import sys
     import site
@@ -206,13 +283,13 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str, pipeline_class
     if not sys_diff_dirs:
         raise RuntimeError(
             "System diffusers not found. Install it first:\n"
-            "  pip install 'diffusers>=0.32.0'"
+            "  pip install -U diffusers"
         )
 
     # Snapshot current state
-    saved_path   = list(sys.path)
-    saved_mods   = {k: v for k, v in sys.modules.items()
-                    if k == "diffusers" or k.startswith("diffusers.")}
+    saved_path = list(sys.path)
+    saved_mods = {k: v for k, v in sys.modules.items()
+                  if k == "diffusers" or k.startswith("diffusers.")}
 
     # Build new sys.path: system site-packages first, local fork paths removed
     stripped = [p for p in sys.path
@@ -227,7 +304,7 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str, pipeline_class
         PipelineClass = getattr(_diffusers_upstream, pipeline_class_name)
         pipe = PipelineClass.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
             token=hf_token,
             cache_dir="./models",
         )
@@ -244,19 +321,24 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str, pipeline_class
 def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                   cpu_offload: bool = False):
     """
-    Auto-detect and load FluxPipeline or StableDiffusion3Pipeline.
+    Auto-detect and load the correct pipeline for each model family.
 
-    Compatibility fallbacks for models newer than the local diffusers fork:
-      FLUX.2-dev   — AutoencoderKLFlux2 missing → pre-load VAE as AutoencoderKL
-      SD 3.5 Large — qk_norm / norm_added_k missing → load via upstream diffusers
-    Both fallbacks keep the bypass mechanism intact (mm_skip_blocks for FLUX,
-    monkey-patch for SD3).
+      FLUX.1-dev / schnell  — FluxPipeline (local fork, mm_skip_blocks support)
+      FLUX.2-dev            — Flux2Pipeline (upstream diffusers, bfloat16)
+      SD 3.5 Large          — StableDiffusion3Pipeline (upstream if qk_norm missing)
     """
     from diffusers import FluxPipeline, StableDiffusion3Pipeline, AutoencoderKL
 
     name = model_path.lower()
 
-    if "stable-diffusion-3" in name or "sd3" in name:
+    if "flux.2" in name or "flux2" in name:
+        # FLUX.2-dev requires Flux2Pipeline from upstream diffusers and bfloat16
+        print("[load_pipeline] FLUX.2-dev detected — loading Flux2Pipeline via upstream diffusers.")
+        pipe = _load_with_upstream_diffusers(
+            model_path, hf_token, "Flux2Pipeline", torch_dtype=torch.bfloat16
+        )
+
+    elif "stable-diffusion-3" in name or "sd3" in name:
         try:
             pipe = StableDiffusion3Pipeline.from_pretrained(
                 model_path,
@@ -274,8 +356,9 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
             pipe = _load_with_upstream_diffusers(
                 model_path, hf_token, "StableDiffusion3Pipeline"
             )
+
     else:
-        # FLUX.1-dev, FLUX.1-schnell, FLUX.2-dev
+        # FLUX.1-dev, FLUX.1-schnell — use local fork for mm_skip_blocks support
         try:
             pipe = FluxPipeline.from_pretrained(
                 model_path,
@@ -292,10 +375,10 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                     "FLUX.2-dev requires transformers>=4.52 (Mistral3/Pixtral text encoder).\n"
                     "The current transformers version is too old.\n\n"
                     "Upgrade with:\n"
-                    "  pip install -q --upgrade transformers\n"
-                    "Then RESTART the Colab runtime and re-run.\n\n"
+                    "  pip install -U transformers\n"
+                    "Then restart the runtime and re-run.\n\n"
                     "If the latest stable release still fails, try the dev build:\n"
-                    "  pip install -q git+https://github.com/huggingface/transformers"
+                    "  pip install git+https://github.com/huggingface/transformers"
                 ) from exc
 
             if "AutoencoderKLFlux2" not in exc_str:
@@ -304,7 +387,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
             # AutoencoderKLFlux2 missing from local fork — pre-load VAE as plain AutoencoderKL
             print(
                 "[load_pipeline] Local fork missing AutoencoderKLFlux2.\n"
-                "  Retrying with VAE pre-loaded as AutoencoderKL (FLUX.2-dev workaround).\n"
+                "  Retrying with VAE pre-loaded as AutoencoderKL (FLUX.2 workaround).\n"
                 "  Layer-bypass comparisons remain valid; absolute image quality may differ slightly."
             )
             vae = AutoencoderKL.from_pretrained(
