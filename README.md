@@ -17,27 +17,17 @@ pip install -e .
 export HF_TOKEN=your_huggingface_token_here
 ```
 
-## Generate Prompts
-
-Using built-in prompts (no API needed):
-
-```bash
-python generate_prompts.py
-```
-
-Using Qwen/Qwen3-32B via HuggingFace API (requires HF token):
-
-```bash
-python generate_prompts.py --qwen --hf_token "$HF_TOKEN"
-```
-
 ## Run Experiments
 
-> `--cpu_offload` applied for low RAM (50 GB system RAM is enough). H100 GPU may not require CPU offloading. Also check disk space, clean it when full.
+> Model weights are cached in `./models/`.
+> `--cpu_offload` offloads weights to CPU between inference steps — required on GPUs with limited VRAM (A100 40 GB or less). H100 can run without `--cpu_offload` for faster inference.
+> Check disk space before running large models; clean `./models/` when full.
 
 **`--n_pairs`** contrastive prompt pairs per semantic category (max 50).
 
-**`--n_steps`** denoising steps per image. 4 = fast, 28 = paper quality. FLUX.1-schnell is designed for 4 steps.
+**`--n_steps`** denoising steps per image.
+
+**`--save_images`** save generated images to `results/images_{tag}/full/` (full-model) and `results/images_{tag}/MM-N/` (bypassed).
 
 ### FLUX.1-dev
 
@@ -46,7 +36,8 @@ python experiments/semantic_sensitivity.py \
     --model_path black-forest-labs/FLUX.1-dev \
     --hf_token "$HF_TOKEN" \
     --n_pairs 10 --n_steps 28 \
-    --device cuda --cpu_offload
+    --device cuda --cpu_offload \
+    --save_images
 ```
 
 ### FLUX.1-schnell
@@ -56,7 +47,25 @@ python experiments/semantic_sensitivity.py \
     --model_path black-forest-labs/FLUX.1-schnell \
     --hf_token "$HF_TOKEN" \
     --n_pairs 10 --n_steps 4 \
-    --device cuda --cpu_offload
+    --device cuda --cpu_offload \
+    --save_images
+```
+
+### FLUX.2-dev
+
+> Requires `transformers>=4.52` and `diffusers` (latest). Restart runtime after upgrading.
+```
+!pip install -U diffusers
+!pip install -U transformers
+```
+
+```bash
+python experiments/semantic_sensitivity.py \
+    --model_path black-forest-labs/FLUX.2-dev \
+    --hf_token "$HF_TOKEN" \
+    --n_pairs 10 --n_steps 28 \
+    --device cuda --cpu_offload \
+    --save_images
 ```
 
 ## Plot Results
@@ -64,4 +73,5 @@ python experiments/semantic_sensitivity.py \
 ```bash
 python experiments/plot_semantic_heatmap.py --tag flux1_dev --threshold 0.92
 python experiments/plot_semantic_heatmap.py --tag flux1_schnell --threshold 0.92
+python experiments/plot_semantic_heatmap.py --tag flux2_dev --threshold 0.92
 ```

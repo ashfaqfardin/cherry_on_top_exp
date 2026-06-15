@@ -97,6 +97,20 @@ def model_tag(model_path: str) -> str:
     return name.replace(".", "").replace("-", "_").lower()  # "flux1_dev"
 
 
+def _img_dir(tag: str, layer_label: str) -> str:
+    """Return (and create) the image save directory for a given layer."""
+    d = os.path.join("results", f"images_{tag}", layer_label)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _save_img(img: Image.Image, tag: str, layer_label: str,
+              cat: str, p_idx: int, side: str) -> None:
+    path = os.path.join(_img_dir(tag, layer_label),
+                        f"{cat}_pair{p_idx:02d}_{side}.png")
+    img.save(path)
+
+
 def run_sweep(args):
     os.makedirs("results", exist_ok=True)
     tag       = args.out_tag or model_tag(args.model_path)
@@ -146,11 +160,14 @@ def run_sweep(args):
         for p_idx, (prompt_a, prompt_b) in enumerate(pairs):
             seed = p_idx          # unique seed per pair, same for both sides
             for side, prompt in [("a", prompt_a), ("b", prompt_b)]:
-                full_cache[(cat, p_idx, side)] = generate_with_bypass(
+                img = generate_with_bypass(
                     pipe, prompt, seed=seed,
                     block_type="mm", bypass_idx=None,
                     num_inference_steps=args.n_steps, device=args.device,
                 )
+                full_cache[(cat, p_idx, side)] = img
+                if args.save_images:
+                    _save_img(img, tag, "full", cat, p_idx, side)
     print(f"  Cached {len(full_cache)} full-model images.\n")
 
     # Pre-compute full-model DINOv2 similarity for each pair (once)
@@ -201,6 +218,11 @@ def run_sweep(args):
                     num_inference_steps=args.n_steps, device=args.device,
                 )
 
+                if args.save_images:
+                    layer_label = f"MM-{layer_idx}" if block_type == "mm" else f"S-{layer_idx}"
+                    _save_img(img_a_abl, tag, layer_label, cat, p_idx, "a")
+                    _save_img(img_b_abl, tag, layer_label, cat, p_idx, "b")
+
                 sim_abl  = dino_similarity(img_a_abl, img_b_abl, dino, args.device)
                 sim_full = sim_full_cache[(cat, p_idx)]
 
@@ -226,7 +248,10 @@ def run_sweep(args):
             "matrix":     matrix.tolist(),
         }, f, indent=2)
 
-    print(f"\nDone. Saved:\n  {npy_path}\n  {json_path}")
+    saved_msg = f"\nDone. Saved:\n  {npy_path}\n  {json_path}"
+    if args.save_images:
+        saved_msg += f"\n  results/images_{tag}/"
+    print(saved_msg)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +271,9 @@ def parse_args():
                              "Auto-derived from model name if omitted.")
     parser.add_argument("--device",      type=str, default="cuda")
     parser.add_argument("--cpu_offload", action="store_true")
+    parser.add_argument("--save_images", action="store_true",
+                        help="Save generated images to results/images_{tag}/full/ "
+                             "and results/images_{tag}/layer_MM-N/ etc.")
     return parser.parse_args()
 
 
