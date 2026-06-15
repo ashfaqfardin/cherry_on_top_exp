@@ -66,10 +66,12 @@ def get_block_counts(pipe) -> tuple[int, int]:
 def _default_guidance(pipe) -> float:
     """Return a sensible default guidance scale for the detected model."""
     model_type = detect_model_type(pipe)
-    if model_type == "sd3":
-        return 7.0
     if model_type == "flux2":
         return 4.0
+    if model_type == "sd3":
+        # SD3.5 Large: recommended 4.5; SD3-medium: 7.0
+        model_id = getattr(pipe, "name_or_path", "") or ""
+        return 4.5 if "3.5" in model_id else 7.0
     # FLUX.1: schnell uses 0.0, dev uses 3.5
     model_id = getattr(pipe, "name_or_path", "") or ""
     if "schnell" in model_id.lower():
@@ -84,17 +86,17 @@ def _default_guidance(pipe) -> float:
 @contextlib.contextmanager
 def _sd3_bypass_block(pipe, layer_idx: int):
     """
-    Temporarily replace block.forward so it returns hidden_states and
-    encoder_hidden_states unchanged (skips the block's transformation).
+    Temporarily replace block.forward so it passes tensors through unchanged.
 
     SD3 JointTransformerBlock.forward() signature:
-        (hidden_states, encoder_hidden_states, temb) → (hidden_states, encoder_hidden_states)
+        (hidden_states, encoder_hidden_states, temb, ...) → (encoder_hidden_states, hidden_states)
+    The return order is swapped vs the input order — the skip must match it.
     """
     block = pipe.transformer.transformer_blocks[layer_idx]
     original_forward = block.forward
 
     def _skip(hidden_states, encoder_hidden_states, temb=None, **kwargs):
-        return hidden_states, encoder_hidden_states
+        return encoder_hidden_states, hidden_states  # match actual return order
 
     block.forward = _skip
     try:
@@ -339,10 +341,12 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
         )
 
     elif "stable-diffusion-3" in name or "sd3" in name:
+        # SD3.5 Large uses bfloat16; SD3-medium uses float16
+        sd_dtype = torch.bfloat16 if "3.5" in name else torch.float16
         try:
             pipe = StableDiffusion3Pipeline.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16,
+                torch_dtype=sd_dtype,
                 token=hf_token,
                 cache_dir="./models",
             )
@@ -354,7 +358,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 "  Retrying with system/upstream diffusers — monkey-patch bypass unaffected."
             )
             pipe = _load_with_upstream_diffusers(
-                model_path, hf_token, "StableDiffusion3Pipeline"
+                model_path, hf_token, "StableDiffusion3Pipeline", torch_dtype=sd_dtype
             )
 
     else:
