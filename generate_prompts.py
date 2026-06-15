@@ -475,11 +475,14 @@ SEMANTIC_CATEGORIES = list(SEMANTIC_PROMPTS.keys())
 
 
 def generate_with_qwen(hf_token: str, n_pairs: int = 50,
-                       model: str = "Qwen/Qwen3.5-27B",
+                       model: str = "Qwen/Qwen3-32B",
                        max_retries: int = 3) -> dict:
     """Generate semantic contrast pairs using a Qwen model via HF Inference API."""
     from huggingface_hub import InferenceClient  # type: ignore
     import time
+
+    os.makedirs("./models/huggingface", exist_ok=True)
+    os.environ.setdefault("HF_HOME", os.path.abspath("./models/huggingface"))
 
     client = InferenceClient(token=hf_token, timeout=120)
     short_name = model.split("/")[-1]
@@ -495,6 +498,7 @@ def generate_with_qwen(hf_token: str, n_pairs: int = 50,
         )
 
         pairs = None
+        fatal_error = False
         for attempt in range(1, max_retries + 1):
             try:
                 response = client.chat.completions.create(
@@ -519,6 +523,19 @@ def generate_with_qwen(hf_token: str, n_pairs: int = 50,
                 break
 
             except Exception as e:
+                err_str = str(e)
+                # 4xx client errors (except 429 rate-limit) are not retryable
+                is_client_error = any(
+                    f"{code} " in err_str or f"{code}\n" in err_str
+                    for code in range(400, 500)
+                    if code != 429
+                )
+                if is_client_error:
+                    print(f"    Fatal API error for '{cat}': {e}")
+                    print("    Stopping Qwen generation — falling back to built-in pairs for all remaining categories.")
+                    fatal_error = True
+                    break
+
                 wait = 15 * attempt
                 if attempt < max_retries:
                     print(f"    Attempt {attempt}/{max_retries} failed: {e}. Retrying in {wait}s...")
@@ -527,6 +544,74 @@ def generate_with_qwen(hf_token: str, n_pairs: int = 50,
                     print(f"    All {max_retries} attempts failed for '{cat}'. Using built-in pairs.")
 
         result[cat] = pairs if pairs is not None else SEMANTIC_PROMPTS[cat]
+
+        if fatal_error:
+            # Fill remaining categories with built-in pairs without attempting API calls
+            remaining = SEMANTIC_CATEGORIES[SEMANTIC_CATEGORIES.index(cat) + 1:]
+            for rem_cat in remaining:
+                result[rem_cat] = SEMANTIC_PROMPTS[rem_cat]
+            break
+
+    return result
+
+
+def generate_with_ollama(n_pairs: int = 50,
+                         model: str = "qwen2.5:7b",
+                         host: str = "http://localhost:11434") -> dict:
+    """Generate semantic contrast pairs using a locally running Ollama model."""
+    import requests
+
+    url = f"{host.rstrip('/')}/api/chat"
+    short_name = model
+
+    # Verify Ollama is reachable before starting
+    try:
+        requests.get(f"{host.rstrip('/')}/api/tags", timeout=5)
+    except Exception:
+        raise RuntimeError(
+            f"Cannot reach Ollama at {host}.\n"
+            "Make sure Ollama is running: https://ollama.com\n"
+            f"Then pull the model:  ollama pull {model}"
+        )
+
+    result = {}
+    for cat in SEMANTIC_CATEGORIES:
+        print(f"  Generating '{cat}' pairs with {short_name}...")
+        user_msg = (
+            f"Generate {n_pairs} contrastive image prompt pairs for the semantic category '{cat}'.\n"
+            f"Each pair must differ ONLY in '{cat}', keeping all other details identical.\n"
+            f"Return ONLY a valid JSON array of {n_pairs} two-element arrays, no extra text.\n"
+            f"Example format: [[\"a red apple on a table\", \"a green apple on a table\"], ...]"
+        )
+
+        try:
+            resp = requests.post(url, json={
+                "model": model,
+                "messages": [{"role": "user", "content": user_msg}],
+                "stream": False,
+                "options": {"temperature": 0.7},
+            }, timeout=300)
+            resp.raise_for_status()
+
+            raw = resp.json()["message"]["content"].strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+            parsed = json.loads(raw)
+            pairs = [
+                (str(a), str(b)) for a, b in parsed
+                if len(a) > 0 and len(b) > 0
+            ][:n_pairs]
+
+            if len(pairs) < n_pairs:
+                print(f"    Only got {len(pairs)}/{n_pairs} pairs, filling rest from built-in.")
+                pairs += SEMANTIC_PROMPTS[cat][len(pairs):n_pairs]
+
+            result[cat] = pairs
+
+        except Exception as e:
+            print(f"    Ollama generation failed for '{cat}': {e}. Using built-in pairs.")
+            result[cat] = SEMANTIC_PROMPTS[cat]
 
     return result
 
@@ -566,13 +651,18 @@ def main():
                         help="OpenAI API key — generates vitality prompts via GPT-4o-mini")
     parser.add_argument("--qwen", action="store_true",
                         help="Generate semantic contrast pairs using a Qwen model via HF Inference API")
-    parser.add_argument("--qwen_model", type=str, default="Qwen/Qwen3.5-27B",
-                        help="HF model ID to use with --qwen (default: Qwen/Qwen3.5-27B; "
-                             "use Qwen/Qwen2.5-7B-Instruct for a faster/cheaper alternative)")
+    parser.add_argument("--qwen_model", type=str, default="Qwen/Qwen3-32B",
+                        help="HF model ID to use with --qwen (default: Qwen/Qwen3-32B)")
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN"),
                         help="HuggingFace token (required with --qwen; falls back to $HF_TOKEN)")
+    parser.add_argument("--ollama", action="store_true",
+                        help="Generate semantic contrast pairs using a locally running Ollama model")
+    parser.add_argument("--ollama_model", type=str, default="qwen2.5:7b",
+                        help="Ollama model name to use with --ollama (default: qwen2.5:7b)")
+    parser.add_argument("--ollama_host", type=str, default="http://localhost:11434",
+                        help="Ollama server URL (default: http://localhost:11434)")
     parser.add_argument("--n_pairs", type=int, default=50,
-                        help="Number of contrast pairs per category to generate with Qwen (default 50)")
+                        help="Number of contrast pairs per category to generate (default 50)")
     args = parser.parse_args()
 
     os.makedirs("prompts", exist_ok=True)
@@ -590,13 +680,16 @@ def main():
     print(f"Saved {len(flat_prompts)} prompts → prompts/vitality_prompts.json")
 
     # --- Semantic contrast prompts ---
-    if args.qwen:
+    if args.ollama:
+        print(f"Generating semantic contrast pairs via Ollama ({args.ollama_model})...")
+        semantic = generate_with_ollama(n_pairs=args.n_pairs, model=args.ollama_model, host=args.ollama_host)
+    elif args.qwen:
         if not args.hf_token:
             raise ValueError("--qwen requires a HuggingFace token. Pass --hf_token or set $HF_TOKEN.")
         print(f"Generating semantic contrast pairs via {args.qwen_model}...")
         semantic = generate_with_qwen(args.hf_token, n_pairs=args.n_pairs, model=args.qwen_model)
     else:
-        print("Using built-in semantic contrast pairs (pass --qwen --hf_token to generate via Qwen).")
+        print("Using built-in semantic contrast pairs (pass --ollama or --qwen --hf_token to generate via LLM).")
         semantic = SEMANTIC_PROMPTS
 
     with open("prompts/semantic_prompts.json", "w") as f:

@@ -25,7 +25,7 @@ Using built-in prompts (no API needed):
 python generate_prompts.py
 ```
 
-Using Qwen/Qwen3.5-27B via HuggingFace API (requires HF token):
+Using Qwen/Qwen3-32B via HuggingFace API (requires HF token):
 
 ```bash
 python generate_prompts.py --qwen --hf_token "$HF_TOKEN"
