@@ -283,13 +283,13 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str,
       SD 3.5 Large — qk_norm / norm_added_k
     Both use monkey-patch bypass so mm_skip_blocks is not needed.
     """
-    import sys
-    import site
-
-    # Find system site-packages directories that contain a real diffusers install
+    # Find every entry in sys.path that has a diffusers install,
+    # excluding the local fork. Works in Colab, venvs, and standard installs
+    # without relying on site.getsitepackages() which can miss non-standard paths.
     sys_diff_dirs = [
-        sp for sp in (site.getsitepackages() + [site.getusersitepackages()])
-        if os.path.isfile(os.path.join(sp, "diffusers", "__init__.py"))
+        p for p in sys.path
+        if p != _LOCAL_DIFFUSERS_SRC
+        and os.path.isfile(os.path.join(p, "diffusers", "__init__.py"))
     ]
     if not sys_diff_dirs:
         raise RuntimeError(
@@ -302,11 +302,11 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str,
     saved_mods = {k: v for k, v in sys.modules.items()
                   if k == "diffusers" or k.startswith("diffusers.")}
 
-    # Build new sys.path: system site-packages first, local fork paths removed
-    stripped = [p for p in sys.path
-                if not os.path.isfile(os.path.join(p, "diffusers", "__init__.py"))
-                or p in sys_diff_dirs]
-    sys.path[:] = sys_diff_dirs + [p for p in stripped if p not in sys_diff_dirs]
+    # Build new sys.path: system diffusers dirs first, local fork removed
+    other_paths = [p for p in sys.path
+                   if p not in sys_diff_dirs
+                   and not os.path.isfile(os.path.join(p, "diffusers", "__init__.py"))]
+    sys.path[:] = sys_diff_dirs + other_paths
     for k in list(saved_mods):
         del sys.modules[k]
 
