@@ -3,13 +3,15 @@ Generate 64 diverse prompts (8 per category) for vitality sweep experiments.
 Saves to prompts/vitality_prompts.json and prompts/semantic_prompts.json.
 
 Usage:
-    python generate_prompts.py                         # use built-in prompts
-    python generate_prompts.py --openai_key sk-...     # use OpenAI to generate
+    python generate_prompts.py                              # use built-in prompts
+    python generate_prompts.py --openai_key sk-...          # use OpenAI to generate
+    python generate_prompts.py --qwen --hf_token hf_...     # use Qwen3.5-27B via HF API
 """
 
 import json
 import os
 import argparse
+import re
 
 # ---------------------------------------------------------------------------
 # Hardcoded fallback prompts (8 per category × 8 categories = 64 total)
@@ -469,6 +471,61 @@ SEMANTIC_PROMPTS = {
 }
 
 
+SEMANTIC_CATEGORIES = list(SEMANTIC_PROMPTS.keys())
+
+
+def generate_with_qwen(hf_token: str, n_pairs: int = 50) -> dict:
+    """Generate semantic contrast pairs using Qwen/Qwen3.5-27B via HF Inference API."""
+    from huggingface_hub import InferenceClient  # type: ignore
+
+    client = InferenceClient(
+        model="Qwen/Qwen3.5-27B",
+        token=hf_token,
+    )
+
+    result = {}
+    for cat in SEMANTIC_CATEGORIES:
+        print(f"  Generating '{cat}' pairs with Qwen3.5-27B...")
+        user_msg = (
+            f"Generate {n_pairs} contrastive image prompt pairs for the semantic category '{cat}'.\n"
+            f"Each pair must differ ONLY in '{cat}', keeping all other details identical.\n"
+            f"Return ONLY a valid JSON array of {n_pairs} two-element arrays, no extra text.\n"
+            f"Example format: [[\"a red apple on a table\", \"a green apple on a table\"], ...]"
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model="Qwen/Qwen3.5-27B",
+                messages=[{"role": "user", "content": user_msg}],
+                max_tokens=4096,
+                temperature=0.7,
+            )
+            raw = response.choices[0].message.content.strip()
+
+            # Strip markdown code fences if present
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+            pairs = json.loads(raw)
+            # Validate: list of 2-element lists/tuples of strings
+            pairs = [
+                (str(a), str(b)) for a, b in pairs
+                if len(a) > 0 and len(b) > 0
+            ][:n_pairs]
+
+            if len(pairs) < n_pairs:
+                print(f"    Warning: only got {len(pairs)} pairs, filling rest from built-in.")
+                pairs += SEMANTIC_PROMPTS[cat][len(pairs):n_pairs]
+
+            result[cat] = pairs
+
+        except Exception as e:
+            print(f"    Qwen generation failed for '{cat}': {e}. Using built-in pairs.")
+            result[cat] = SEMANTIC_PROMPTS[cat]
+
+    return result
+
+
 def generate_with_openai(api_key: str) -> list:
     """Use OpenAI to generate 64 prompts (8 per category)."""
     from openai import OpenAI
@@ -501,17 +558,23 @@ def generate_with_openai(api_key: str) -> list:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--openai_key", type=str, default=None,
-                        help="OpenAI API key (optional — uses built-in prompts if omitted)")
+                        help="OpenAI API key — generates vitality prompts via GPT-4o-mini")
+    parser.add_argument("--qwen", action="store_true",
+                        help="Generate semantic contrast pairs using Qwen/Qwen3.5-27B via HF API")
+    parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN"),
+                        help="HuggingFace token (required with --qwen; falls back to $HF_TOKEN)")
+    parser.add_argument("--n_pairs", type=int, default=50,
+                        help="Number of contrast pairs per category to generate with Qwen (default 50)")
     args = parser.parse_args()
 
     os.makedirs("prompts", exist_ok=True)
 
     # --- Vitality prompts ---
     if args.openai_key:
-        print("Generating prompts via OpenAI...")
+        print("Generating vitality prompts via OpenAI...")
         flat_prompts = generate_with_openai(args.openai_key)
     else:
-        print("Using built-in prompt set (pass --openai_key to generate via GPT-4o-mini).")
+        print("Using built-in vitality prompt set (pass --openai_key to generate via GPT-4o-mini).")
         flat_prompts = [p for prompts in BUILTIN_PROMPTS.values() for p in prompts]
 
     with open("prompts/vitality_prompts.json", "w") as f:
@@ -519,8 +582,17 @@ def main():
     print(f"Saved {len(flat_prompts)} prompts → prompts/vitality_prompts.json")
 
     # --- Semantic contrast prompts ---
+    if args.qwen:
+        if not args.hf_token:
+            raise ValueError("--qwen requires a HuggingFace token. Pass --hf_token or set $HF_TOKEN.")
+        print("Generating semantic contrast pairs via Qwen/Qwen3.5-27B...")
+        semantic = generate_with_qwen(args.hf_token, n_pairs=args.n_pairs)
+    else:
+        print("Using built-in semantic contrast pairs (pass --qwen --hf_token to generate via Qwen).")
+        semantic = SEMANTIC_PROMPTS
+
     with open("prompts/semantic_prompts.json", "w") as f:
-        json.dump(SEMANTIC_PROMPTS, f, indent=2)
+        json.dump(semantic, f, indent=2)
     print(f"Saved semantic contrast pairs → prompts/semantic_prompts.json")
 
 
