@@ -474,18 +474,19 @@ SEMANTIC_PROMPTS = {
 SEMANTIC_CATEGORIES = list(SEMANTIC_PROMPTS.keys())
 
 
-def generate_with_qwen(hf_token: str, n_pairs: int = 50) -> dict:
-    """Generate semantic contrast pairs using Qwen/Qwen3.5-27B via HF Inference API."""
+def generate_with_qwen(hf_token: str, n_pairs: int = 50,
+                       model: str = "Qwen/Qwen3.5-27B",
+                       max_retries: int = 3) -> dict:
+    """Generate semantic contrast pairs using a Qwen model via HF Inference API."""
     from huggingface_hub import InferenceClient  # type: ignore
+    import time
 
-    client = InferenceClient(
-        model="Qwen/Qwen3.5-27B",
-        token=hf_token,
-    )
+    client = InferenceClient(token=hf_token, timeout=120)
+    short_name = model.split("/")[-1]
 
     result = {}
     for cat in SEMANTIC_CATEGORIES:
-        print(f"  Generating '{cat}' pairs with Qwen3.5-27B...")
+        print(f"  Generating '{cat}' pairs with {short_name}...")
         user_msg = (
             f"Generate {n_pairs} contrastive image prompt pairs for the semantic category '{cat}'.\n"
             f"Each pair must differ ONLY in '{cat}', keeping all other details identical.\n"
@@ -493,35 +494,39 @@ def generate_with_qwen(hf_token: str, n_pairs: int = 50) -> dict:
             f"Example format: [[\"a red apple on a table\", \"a green apple on a table\"], ...]"
         )
 
-        try:
-            response = client.chat.completions.create(
-                model="Qwen/Qwen3.5-27B",
-                messages=[{"role": "user", "content": user_msg}],
-                max_tokens=4096,
-                temperature=0.7,
-            )
-            raw = response.choices[0].message.content.strip()
+        pairs = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": user_msg}],
+                    max_tokens=4096,
+                    temperature=0.7,
+                )
+                raw = response.choices[0].message.content.strip()
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
 
-            # Strip markdown code fences if present
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
+                parsed = json.loads(raw)
+                pairs = [
+                    (str(a), str(b)) for a, b in parsed
+                    if len(a) > 0 and len(b) > 0
+                ][:n_pairs]
 
-            pairs = json.loads(raw)
-            # Validate: list of 2-element lists/tuples of strings
-            pairs = [
-                (str(a), str(b)) for a, b in pairs
-                if len(a) > 0 and len(b) > 0
-            ][:n_pairs]
+                if len(pairs) < n_pairs:
+                    print(f"    Only got {len(pairs)}/{n_pairs} pairs, filling rest from built-in.")
+                    pairs += SEMANTIC_PROMPTS[cat][len(pairs):n_pairs]
+                break
 
-            if len(pairs) < n_pairs:
-                print(f"    Warning: only got {len(pairs)} pairs, filling rest from built-in.")
-                pairs += SEMANTIC_PROMPTS[cat][len(pairs):n_pairs]
+            except Exception as e:
+                wait = 15 * attempt
+                if attempt < max_retries:
+                    print(f"    Attempt {attempt}/{max_retries} failed: {e}. Retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"    All {max_retries} attempts failed for '{cat}'. Using built-in pairs.")
 
-            result[cat] = pairs
-
-        except Exception as e:
-            print(f"    Qwen generation failed for '{cat}': {e}. Using built-in pairs.")
-            result[cat] = SEMANTIC_PROMPTS[cat]
+        result[cat] = pairs if pairs is not None else SEMANTIC_PROMPTS[cat]
 
     return result
 
@@ -560,7 +565,10 @@ def main():
     parser.add_argument("--openai_key", type=str, default=None,
                         help="OpenAI API key — generates vitality prompts via GPT-4o-mini")
     parser.add_argument("--qwen", action="store_true",
-                        help="Generate semantic contrast pairs using Qwen/Qwen3.5-27B via HF API")
+                        help="Generate semantic contrast pairs using a Qwen model via HF Inference API")
+    parser.add_argument("--qwen_model", type=str, default="Qwen/Qwen3.5-27B",
+                        help="HF model ID to use with --qwen (default: Qwen/Qwen3.5-27B; "
+                             "use Qwen/Qwen2.5-7B-Instruct for a faster/cheaper alternative)")
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN"),
                         help="HuggingFace token (required with --qwen; falls back to $HF_TOKEN)")
     parser.add_argument("--n_pairs", type=int, default=50,
@@ -585,8 +593,8 @@ def main():
     if args.qwen:
         if not args.hf_token:
             raise ValueError("--qwen requires a HuggingFace token. Pass --hf_token or set $HF_TOKEN.")
-        print("Generating semantic contrast pairs via Qwen/Qwen3.5-27B...")
-        semantic = generate_with_qwen(args.hf_token, n_pairs=args.n_pairs)
+        print(f"Generating semantic contrast pairs via {args.qwen_model}...")
+        semantic = generate_with_qwen(args.hf_token, n_pairs=args.n_pairs, model=args.qwen_model)
     else:
         print("Using built-in semantic contrast pairs (pass --qwen --hf_token to generate via Qwen).")
         semantic = SEMANTIC_PROMPTS

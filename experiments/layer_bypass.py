@@ -229,6 +229,7 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str, pipeline_class
             model_path,
             torch_dtype=torch.float16,
             token=hf_token,
+            cache_dir="./models",
         )
     finally:
         sys.path[:] = saved_path
@@ -261,6 +262,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 model_path,
                 torch_dtype=torch.float16,
                 token=hf_token,
+                cache_dir="./models",
             )
         except (ValueError, AttributeError) as exc:
             if "norm_added_k" not in str(exc) and "qk_norm" not in str(exc) and "no attribute" not in str(exc):
@@ -280,6 +282,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 torch_dtype=torch.float16,
                 visualize_attention=False,
                 token=hf_token,
+                cache_dir="./models",
             )
         except AttributeError as exc:
             exc_str = str(exc)
@@ -309,6 +312,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 subfolder="vae",
                 torch_dtype=torch.float16,
                 token=hf_token,
+                cache_dir="./models",
             )
             pipe = FluxPipeline.from_pretrained(
                 model_path,
@@ -316,6 +320,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 torch_dtype=torch.float16,
                 visualize_attention=False,
                 token=hf_token,
+                cache_dir="./models",
             )
 
     if cpu_offload:

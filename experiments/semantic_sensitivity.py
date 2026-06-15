@@ -69,6 +69,7 @@ DINO_PREPROCESS = transforms.Compose([
 # ---------------------------------------------------------------------------
 
 def load_dino(device: str = "cuda"):
+    torch.hub.set_dir("./models/torch_hub")
     model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14",
                            pretrained=True)
     model.eval().to(device)
