@@ -273,7 +273,9 @@ def generate_with_bypass(
 
 def _load_with_upstream_diffusers(model_path: str, hf_token: str,
                                    pipeline_class_name: str,
-                                   torch_dtype=torch.float16):
+                                   torch_dtype=torch.float16,
+                                   cpu_offload: bool = False,
+                                   device: str = "cuda"):
     """
     Load a pipeline using the system (upstream) diffusers installation,
     bypassing the local fork in sys.path.
@@ -282,6 +284,12 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str,
       FLUX.2-dev   — Flux2Pipeline + bfloat16
       SD 3.5 Large — qk_norm / norm_added_k
     Both use monkey-patch bypass so mm_skip_blocks is not needed.
+
+    Device placement is done here, while upstream diffusers modules are still
+    active in sys.modules — this avoids 'No module named diffusers.hooks' errors
+    that occur when the pipe tries lazy imports after sys.modules is restored.
+    On success, sys.path is restored but upstream diffusers stays in sys.modules
+    so the pipe's methods can continue doing lazy imports normally.
     """
     # Find every entry in sys.path that has a diffusers install,
     # excluding the local fork. Works in Colab, venvs, and standard installs
@@ -312,20 +320,43 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str,
 
     try:
         import diffusers as _diffusers_upstream
-        PipelineClass = getattr(_diffusers_upstream, pipeline_class_name)
+        try:
+            PipelineClass = getattr(_diffusers_upstream, pipeline_class_name)
+        except (AttributeError, RuntimeError) as e:
+            if "Mistral3ForConditionalGeneration" in str(e):
+                raise RuntimeError(
+                    "FLUX.2-dev requires transformers>=4.52 (Mistral3/Pixtral text encoder).\n"
+                    "Upgrade with:\n"
+                    "  pip install -U transformers\n"
+                    "Then restart the Colab runtime and re-run."
+                ) from e
+            raise
         pipe = PipelineClass.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
             token=hf_token,
             cache_dir="./models",
         )
-    finally:
+        # Device placement must happen here, while upstream sys.modules is active.
+        # enable_sequential_cpu_offload() does lazy imports from diffusers.hooks
+        # which only exists in upstream diffusers — not in the local fork.
+        if cpu_offload:
+            pipe.enable_sequential_cpu_offload()
+        else:
+            pipe.to(device)
+
+    except Exception:
+        # On failure: fully restore sys.path and sys.modules
         sys.path[:] = saved_path
         for k in list(sys.modules.keys()):
             if k == "diffusers" or k.startswith("diffusers."):
                 del sys.modules[k]
         sys.modules.update(saved_mods)
+        raise
 
+    # On success: restore sys.path so future imports still resolve to local fork,
+    # but keep upstream diffusers in sys.modules so the pipe's lazy imports work.
+    sys.path[:] = saved_path
     return pipe
 
 
@@ -341,11 +372,11 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
     name = model_path.lower()
 
     if "flux.2" in name or "flux2" in name:
-        # FLUX.2-dev: go directly to upstream — do NOT import from local fork here,
-        # as that would drag in system diffusers if the local fork isn't first in sys.path.
+        # FLUX.2-dev: go directly to upstream — device placement handled inside
         print("[load_pipeline] FLUX.2-dev detected — loading Flux2Pipeline via upstream diffusers.")
-        pipe = _load_with_upstream_diffusers(
-            model_path, hf_token, "Flux2Pipeline", torch_dtype=torch.bfloat16
+        return _load_with_upstream_diffusers(
+            model_path, hf_token, "Flux2Pipeline",
+            torch_dtype=torch.bfloat16, cpu_offload=cpu_offload, device=device,
         )
 
     elif "stable-diffusion-3" in name or "sd3" in name:
@@ -366,8 +397,9 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 "[load_pipeline] Local fork missing qk_norm support (SD 3.5 Large feature).\n"
                 "  Retrying with system/upstream diffusers — monkey-patch bypass unaffected."
             )
-            pipe = _load_with_upstream_diffusers(
-                model_path, hf_token, "StableDiffusion3Pipeline", torch_dtype=sd_dtype
+            return _load_with_upstream_diffusers(
+                model_path, hf_token, "StableDiffusion3Pipeline",
+                torch_dtype=sd_dtype, cpu_offload=cpu_offload, device=device,
             )
 
     else:
