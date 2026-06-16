@@ -68,8 +68,31 @@ DINO_PREPROCESS = transforms.Compose([
 # DINOv2 helpers  (same as vitality_sweep.py — paper's chosen metric)
 # ---------------------------------------------------------------------------
 
-def load_dino(device: str = "cuda"):
-    torch.hub.set_dir("./models/torch_hub")
+def _patch_dinov2_for_python39(hub_dir: str) -> None:
+    """Add `from __future__ import annotations` to cached DINOv2 files that use
+    Python 3.10+ union-type syntax (float | None). No-op on Python 3.10+."""
+    import glob
+    if sys.version_info >= (3, 10):
+        return
+    dinov2_dir = os.path.join(hub_dir, "facebookresearch_dinov2_main")
+    if not os.path.isdir(dinov2_dir):
+        return
+    future_line = "from __future__ import annotations\n"
+    for path in glob.glob(os.path.join(dinov2_dir, "**", "*.py"), recursive=True):
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        if "from __future__" in src:
+            continue
+        if " | " not in src:
+            continue
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(future_line + src)
+
+
+def load_dino(device: str = "cuda", cache_dir: str = "./models"):
+    hub_dir = os.path.join(cache_dir, "torch_hub")
+    torch.hub.set_dir(hub_dir)
+    _patch_dinov2_for_python39(hub_dir)
     model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14",
                            pretrained=True)
     model.eval().to(device)
@@ -121,7 +144,7 @@ def run_sweep(args):
     with open("prompts/semantic_prompts.json") as f:
         semantic_prompts = json.load(f)
 
-    pipe = load_pipeline(args.model_path, args.hf_token, args.device, args.cpu_offload)
+    pipe = load_pipeline(args.model_path, args.hf_token, args.device, args.cpu_offload, args.cache_dir)
     N_MM, N_SINGLE = get_block_counts(pipe)
     model_type = detect_model_type(pipe)
     print(f"Model type : {model_type}  |  MM blocks: {N_MM}  Single blocks: {N_SINGLE}")
@@ -146,7 +169,7 @@ def run_sweep(args):
     else:
         matrix = np.full((n_layers, len(CATEGORIES)), np.nan)
 
-    dino = load_dino(args.device)
+    dino = load_dino(args.device, args.cache_dir)
 
     # ------------------------------------------------------------------
     # Pre-generate ALL full-model images for every pair — done ONCE
@@ -271,6 +294,8 @@ def parse_args():
                              "Auto-derived from model name if omitted.")
     parser.add_argument("--device",      type=str, default="cuda")
     parser.add_argument("--cpu_offload", action="store_true")
+    parser.add_argument("--cache_dir",   type=str, default="./models",
+                        help="Directory for model weights and torch hub cache (default: ./models)")
     parser.add_argument("--save_images", action="store_true",
                         help="Save generated images to results/images_{tag}/full/ "
                              "and results/images_{tag}/layer_MM-N/ etc.")

@@ -275,7 +275,8 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str,
                                    pipeline_class_name: str,
                                    torch_dtype=torch.float16,
                                    cpu_offload: bool = False,
-                                   device: str = "cuda"):
+                                   device: str = "cuda",
+                                   cache_dir: str = "./models"):
     """
     Load a pipeline using the system (upstream) diffusers installation,
     bypassing the local fork in sys.path.
@@ -335,7 +336,7 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str,
             model_path,
             torch_dtype=torch_dtype,
             token=hf_token,
-            cache_dir="./models",
+            cache_dir=cache_dir,
         )
         # Device placement must happen here, while upstream sys.modules is active.
         # enable_sequential_cpu_offload() does lazy imports from diffusers.hooks
@@ -361,7 +362,7 @@ def _load_with_upstream_diffusers(model_path: str, hf_token: str,
 
 
 def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
-                  cpu_offload: bool = False):
+                  cpu_offload: bool = False, cache_dir: str = "./models"):
     """
     Auto-detect and load the correct pipeline for each model family.
 
@@ -377,6 +378,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
         return _load_with_upstream_diffusers(
             model_path, hf_token, "Flux2Pipeline",
             torch_dtype=torch.bfloat16, cpu_offload=cpu_offload, device=device,
+            cache_dir=cache_dir,
         )
 
     elif "stable-diffusion-3" in name or "sd3" in name:
@@ -388,7 +390,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 model_path,
                 torch_dtype=sd_dtype,
                 token=hf_token,
-                cache_dir="./models",
+                cache_dir=cache_dir,
             )
         except (ValueError, AttributeError) as exc:
             if "norm_added_k" not in str(exc) and "qk_norm" not in str(exc) and "no attribute" not in str(exc):
@@ -400,6 +402,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
             return _load_with_upstream_diffusers(
                 model_path, hf_token, "StableDiffusion3Pipeline",
                 torch_dtype=sd_dtype, cpu_offload=cpu_offload, device=device,
+                cache_dir=cache_dir,
             )
 
     else:
@@ -411,7 +414,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 torch_dtype=torch.float16,
                 visualize_attention=False,
                 token=hf_token,
-                cache_dir="./models",
+                cache_dir=cache_dir,
             )
         except AttributeError as exc:
             exc_str = str(exc)
@@ -441,7 +444,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 subfolder="vae",
                 torch_dtype=torch.float16,
                 token=hf_token,
-                cache_dir="./models",
+                cache_dir=cache_dir,
             )
             pipe = FluxPipeline.from_pretrained(
                 model_path,
@@ -449,7 +452,7 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 torch_dtype=torch.float16,
                 visualize_attention=False,
                 token=hf_token,
-                cache_dir="./models",
+                cache_dir=cache_dir,
             )
 
     if cpu_offload:
