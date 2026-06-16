@@ -75,3 +75,11 @@ python experiments/plot_semantic_heatmap.py --tag flux1_dev --threshold 0.92
 python experiments/plot_semantic_heatmap.py --tag flux1_schnell --threshold 0.92
 python experiments/plot_semantic_heatmap.py --tag flux2_dev --threshold 0.92
 ```
+
+## Results
+
+Zip the results folder (includes `.npy`, `.json`, plots, and saved images):
+
+```bash
+zip -r results.zip results/
+```
