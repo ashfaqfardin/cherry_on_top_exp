@@ -21,6 +21,7 @@ img = generate_with_bypass(pipe, prompt, seed=0, block_type="mm", bypass_idx=5)
 import contextlib
 import os
 import sys
+import warnings
 from typing import Optional
 
 import torch
@@ -408,14 +409,17 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
     else:
         from diffusers import FluxPipeline, AutoencoderKL  # local fork
         # FLUX.1-dev, FLUX.1-schnell — use local fork for mm_skip_blocks support
+        _w = [("ignore", r".*torch_dtype.*deprecated.*"), ("ignore", r".*Use `dtype` instead.*")]
         try:
-            pipe = FluxPipeline.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                visualize_attention=False,
-                token=hf_token,
-                cache_dir=cache_dir,
-            )
+            with warnings.catch_warnings():
+                for _action, _msg in _w:
+                    warnings.filterwarnings(_action, message=_msg)
+                pipe = FluxPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    token=hf_token,
+                    cache_dir=cache_dir,
+                )
         except AttributeError as exc:
             exc_str = str(exc)
 
@@ -439,21 +443,23 @@ def load_pipeline(model_path: str, hf_token: str, device: str = "cuda",
                 "  Retrying with VAE pre-loaded as AutoencoderKL (FLUX.2 workaround).\n"
                 "  Layer-bypass comparisons remain valid; absolute image quality may differ slightly."
             )
-            vae = AutoencoderKL.from_pretrained(
-                model_path,
-                subfolder="vae",
-                torch_dtype=torch.float16,
-                token=hf_token,
-                cache_dir=cache_dir,
-            )
-            pipe = FluxPipeline.from_pretrained(
-                model_path,
-                vae=vae,
-                torch_dtype=torch.float16,
-                visualize_attention=False,
-                token=hf_token,
-                cache_dir=cache_dir,
-            )
+            with warnings.catch_warnings():
+                for _action, _msg in _w:
+                    warnings.filterwarnings(_action, message=_msg)
+                vae = AutoencoderKL.from_pretrained(
+                    model_path,
+                    subfolder="vae",
+                    torch_dtype=torch.float16,
+                    token=hf_token,
+                    cache_dir=cache_dir,
+                )
+                pipe = FluxPipeline.from_pretrained(
+                    model_path,
+                    vae=vae,
+                    torch_dtype=torch.float16,
+                    token=hf_token,
+                    cache_dir=cache_dir,
+                )
 
     if cpu_offload:
         pipe.enable_sequential_cpu_offload()
