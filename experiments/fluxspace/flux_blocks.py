@@ -393,8 +393,17 @@ class SingleTransformerBlock(torch.nn.Module):
 
         return hidden_states
 
-    def forward(self, hidden_states, temb, image_rotary_emb=None, joint_attention_kwargs=None):
+    def forward(self, hidden_states, temb, image_rotary_emb=None, joint_attention_kwargs=None,
+                encoder_hidden_states=None):
+        # Newer diffusers (>=0.32) passes text and image tokens separately; concat before processing.
+        txt_seq_len = 0
+        if encoder_hidden_states is not None:
+            txt_seq_len = encoder_hidden_states.shape[1]
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        hidden_states_out = self.forward_block(hidden_states, temb, image_rotary_emb=image_rotary_emb, joint_attention_kwargs=joint_attention_kwargs)
+        hidden_states_out = self.forward_block(hidden_states, temb, image_rotary_emb=image_rotary_emb,
+                                               joint_attention_kwargs=joint_attention_kwargs)
 
+        if txt_seq_len > 0:
+            return hidden_states_out[:, :txt_seq_len], hidden_states_out[:, txt_seq_len:]
         return hidden_states_out
