@@ -49,8 +49,8 @@ class TransformerBlock(torch.nn.Module):
         self.ff_context = orig_module.ff_context
 
         ## Other hyperparams
-        self._chunk_size = orig_module._chunk_size
-        self._chunk_dim = orig_module._chunk_dim
+        self._chunk_size = getattr(orig_module, '_chunk_size', None)
+        self._chunk_dim = getattr(orig_module, '_chunk_dim', 0)
 
         ## Module name
         self.module_name = module_name
