@@ -36,12 +36,18 @@ import sys
 
 import torch
 
+# Add repo root to sys.path so 'experiments' is importable as a package
+# (Python only adds the script's own directory by default, not the parent).
+_REPO_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 # Identify the local diffusers fork so it can be excluded when loading upstream diffusers.
 # FluxSpace requires upstream diffusers (>=0.31.0) because it wraps block.forward() to
 # receive joint_attention_kwargs — a calling convention the local fork does not use.
-_LOCAL_DIFFUSERS_SRC = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
-)
+_LOCAL_DIFFUSERS_SRC = os.path.normpath(os.path.join(_REPO_ROOT, "src"))
 
 
 def load_fluxspace_pipeline(model_path: str, hf_token: str,
