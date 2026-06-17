@@ -1,108 +1,57 @@
 {
-  "comment": "Paper: FluxSpace (Dalva et al., CVPR 2025) — exact hyperparameters from arXiv:2412.09611. Global defaults apply to every run unless overridden per-run.",
+  "comment": "Exact hyperparameters from the official FluxSpace demo notebook (gemlab-vt/FluxSpace). max_sequence_length=256 matches the demo; seed is per-run.",
 
   "global": {
     "model_path": "black-forest-labs/FLUX.1-dev",
     "n_steps": 30,
-    "seed": 0,
     "guidance_scale": 3.5,
     "height": 1024,
     "width": 1024,
-    "attention_threshold": 0.5,
-    "edit_start_iter": 0,
+    "max_sequence_length": 256,
     "edit_stop_iter": null
   },
 
   "runs": [
     {
-      "name": "eyeglasses",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "eyeglasses",
-      "edit_global_scale": 0.8,
-      "edit_content_scale": 5,
-      "edit_start_iter": 3,
-      "attention_threshold": 0.5
-    },
-    {
-      "name": "smile",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "smiling",
-      "edit_global_scale": 0.5,
-      "edit_content_scale": 8,
-      "edit_start_iter": 5,
-      "attention_threshold": 0.5
-    },
-    {
-      "name": "sunglasses",
-      "prompt": "portrait photo of a man",
+      "name": "man_sunglasses",
+      "seed": 10,
+      "prompt": "a handsome man is walking on the street",
       "edit_prompt": "sunglasses",
-      "edit_global_scale": 0.5,
-      "edit_content_scale": 5,
-      "edit_start_iter": 2,
+      "edit_start_iter": 6,
+      "edit_global_scale": 0.8,
+      "edit_content_scale": 3,
       "attention_threshold": 0.5
     },
     {
-      "name": "beard",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "beard",
+      "name": "woman_smiling",
+      "seed": 0,
+      "prompt": "portrait photo of a blonde woman",
+      "edit_prompt": "smiling",
+      "edit_start_iter": 3,
       "edit_global_scale": 0.5,
       "edit_content_scale": 5,
-      "edit_start_iter": 3,
       "attention_threshold": 0.5
     },
     {
-      "name": "age",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "age",
+      "name": "cupcake_sprinkles",
+      "seed": 42,
+      "prompt": "A delicious cupcake",
+      "edit_prompt": "sprinkles",
+      "edit_start_iter": 1,
       "edit_global_scale": 0.5,
       "edit_content_scale": 5,
-      "edit_start_iter": 3,
       "attention_threshold": 0.5
     },
     {
-      "name": "gender",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "female",
-      "edit_global_scale": 0.5,
-      "edit_content_scale": 5,
-      "edit_start_iter": 3,
-      "attention_threshold": 0.5
-    },
-    {
-      "name": "comics_style",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "comics style",
-      "edit_global_scale": 0.5,
-      "edit_content_scale": 0,
-      "edit_start_iter": 3,
-      "attention_threshold": 0
-    },
-    {
-      "name": "3d_cartoon_style",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "3D cartoon style",
-      "edit_global_scale": 0.5,
-      "edit_content_scale": 0,
-      "edit_start_iter": 3,
-      "attention_threshold": 0
-    },
-    {
-      "name": "anime_style",
-      "prompt": "portrait photo of a man",
+      "name": "portrait_anime",
+      "seed": 99,
+      "prompt": "portrait of a person",
       "edit_prompt": "anime style",
-      "edit_global_scale": 0.5,
-      "edit_content_scale": 0,
-      "edit_start_iter": 3,
-      "attention_threshold": 0
-    },
-    {
-      "name": "cinematic_lighting",
-      "prompt": "portrait photo of a man",
-      "edit_prompt": "cinematic lighting",
-      "edit_global_scale": 0.5,
-      "edit_content_scale": 0,
-      "edit_start_iter": 3,
-      "attention_threshold": 0
+      "edit_start_iter": 0,
+      "edit_stop_iter": 3,
+      "edit_global_scale": 0.8,
+      "edit_content_scale": 4.0,
+      "attention_threshold": 0.0
     }
   ]
 }

@@ -131,6 +131,7 @@ def generate_fluxspace(pipe, prompt: str, edit_prompt: str, seed: int = 0,
                        num_inference_steps: int = 30,
                        guidance_scale: float = 3.5,
                        height: int = 1024, width: int = 1024,
+                       max_sequence_length: int = 256,
                        device: str = "cuda"):
     """Generate one image with FluxSpace semantic editing applied."""
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -147,6 +148,7 @@ def generate_fluxspace(pipe, prompt: str, edit_prompt: str, seed: int = 0,
         guidance_scale=guidance_scale,
         height=height,
         width=width,
+        max_sequence_length=max_sequence_length,
         output_type="pil",
     )
     return result.images[0]
@@ -162,6 +164,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     guidance_scale   = cfg.get("guidance_scale", 3.5)
     height           = cfg.get("height", 1024)
     width            = cfg.get("width", 1024)
+    max_seq_len      = cfg.get("max_sequence_length", 256)
     global_scale     = cfg.get("edit_global_scale", 0.5)
     content_scale    = cfg.get("edit_content_scale", 0.5)
     start_iter       = cfg.get("edit_start_iter", 0)
@@ -178,7 +181,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         edit_global_scale=0.0, edit_content_scale=0.0,
         edit_start_iter=n_steps, edit_stop_iter=n_steps,
         num_inference_steps=n_steps, guidance_scale=guidance_scale,
-        height=height, width=width, device=device,
+        height=height, width=width, max_sequence_length=max_seq_len, device=device,
     )
 
     print(f"  Generating edited...")
@@ -188,7 +191,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         edit_start_iter=start_iter, edit_stop_iter=stop_iter,
         attention_threshold=attn_thresh,
         num_inference_steps=n_steps, guidance_scale=guidance_scale,
-        height=height, width=width, device=device,
+        height=height, width=width, max_sequence_length=max_seq_len, device=device,
     )
 
     if save_images:
@@ -251,6 +254,8 @@ def parse_args():
     parser.add_argument("--guidance_scale",      type=float, default=3.5)
     parser.add_argument("--height",              type=int,   default=1024)
     parser.add_argument("--width",               type=int,   default=1024)
+    parser.add_argument("--max_sequence_length", type=int,   default=256,
+                        help="T5 max token length (default 256, matches demo)")
     parser.add_argument("--seed",                type=int,   default=0)
 
     # --- Infrastructure (shared between both modes) ---
@@ -311,6 +316,7 @@ def main():
             "guidance_scale": args.guidance_scale,
             "height": args.height,
             "width": args.width,
+            "max_sequence_length": args.max_sequence_length,
             "edit_global_scale": args.edit_global_scale,
             "edit_content_scale": args.edit_content_scale,
             "edit_start_iter": args.edit_start_iter,
