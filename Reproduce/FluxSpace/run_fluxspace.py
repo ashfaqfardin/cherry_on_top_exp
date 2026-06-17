@@ -10,7 +10,7 @@ The method injects an edit direction into each MM-DiT block's attention:
 
 Usage — single run
 ------------------
-python experiments/run_fluxspace.py \\
+python Reproduce/FluxSpace/run_fluxspace.py \\
     --hf_token "$HF_TOKEN" \\
     --prompt "portrait photo of a man" \\
     --edit_prompt "eyeglasses" \\
@@ -20,7 +20,7 @@ python experiments/run_fluxspace.py \\
 
 Usage — reproduce all paper runs from config file
 -------------------------------------------------
-python experiments/run_fluxspace.py \\
+python Reproduce/FluxSpace/run_fluxspace.py \\
     --hf_token "$HF_TOKEN" \\
     --config prompts/reproduce_fluxspace.json \\
     --device cuda --cpu_offload \\
@@ -36,10 +36,10 @@ import sys
 
 import torch
 
-# Add repo root to sys.path so 'experiments' is importable as a package
-# (Python only adds the script's own directory by default, not the parent).
+# Add repo root to sys.path so 'Reproduce' is importable as a package.
+# Script lives at Reproduce/FluxSpace/run_fluxspace.py, so go up two levels.
 _REPO_ROOT = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 )
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -88,7 +88,7 @@ def load_fluxspace_pipeline(model_path: str, hf_token: str,
     try:
         # Import while upstream diffusers is active — module is cached for the lifetime of
         # this process, so the pipeline's lazy imports will always resolve to upstream.
-        from experiments.fluxspace.flux_semantic_pipeline import GenerationPipelineSemantic
+        from Reproduce.FluxSpace.flux_semantic_pipeline import GenerationPipelineSemantic
 
         pipe = GenerationPipelineSemantic.from_pretrained(
             model_path,

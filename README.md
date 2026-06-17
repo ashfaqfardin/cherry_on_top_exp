@@ -111,7 +111,7 @@ Edits a generated image by injecting an attribute into FLUX.1-dev's attention la
 ### Reproduce all paper runs (config file)
 
 ```bash
-python experiments/run_fluxspace.py \
+python Reproduce/FluxSpace/run_fluxspace.py \
     --hf_token "$HF_TOKEN" \
     --config prompts/reproduce_fluxspace.json \
     --device cuda --cpu_offload \
@@ -128,7 +128,7 @@ Saves one `original.png` + `edited.png` per run under `results/fluxspace/{name}/
 λ_coarse=0.8, λ_fine=5, start_iter=3
 
 ```bash
-python experiments/run_fluxspace.py \
+python Reproduce/FluxSpace/run_fluxspace.py \
     --model_path black-forest-labs/FLUX.1-dev \
     --hf_token "$HF_TOKEN" \
     --prompt "portrait photo of a man" \
@@ -148,7 +148,7 @@ python experiments/run_fluxspace.py \
 λ_coarse=0.5, λ_fine=8, start_iter=5
 
 ```bash
-python experiments/run_fluxspace.py \
+python Reproduce/FluxSpace/run_fluxspace.py \
     --model_path black-forest-labs/FLUX.1-dev \
     --hf_token "$HF_TOKEN" \
     --prompt "portrait photo of a man" \
@@ -171,7 +171,7 @@ Scene: `fall`, `snow`, `sunny`, `cherry blossom`, `raining`
 
 For style edits the paper uses λ_coarse only (λ_fine=0, τ_m=0):
 ```bash
-python experiments/run_fluxspace.py \
+python Reproduce/FluxSpace/run_fluxspace.py \
     --model_path black-forest-labs/FLUX.1-dev \
     --hf_token "$HF_TOKEN" \
     --prompt "portrait photo of a man" \
