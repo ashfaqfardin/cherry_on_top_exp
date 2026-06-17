@@ -320,13 +320,19 @@ class GenerationPipelineSemantic(DiffusionPipeline, FromSingleFileMixin):
             set_attr_raw(self.transformer, transformer_module, unit)
 
     def get_temb_for_projections(self, timestep, pooled_projections, guidance=None):
+        tte = self.transformer.time_text_embed
+        tte_dev = next(tte.parameters()).device
+        out_dev = timestep.device
+        timestep = timestep.to(tte_dev)
+        pooled_projections = pooled_projections.to(tte_dev)
+        if guidance is not None:
+            guidance = guidance.to(tte_dev)
         temb = (
-            self.transformer.time_text_embed(timestep, pooled_projections)
+            tte(timestep, pooled_projections)
             if guidance is None
-            else self.transformer.time_text_embed(timestep, guidance, pooled_projections)
+            else tte(timestep, guidance, pooled_projections)
         )
-
-        return temb
+        return temb.to(out_dev)
 
     @torch.no_grad()
     def __call__(
