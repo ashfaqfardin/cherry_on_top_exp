@@ -480,9 +480,11 @@ class GenerationPipelineSemantic(DiffusionPipeline, FromSingleFileMixin):
                 if self.interrupt:
                     continue
 
-                self._joint_attention_kwargs["edit_prompt_embeds"] = self.transformer.context_embedder(edit_prompt_embeds)
-
-                self._joint_attention_kwargs["neg_prompt_embeds"] = self.transformer.context_embedder(neg_prompt_embeds)
+                _ce = self.transformer.context_embedder
+                _ce_dev = next(_ce.parameters()).device
+                _lat_dev = latents.device
+                self._joint_attention_kwargs["edit_prompt_embeds"] = _ce(edit_prompt_embeds.to(_ce_dev)).to(_lat_dev)
+                self._joint_attention_kwargs["neg_prompt_embeds"] = _ce(neg_prompt_embeds.to(_ce_dev)).to(_lat_dev)
 
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
