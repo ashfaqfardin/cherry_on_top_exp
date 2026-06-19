@@ -46,28 +46,21 @@ _REPO_ROOT = os.path.normpath(
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from diffusers.models.attention_processor import FluxAttnProcessor2_0
+
 from Reproduce.FreeFlux.non_rigid.pipeline_flux_non_rigid import FluxPipeline
 from Reproduce.FreeFlux.non_rigid.non_rigid_attn_utils import register_non_rigid_attention_control
 
 
 def load_freeflux_pipeline(model_path: str, hf_token: str,
                             device: str = "cuda", cpu_offload: bool = False,
-                            cache_dir: str = "./models",
-                            start_step: int = 4, start_layer: int = 0,
-                            n_steps: int = 28):
-    """Load FluxPipeline and register the non-rigid attention processor."""
+                            cache_dir: str = "./models"):
+    """Load FluxPipeline. Attention processor is registered per-run inside run_non_rigid_edit."""
     pipe = FluxPipeline.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         token=hf_token,
         cache_dir=cache_dir,
-    )
-
-    register_non_rigid_attention_control(
-        pipe,
-        start_step=start_step,
-        start_layer=start_layer,
-        total_steps=n_steps,
     )
 
     if cpu_offload:
@@ -110,19 +103,21 @@ def run_non_rigid_edit(pipe, source_image_path: str,
                        n_steps: int = 28, guidance_scale: float = 3.5,
                        height: int = 1024, width: int = 1024,
                        max_sequence_length: int = 512,
-                       device: str = "cuda"):
-    """Invert source image then generate the edited target."""
+                       device: str = "cuda",
+                       start_step: int = 4, start_layer: int = 0):
+    """Invert source image then generate the edited target.
+
+    Inversion uses standard attention (batch=1).
+    Editing uses non-rigid attention (batch=2: [src, tgt]).
+    The processor must be switched between passes — registering non_rigid during
+    inversion would cause masactrl_forward to fail on batch-size 1.
+    """
     dtype = torch.bfloat16
 
     # Encode source image
     src_latents = encode_image_to_latents(pipe, source_image_path, height, width, device, dtype)
 
-    # Step 1: forward inversion with source prompt
-    print("  Inverting source image...")
-    inverted_latents = pipe(
-        prompt=source_prompt,
-        latents=src_latents.clone(),
-        invert_image=True,
+    common_kwargs = dict(
         num_inference_steps=n_steps,
         guidance_scale=guidance_scale,
         height=height,
@@ -130,18 +125,30 @@ def run_non_rigid_edit(pipe, source_image_path: str,
         max_sequence_length=max_sequence_length,
     )
 
-    # Step 2: edit — batch [src_prompt, tgt_prompt] with inverted latents for source
+    # Step 1: standard attention for inversion — batch=1, masactrl must NOT run
+    pipe.transformer.set_attn_processor(FluxAttnProcessor2_0())
+    print("  Inverting source image...")
+    inverted_latents = pipe(
+        prompt=source_prompt,
+        latents=src_latents.clone(),
+        invert_image=True,
+        **common_kwargs,
+    )
+
+    # Step 2: non-rigid attention for editing — batch=2 [src, tgt]
+    register_non_rigid_attention_control(
+        pipe,
+        start_step=start_step,
+        start_layer=start_layer,
+        total_steps=n_steps,
+    )
     print("  Generating edited image...")
     result = pipe(
         prompt=[source_prompt, target_prompt],
         latents=src_latents.repeat(2, 1, 1),
         inverted_latent_list=inverted_latents,
-        num_inference_steps=n_steps,
-        guidance_scale=guidance_scale,
-        height=height,
-        width=width,
-        max_sequence_length=max_sequence_length,
         output_type="pil",
+        **common_kwargs,
     )
 
     # result.images[0] = source reconstruction, result.images[1] = edited
@@ -159,9 +166,12 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     height          = cfg.get("height", 1024)
     width           = cfg.get("width", 1024)
     max_seq_len     = cfg.get("max_sequence_length", 512)
+    start_step      = cfg.get("start_step", 4)
+    start_layer     = cfg.get("start_layer", 0)
 
     print(f"\n[{name}]  source='{source_prompt}'  target='{target_prompt}'")
     print(f"         steps={n_steps}  guidance={guidance_scale}  size={height}x{width}")
+    print(f"         start_step={start_step}  start_layer={start_layer}")
 
     img_src_recon, img_edited = run_non_rigid_edit(
         pipe,
@@ -174,6 +184,8 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         width=width,
         max_sequence_length=max_seq_len,
         device=device,
+        start_step=start_step,
+        start_layer=start_layer,
     )
 
     if save_images:
@@ -268,11 +280,8 @@ def main():
         args.model_path, args.hf_token,
         device=args.device, cpu_offload=args.cpu_offload,
         cache_dir=args.cache_dir,
-        start_step=args.start_step,
-        start_layer=args.start_layer,
-        n_steps=args.n_steps,
     )
-    print("[FreeFlux] Model loaded. Non-rigid attention processor registered.")
+    print("[FreeFlux] Model loaded.")
 
     if args.config:
         runs = load_config(args.config)
@@ -296,6 +305,8 @@ def main():
             "height":             args.height,
             "width":              args.width,
             "max_sequence_length": args.max_sequence_length,
+            "start_step":         args.start_step,
+            "start_layer":        args.start_layer,
         }
         run_single(pipe, cfg,
                    out_dir=args.out_dir,
