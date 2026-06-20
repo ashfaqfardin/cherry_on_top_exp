@@ -16,13 +16,13 @@
     {
       "name": "cat_yarn_generated",
       "source_prompt": "a cat sitting on a wooden floor",
-      "target_prompt": "a cat sitting on a wooden floor with a ball of yarn",
+      "target_prompt": "a cat sitting on a wooden floor with a ball of yarn near it",
       "added_word": "yarn"
     },
     {
       "name": "dog_ball_generated",
       "source_prompt": "a yellow dog sitting on grass",
-      "target_prompt": "a yellow dog sitting on grass with a ball",
+      "target_prompt": "a yellow dog sitting on grass with a ball near it",
       "added_word": "ball"
     },
     {
@@ -32,32 +32,10 @@
       "added_word": "cone"
     },
     {
-      "name": "cat_yarn_real",
-      "source_image": "inputs/cat.jpg",
-      "source_prompt": "a cat sitting",
-      "target_prompt": "a cat sitting with a ball of yarn",
-      "added_word": "yarn"
-    },
-    {
-      "name": "dog_bone_real",
-      "source_image": "inputs/dog.jpg",
-      "source_prompt": "a yellow Labrador dog",
-      "target_prompt": "a yellow Labrador dog with a bone",
-      "added_word": "bone"
-    },
-    {
-      "name": "car_cone_real",
-      "source_image": "inputs/car.jpg",
-      "source_prompt": "a red sports car parked",
-      "target_prompt": "a red sports car parked with a traffic cone beside it",
-      "added_word": "cone"
-    },
-    {
-      "name": "bottle_flower_real",
-      "source_image": "inputs/bottle.jpg",
-      "source_prompt": "a bottle standing on a table",
-      "target_prompt": "a bottle standing on a table with flowers next to it",
-      "added_word": "flowers"
+      "name": "bird_feeder_generated",
+      "source_prompt": "a small bird perched on a tree branch",
+      "target_prompt": "a small bird perched on a tree branch with a bird feeder nearby",
+      "added_word": "bird feeder"
     }
   ]
 }
