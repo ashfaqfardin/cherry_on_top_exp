@@ -211,6 +211,10 @@ def run_add_object_generated(pipe, source_prompt: str, target_prompt: str,
         **common_kwargs,
     )
     print(f"            Derived {len(derive_idx_list)} spatial token indices for object region.")
+    if not derive_idx_list:
+        print("  WARNING: empty spatial mask — the attention map produced no foreground patches for "
+              f"'{added_word}'. The edited image may look identical to the source. "
+              "Try a different seed, lower derive_step, or a simpler added_word.")
 
     # ── Pass 3: add-object attention → edited image ──────────────────────────
     print("  [Pass 3/3] Generating edited image (add-object attention)...")
@@ -289,6 +293,10 @@ def run_add_object_real(pipe, source_image_path: str,
         **common_kwargs,
     )
     print(f"            Derived {len(derive_idx_list)} spatial token indices for object region.")
+    if not derive_idx_list:
+        print("  WARNING: empty spatial mask — the attention map produced no foreground patches for "
+              f"'{added_word}'. The edited image may look identical to the source. "
+              "Try a different seed, lower derive_step, or a simpler added_word.")
 
     # ── Pass 3: add-object → edited image ───────────────────────────────────
     print("  [Pass 3/4] Generating edited image (add-object attention)...")

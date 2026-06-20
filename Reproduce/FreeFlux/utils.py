@@ -1,3 +1,4 @@
+import copy
 from PIL import Image
 import numpy as np
 import torch
@@ -20,6 +21,11 @@ def resize_and_concat_images(image_list, resize_width=512, resize_height=512):
     for i, img in enumerate(resized_images):
         concat_image.paste(img, (i * resize_width, 0))
     return concat_image
+
+def find_tightest_list(solutions):
+    """Return the ascending sequence whose elements span the smallest range."""
+    return min(solutions, key=lambda seq: seq[-1] - seq[0] if len(seq) > 1 else 0)
+
 
 def find_ascending_sequence(lists):
     result = []
