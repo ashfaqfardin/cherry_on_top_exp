@@ -32,11 +32,25 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-# also ensure the Infinity submodule is importable (users clone it alongside
-# this repo or install it; we look for it under <root>/Infinity if present)
-_INF = os.path.join(_ROOT, "Infinity")
-if os.path.isdir(_INF) and _INF not in sys.path:
-    sys.path.insert(0, _INF)
+# ── find the Infinity repo ────────────────────────────────────────────
+# Check in order: --infinity_repo CLI arg (handled later), sibling of repo
+# root, common Colab/cloud paths, current working directory.
+_INF_CANDIDATES = [
+    os.path.join(_ROOT, "Infinity"),           # <repo_root>/Infinity/
+    "/content/Infinity",                        # Colab default clone location
+    os.path.join(os.getcwd(), "Infinity"),      # cwd/Infinity/
+    os.path.expanduser("~/Infinity"),           # ~/Infinity/
+]
+
+def _add_infinity_to_path(path: str) -> bool:
+    if os.path.isdir(os.path.join(path, "tools")) and path not in sys.path:
+        sys.path.insert(0, path)
+        return True
+    return False
+
+for _cand in _INF_CANDIDATES:
+    if _add_infinity_to_path(_cand):
+        break
 
 import torch
 from PIL import Image
@@ -113,9 +127,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SVD style personalization (Infinity-2B)")
 
     # ── model ────────────────────────────────────────────────────────
+    p.add_argument("--infinity_repo", type=str, default="",
+                   help="Path to the cloned Infinity repo (the directory that "
+                        "contains tools/run_infinity.py).  Auto-detected when "
+                        "omitted.")
     p.add_argument("--infinity_path", type=str, default="",
                    help="Path to Infinity-2B checkpoint (.pth).  "
-                        "Falls back to cache_dir/infinity_2b.pth")
+                        "Falls back to cache_dir/infinity_2b_reg.pth")
     p.add_argument("--vae_path", type=str, default="",
                    help="Path to BSQ-VAE d32 checkpoint (.pth).  "
                         "Falls back to cache_dir/infinity_vae_d32.pth")
