@@ -1,0 +1,38 @@
+{
+  "comment": "Demo runs for SVD-based style personalization on Infinity-2B. Each run generates a 1024×1024 image in the style of the reference image. Place your own style reference images in inputs/ before running.",
+
+  "global": {
+    "pfb_alpha": 1.0,
+    "cfg": 3.0,
+    "tau": 1.0,
+    "top_k": 900,
+    "top_p": 0.97,
+    "cfg_insertion_layer": -5,
+    "height": 1024,
+    "width": 1024,
+    "seed": 0
+  },
+
+  "runs": [
+    {
+      "name": "cat_watercolor",
+      "style_image": "inputs/watercolor_ref.jpg",
+      "prompt": "a cat sitting on a windowsill in watercolor painting style"
+    },
+    {
+      "name": "castle_oilpainting",
+      "style_image": "inputs/oilpainting_ref.jpg",
+      "prompt": "a medieval castle on a hill in oil painting style"
+    },
+    {
+      "name": "robot_3d",
+      "style_image": "inputs/3d_render_ref.jpg",
+      "prompt": "a friendly robot standing in a room in 3D rendering style"
+    },
+    {
+      "name": "fox_cartoon",
+      "style_image": "inputs/cartoon_ref.jpg",
+      "prompt": "a fox running through a forest in cartoon illustration style"
+    }
+  ]
+}
