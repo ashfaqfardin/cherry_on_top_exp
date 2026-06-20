@@ -28,9 +28,7 @@ Two mechanisms are applied to the generation path:
 ## Prerequisites
 
 1. Clone the [Infinity repo](https://github.com/FoundationVision/Infinity) and add it to `PYTHONPATH`, or place it at `<repo_root>/Infinity/`.
-2. Download the model checkpoints:
-   - `infinity_2b.pth` — Infinity-2B transformer
-   - `infinity_vae_d32.pth` — BSQ-VAE d32
+2. Checkpoints (`infinity_2b_reg.pth` and `infinity_vae_d32.pth`) are **auto-downloaded** from `FoundationVision/infinity` on first run. Pass your HuggingFace token via `--hf_token` or set `HF_TOKEN` in the environment to avoid rate limits.
 3. The T5 text encoder (`google/flan-t5-xl`) is loaded from HuggingFace automatically.
 
 ---
@@ -39,14 +37,23 @@ Two mechanisms are applied to the generation path:
 
 ```bash
 python Reproduce/SVD/run_svd_style.py \
-    --infinity_path  models/infinity_2b.pth \
-    --vae_path       models/infinity_vae_d32.pth \
-    --t5_path        google/flan-t5-xl \
-    --style_image    inputs/watercolor_ref.jpg \
-    --prompt         "a cat sitting on a windowsill in watercolor painting style" \
+    --style_image  inputs/watercolor_ref.jpg \
+    --prompt       "a cat sitting on a windowsill in watercolor painting style" \
+    --hf_token     YOUR_HF_TOKEN \
     --seed 0 \
     --device cuda \
     --save_images
+```
+
+Checkpoints are downloaded automatically on first run to `./models/`. You can also point to existing files:
+
+```bash
+python Reproduce/SVD/run_svd_style.py \
+    --infinity_path  models/infinity_2b_reg.pth \
+    --vae_path       models/infinity_vae_d32.pth \
+    --style_image    inputs/watercolor_ref.jpg \
+    --prompt         "a cat sitting on a windowsill in watercolor painting style" \
+    --seed 0 --device cuda --save_images
 ```
 
 Output: `results/svd_style/output/generated.png`
@@ -94,7 +101,8 @@ Per-run keys override `global`. `style_image` is relative to the repo root.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--infinity_path` | `models/infinity_2b.pth` | Infinity-2B transformer checkpoint |
+| `--hf_token` | env `HF_TOKEN` | HuggingFace access token for downloads |
+| `--infinity_path` | `models/infinity_2b_reg.pth` | Infinity-2B transformer checkpoint (auto-downloaded) |
 | `--vae_path` | `models/infinity_vae_d32.pth` | BSQ-VAE d32 checkpoint |
 | `--t5_path` | `google/flan-t5-xl` | HuggingFace ID or local path for T5 |
 | `--cache_dir` | `./models` | Directory for model weight cache |

@@ -276,7 +276,7 @@ def _styled_infer_cfg(
     autoregressive_infer_cfg method from infinity/models/infinity.py.
     Only the two injection points and the final decode step differ.
     """
-    from infinity.utils.misc import sample_with_top_k_top_p_also_inplace_modifying_logits_ as _sample
+    from infinity.models.infinity import sample_with_top_k_top_p_also_inplace_modifying_logits_ as _sample
 
     B = 2  # dual-stream: 0 = content, 1 = generation
 
@@ -548,22 +548,50 @@ def generate_styled(
     return Image.fromarray(img_np)
 
 
+def _hf_download_checkpoint(
+    repo_id: str,
+    filename: str,
+    local_dir: str,
+    token: str | None = None,
+) -> str:
+    """Download a single file from HF Hub into local_dir if not already present."""
+    import os
+    from huggingface_hub import hf_hub_download
+
+    dest = os.path.join(local_dir, filename)
+    if os.path.isfile(dest):
+        return dest
+
+    os.makedirs(local_dir, exist_ok=True)
+    print(f"  Downloading {repo_id}/{filename} → {local_dir}")
+    hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        local_dir=local_dir,
+        token=token,
+    )
+    return dest
+
+
 def load_model(
     model_path: str,
     vae_path: str,
     t5_path: str,
     device: str = "cuda",
     cache_dir: str = "./models",
+    hf_token: str | None = None,
 ):
     """
-    Load Infinity-2B, BSQ-VAE-d32, and Flan-T5-XL from local checkpoints.
+    Load Infinity-2B, BSQ-VAE-d32, and Flan-T5-XL.
 
-    model_path : path to infinity_2b.pth  (transformer checkpoint)
-    vae_path   : path to infinity_vae_d32.pth
+    model_path : local path to infinity_2b_reg.pth; auto-downloaded from
+                 FoundationVision/infinity if the file is missing.
+    vae_path   : local path to infinity_vae_d32.pth; same auto-download logic.
     t5_path    : HuggingFace model ID or local dir for the T5 text encoder
                  (e.g. 'google/flan-t5-xl')
     device     : 'cuda' or 'cpu'
-    cache_dir  : directory to cache HF downloads
+    cache_dir  : directory for downloaded checkpoints
+    hf_token   : HuggingFace token; falls back to HF_TOKEN env variable.
 
     Returns (infinity, vae, text_tokenizer, text_encoder, scale_schedule).
     scale_schedule is for 1024×1024 (pn='1M', aspect 1:1), 12 scales.
@@ -573,6 +601,24 @@ def load_model(
 
     from tools.run_infinity import load_tokenizer, load_visual_tokenizer, load_transformer
     from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
+
+    # ── resolve HF token and inject into environment ──────────────────
+    # Setting HF_TOKEN ensures all huggingface_hub / transformers calls
+    # (including load_tokenizer inside Infinity) are authenticated.
+    token = hf_token or os.environ.get("HF_TOKEN") or None
+    if token:
+        os.environ["HF_TOKEN"] = token
+
+    # ── auto-download checkpoints if missing ──────────────────────────
+    _INF_REPO = "FoundationVision/infinity"
+    if not os.path.isfile(model_path):
+        model_path = _hf_download_checkpoint(
+            _INF_REPO, "infinity_2b_reg.pth", cache_dir, token=token
+        )
+    if not os.path.isfile(vae_path):
+        vae_path = _hf_download_checkpoint(
+            _INF_REPO, "infinity_vae_d32.pth", cache_dir, token=token
+        )
 
     # ── scale schedule for 1024×1024 (aspect 1:1) ────────────────────
     pn = "1M"

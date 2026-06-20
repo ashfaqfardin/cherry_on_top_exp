@@ -127,6 +127,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SVD style personalization (Infinity-2B)")
 
     # ── model ────────────────────────────────────────────────────────
+    p.add_argument("--hf_token", type=str, default="",
+                   help="HuggingFace access token for downloading checkpoints. "
+                        "Falls back to HF_TOKEN environment variable.")
     p.add_argument("--infinity_repo", type=str, default="",
                    help="Path to the cloned Infinity repo (the directory that "
                         "contains tools/run_infinity.py).  Auto-detected when "
@@ -188,8 +191,11 @@ def _resolve_path(path: str, fallback_dir: str, fallback_name: str) -> str:
 def main() -> None:
     args = parse_args()
 
-    inf_ckpt = _resolve_path(args.infinity_path, args.cache_dir, "infinity_2b.pth")
+    inf_ckpt = _resolve_path(args.infinity_path, args.cache_dir, "infinity_2b_reg.pth")
     vae_ckpt = _resolve_path(args.vae_path,      args.cache_dir, "infinity_vae_d32.pth")
+
+    import os
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN") or None
 
     print("[Loading models …]")
     infinity, vae, text_tokenizer, text_encoder, scale_schedule = load_model(
@@ -198,6 +204,7 @@ def main() -> None:
         t5_path=args.t5_path,
         device=args.device,
         cache_dir=args.cache_dir,
+        hf_token=hf_token,
     )
 
     # ── build run list ───────────────────────────────────────────────
