@@ -44,7 +44,7 @@
       "source_prompt": "A red sports car parked on a road",
       "target_prompt": "A red sports car parked on a road",
       "foreground_word": "car",
-      "shift": [10, 10]
+      "shift": [5, 5]
     }
   ]
 }

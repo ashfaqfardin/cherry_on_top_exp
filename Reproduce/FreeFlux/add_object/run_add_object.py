@@ -222,8 +222,8 @@ def run_add_object_generated(pipe, source_prompt: str, target_prompt: str,
         **common_kwargs,
     )
 
-    # images[0] = source, images[1] = edited
-    return image_ori[1], result_edit.images[1]
+    # images[0] = source-prompt generation (no control), images[1] = edited
+    return image_ori[0], result_edit.images[1]
 
 
 @torch.no_grad()

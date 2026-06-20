@@ -3,20 +3,21 @@ FreeFlux non-rigid image editing for FLUX.1-dev.
 
 Based on: https://github.com/wtybest/FreeFlux (ICCV 2025)
 
-The method performs training-free non-rigid editing (pose changes, deformations) by:
-  1. Inverting the source image with DDIM-like forward inversion
-  2. Denoising a batch of [source, target] with mutual self-attention control:
-     image-token keys/values from the source are shared into the target at
-     specified steps/layers, preserving structure while following the new prompt.
+Performs training-free non-rigid editing (pose changes, deformations) by sharing
+image-token keys/values from the source branch into the target branch during a
+SINGLE shared-latent denoising pass. No real source image or DDIM inversion needed.
+
+Both [source_prompt, target_prompt] start from the SAME random latents (seeded),
+and mutual self-attention at selected layers/steps copies structure from source to
+target while the target follows its own prompt.
 
 Usage — single run
 ------------------
 python Reproduce/FreeFlux/non_rigid/run_non_rigid.py \\
     --hf_token "$HF_TOKEN" \\
-    --source_image path/to/image.jpg \\
-    --source_prompt "a cat sitting on a chair" \\
-    --target_prompt "a cat jumping over a chair" \\
-    --n_steps 28 --seed 0 \\
+    --source_prompt "a bird perched on a branch" \\
+    --target_prompt "a bird flying from the branch" \\
+    --n_steps 50 --seed 2 \\
     --device cuda --cpu_offload \\
     --cache_dir ./models --save_images
 
@@ -34,7 +35,6 @@ import json
 import os
 import sys
 
-import numpy as np
 import torch
 from PIL import Image
 
@@ -46,16 +46,28 @@ _REPO_ROOT = os.path.normpath(
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from diffusers.models.attention_processor import FluxAttnProcessor2_0
+from diffusers.utils.torch_utils import randn_tensor
 
 from Reproduce.FreeFlux.non_rigid.pipeline_flux_non_rigid import FluxPipeline
 from Reproduce.FreeFlux.non_rigid.non_rigid_attn_utils import register_non_rigid_attention_control
 
 
+# Paper processor args from the original non_rigid.ipynb notebook.
+# layer_idx selects which of the 57 transformer layers apply attention sharing.
+_PROCESSOR_ARGS = {
+    "start_step":   0,
+    "start_layer":  0,
+    "layer_idx":    [0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56],
+    "step_idx":     list(range(0, 50)),
+    "total_layers": 57,
+    "total_steps":  50,
+}
+
+
 def load_freeflux_pipeline(model_path: str, hf_token: str,
                             device: str = "cuda", cpu_offload: bool = False,
                             cache_dir: str = "./models"):
-    """Load FluxPipeline. Attention processor is registered per-run inside run_non_rigid_edit."""
+    """Load the non-rigid FluxPipeline. Attention is registered per-run in run_non_rigid_edit."""
     pipe = FluxPipeline.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -71,111 +83,66 @@ def load_freeflux_pipeline(model_path: str, hf_token: str,
     return pipe
 
 
-def encode_image_to_latents(pipe, image_path: str, height: int, width: int,
-                             device: str, dtype=torch.bfloat16):
-    """VAE-encode a source image and return packed latents."""
-    image = Image.open(image_path).convert("RGB").resize((width, height), Image.LANCZOS)
-    image_array = np.array(image).astype(np.float32) / 255.0
-    image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).unsqueeze(0)
-    image_tensor = 2.0 * image_tensor - 1.0  # [-1, 1]
-
-    vae = pipe.vae
-    execution_device = pipe._execution_device
-    image_tensor = image_tensor.to(device=execution_device, dtype=dtype)
-
-    with torch.no_grad():
-        latents = vae.encode(image_tensor).latent_dist.sample()
-        latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor
-        h_lat = height // pipe.vae_scale_factor
-        w_lat = width // pipe.vae_scale_factor
-        latents = FluxPipeline._pack_latents(
-            latents, batch_size=1,
-            num_channels_latents=latents.shape[1],
-            height=h_lat, width=w_lat,
-        )
-
-    return latents
-
-
 @torch.no_grad()
-def run_non_rigid_edit(pipe, source_image_path: str,
-                       source_prompt: str, target_prompt: str,
-                       n_steps: int = 28, guidance_scale: float = 3.5,
+def run_non_rigid_edit(pipe, source_prompt: str, target_prompt: str,
+                       n_steps: int = 50, guidance_scale: float = 3.5,
                        height: int = 1024, width: int = 1024,
-                       max_sequence_length: int = 512,
-                       device: str = "cuda",
-                       start_step: int = 4, start_layer: int = 0):
-    """Invert source image then generate the edited target.
+                       max_sequence_length: int = 512, seed: int = 2):
+    """Generate source and non-rigidly edited target images from shared latents.
 
-    Inversion uses standard attention (batch=1).
-    Editing uses non-rigid attention (batch=2: [src, tgt]).
-    The processor must be switched between passes — registering non_rigid during
-    inversion would cause masactrl_forward to fail on batch-size 1.
+    Both prompts start from the SAME seeded random latents. Mutual self-attention
+    control at selected layers copies image-token keys/values from the source branch
+    into the target branch, transferring spatial structure while the target follows
+    its own prompt.
+
+    Returns (source_image, edited_image) as PIL Images.
     """
-    dtype = torch.bfloat16
+    prompts = [source_prompt, target_prompt]
 
-    # Encode source image
-    src_latents = encode_image_to_latents(pipe, source_image_path, height, width, device, dtype)
+    # Create shared random latents: same noise for both source and target.
+    # Shape before packing: (1, 16, H//8, W//8) — matches pipeline's prepare_latents.
+    generator = torch.Generator(device=pipe._execution_device).manual_seed(seed)
+    shape = (1, 16, height // 8, width // 8)
+    latents = randn_tensor(shape, generator=generator,
+                           device=pipe._execution_device, dtype=torch.bfloat16)
+    latents = latents.expand(len(prompts), -1, -1, -1).clone()
+    latents = pipe._pack_latents(latents, len(prompts), 16, height // 8, width // 8)
 
-    common_kwargs = dict(
-        num_inference_steps=n_steps,
-        guidance_scale=guidance_scale,
+    # Register non-rigid attention control (shared keys/values from src → tgt).
+    register_non_rigid_attention_control(pipe, **_PROCESSOR_ARGS)
+
+    result = pipe(
+        prompts,
         height=height,
         width=width,
+        guidance_scale=guidance_scale,
+        num_inference_steps=n_steps,
         max_sequence_length=max_sequence_length,
-    )
-
-    # Step 1: standard attention for inversion — batch=1, masactrl must NOT run
-    pipe.transformer.set_attn_processor(FluxAttnProcessor2_0())
-    print("  Inverting source image...")
-    inverted_latents = pipe(
-        prompt=source_prompt,
-        latents=src_latents.clone(),
-        invert_image=True,
-        **common_kwargs,
-    )
-
-    # Step 2: non-rigid attention for editing — batch=2 [src, tgt]
-    register_non_rigid_attention_control(
-        pipe,
-        start_step=start_step,
-        start_layer=start_layer,
-        total_steps=n_steps,
-    )
-    print("  Generating edited image...")
-    result = pipe(
-        prompt=[source_prompt, target_prompt],
-        latents=src_latents.repeat(2, 1, 1),
-        inverted_latent_list=inverted_latents,
+        latents=latents,
         output_type="pil",
-        **common_kwargs,
     )
 
-    # result.images[0] = source reconstruction, result.images[1] = edited
+    # images[0] = source (generated), images[1] = edited (target prompt + source structure)
     return result.images[0], result.images[1]
 
 
-def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
+def run_single(pipe, cfg: dict, out_dir: str, save_images: bool):
     """Run one experiment defined by cfg dict and optionally save images."""
-    name            = cfg["name"]
-    source_image    = cfg["source_image"]
-    source_prompt   = cfg["source_prompt"]
-    target_prompt   = cfg["target_prompt"]
-    n_steps         = cfg.get("n_steps", 28)
-    guidance_scale  = cfg.get("guidance_scale", 3.5)
-    height          = cfg.get("height", 1024)
-    width           = cfg.get("width", 1024)
-    max_seq_len     = cfg.get("max_sequence_length", 512)
-    start_step      = cfg.get("start_step", 4)
-    start_layer     = cfg.get("start_layer", 0)
+    name           = cfg["name"]
+    source_prompt  = cfg["source_prompt"]
+    target_prompt  = cfg["target_prompt"]
+    n_steps        = cfg.get("n_steps", 50)
+    guidance_scale = cfg.get("guidance_scale", 3.5)
+    height         = cfg.get("height", 1024)
+    width          = cfg.get("width", 1024)
+    max_seq_len    = cfg.get("max_sequence_length", 512)
+    seed           = cfg.get("seed", 2)
 
     print(f"\n[{name}]  source='{source_prompt}'  target='{target_prompt}'")
-    print(f"         steps={n_steps}  guidance={guidance_scale}  size={height}x{width}")
-    print(f"         start_step={start_step}  start_layer={start_layer}")
+    print(f"         steps={n_steps}  guidance={guidance_scale}  seed={seed}  size={height}x{width}")
 
-    img_src_recon, img_edited = run_non_rigid_edit(
+    img_src, img_edited = run_non_rigid_edit(
         pipe,
-        source_image_path=source_image,
         source_prompt=source_prompt,
         target_prompt=target_prompt,
         n_steps=n_steps,
@@ -183,27 +150,21 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         height=height,
         width=width,
         max_sequence_length=max_seq_len,
-        device=device,
-        start_step=start_step,
-        start_layer=start_layer,
+        seed=seed,
     )
 
     if save_images:
         run_dir = os.path.join(out_dir, name)
         os.makedirs(run_dir, exist_ok=True)
-        img_src_recon.save(os.path.join(run_dir, "source_recon.png"))
+        img_src.save(os.path.join(run_dir, "source.png"))
         img_edited.save(os.path.join(run_dir, "edited.png"))
-        # Also copy source image for reference
-        src_img = Image.open(source_image).convert("RGB")
-        src_img.save(os.path.join(run_dir, "source.png"))
         print(f"  Saved → {run_dir}/")
 
-    return img_src_recon, img_edited
+    return img_src, img_edited
 
 
 def load_config(config_path: str) -> list:
-    """
-    Load runs from a JSON config file.
+    """Load runs from a JSON config file.
 
     The JSON must have a "runs" list. An optional "global" dict provides
     default values that each run inherits unless it overrides them.
@@ -229,26 +190,22 @@ def parse_args():
     # --- Config-file mode ---
     parser.add_argument("--config", type=str, default=None,
                         help="Path to a JSON run-config file. "
-                             "When provided, --source_image/--source_prompt/--target_prompt are not required.")
+                             "When provided, --source_prompt/--target_prompt are not required.")
 
     # --- Single-run mode ---
-    parser.add_argument("--source_image",  type=str, default=None,
-                        help="Path to the source image (required without --config)")
     parser.add_argument("--source_prompt", type=str, default=None,
-                        help="Text description of the source image (required without --config)")
+                        help="Text description of the source scene (required without --config)")
     parser.add_argument("--target_prompt", type=str, default=None,
                         help="Text description of the desired edit (required without --config)")
-    parser.add_argument("--n_steps",             type=int,   default=28,
-                        help="Denoising steps (default 28)")
+    parser.add_argument("--n_steps",             type=int,   default=50,
+                        help="Denoising steps (default 50, matching paper)")
     parser.add_argument("--guidance_scale",      type=float, default=3.5)
     parser.add_argument("--height",              type=int,   default=1024)
     parser.add_argument("--width",               type=int,   default=1024)
     parser.add_argument("--max_sequence_length", type=int,   default=512,
                         help="T5 max token length (default 512)")
-    parser.add_argument("--start_step",  type=int, default=4,
-                        help="First denoising step to apply attention sharing (default 4)")
-    parser.add_argument("--start_layer", type=int, default=0,
-                        help="First transformer layer to apply attention sharing (default 0)")
+    parser.add_argument("--seed",                type=int,   default=2,
+                        help="Random seed for shared latents (default 2)")
 
     # --- Infrastructure ---
     parser.add_argument("--model_path",  type=str, default="black-forest-labs/FLUX.1-dev")
@@ -260,14 +217,13 @@ def parse_args():
     parser.add_argument("--out_dir",    type=str, default="results/freeflux/non_rigid",
                         help="Output directory for saved images")
     parser.add_argument("--save_images", action="store_true",
-                        help="Save source.png, source_recon.png, and edited.png for each run")
+                        help="Write source.png and edited.png for each run")
 
     args = parser.parse_args()
 
-    # Validate: without --config, source args are required
     if args.config is None:
-        if args.source_image is None or args.source_prompt is None or args.target_prompt is None:
-            parser.error("--source_image, --source_prompt, and --target_prompt are required unless --config is provided.")
+        if args.source_prompt is None or args.target_prompt is None:
+            parser.error("--source_prompt and --target_prompt are required unless --config is provided.")
 
     return args
 
@@ -287,17 +243,13 @@ def main():
         runs = load_config(args.config)
         print(f"\n[FreeFlux] Running {len(runs)} experiment(s) from {args.config}")
         for cfg in runs:
-            run_single(pipe, cfg,
-                       out_dir=args.out_dir,
-                       save_images=args.save_images,
-                       device=args.device)
+            run_single(pipe, cfg, out_dir=args.out_dir, save_images=args.save_images)
         print(f"\n[FreeFlux] All runs complete.")
         if args.save_images:
             print(f"  Results saved to {args.out_dir}/")
     else:
         cfg = {
             "name":               "output",
-            "source_image":       args.source_image,
             "source_prompt":      args.source_prompt,
             "target_prompt":      args.target_prompt,
             "n_steps":            args.n_steps,
@@ -305,13 +257,9 @@ def main():
             "height":             args.height,
             "width":              args.width,
             "max_sequence_length": args.max_sequence_length,
-            "start_step":         args.start_step,
-            "start_layer":        args.start_layer,
+            "seed":               args.seed,
         }
-        run_single(pipe, cfg,
-                   out_dir=args.out_dir,
-                   save_images=args.save_images,
-                   device=args.device)
+        run_single(pipe, cfg, out_dir=args.out_dir, save_images=args.save_images)
 
 
 if __name__ == "__main__":

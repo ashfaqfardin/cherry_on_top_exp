@@ -4,11 +4,11 @@
 
 Three editing tasks, all using FLUX.1-dev with mutual self-attention control:
 
-| Task | What it does | SAM2 needed |
+| Task | Input | SAM2 needed |
 |---|---|---|
-| `non_rigid` | Pose / deformation changes on real images | No |
-| `add_object` | Insert a new object into a generated or real image | No |
-| `bg_replace` | Replace the background of a generated image | Yes |
+| `non_rigid` | Text prompts only — shared latents (no source image) | No |
+| `add_object` | Text prompts; optionally a real source image | No |
+| `bg_replace` | Text prompts — source image generated on the fly | Yes |
 
 All runners are called from the **repo root** (`e:/Cherry_on_top/`).
 
@@ -16,17 +16,14 @@ All runners are called from the **repo root** (`e:/Cherry_on_top/`).
 
 ## Source images
 
-The following images are provided in `inputs/` and are ready to use immediately:
+Images in `inputs/` are used by the `add_object` task (real-image mode). The `non_rigid` and `bg_replace` tasks generate their source images from prompts — no image file required.
 
-| File | Subject | Source |
-|---|---|---|
-| `inputs/bottle.jpg` | Glass bottle | Provided |
-| `inputs/cat.jpg` | Cat | Wikimedia Commons (`A-Cat.jpg`, CC BY-SA) |
-| `inputs/dog.jpg` | Yellow Labrador | Wikimedia Commons (`YellowLabradorLooking_new.jpg`, CC BY-SA) |
-| `inputs/car.jpg` | Red Abarth sports car | Wikimedia Commons (`2020_Abarth_595_Competizione_front.jpg`, CC BY-SA) |
-
-All config files under `prompts/` reference these paths directly — no setup needed.
-To use your own images, add them to `inputs/` or `assets/` and update the config accordingly.
+| File | Subject | Source | Used by |
+|---|---|---|---|
+| `inputs/bottle.jpg` | Glass bottle | Provided | `add_object` |
+| `inputs/cat.jpg` | Cat | Wikimedia Commons (`A-Cat.jpg`, CC BY-SA) | `add_object` |
+| `inputs/dog.jpg` | Yellow Labrador | Wikimedia Commons (`YellowLabradorLooking_new.jpg`, CC BY-SA) | `add_object` |
+| `inputs/car.jpg` | Red Abarth sports car | Wikimedia Commons (`2020_Abarth_595_Competizione_front.jpg`, CC BY-SA) | `add_object` |
 
 ---
 
@@ -45,29 +42,29 @@ pip install git+https://github.com/facebookresearch/sam2
 
 ## Non-Rigid Editing
 
-Edits a **real image** with structural changes (pose, deformation) via DDIM inversion + mutual self-attention.
+Performs non-rigid edits (pose changes, deformations) on **generated** images via shared latents + mutual self-attention control. **No real source image or DDIM inversion needed.**
+
+Both `source_prompt` and `target_prompt` start from the **same seeded random noise**. During denoising, image-token keys/values at selected transformer layers are copied from the source branch into the target branch, preserving spatial structure while the target follows its own prompt.
 
 ### Config file
 
-Edit `prompts/reproduce_freeflux.json` — replace `source_image` paths with your own:
+`prompts/reproduce_freeflux.json`:
 
 ```json
 {
   "global": {
     "model_path": "black-forest-labs/FLUX.1-dev",
-    "n_steps": 28,
+    "n_steps": 50,
     "guidance_scale": 3.5,
     "height": 1024,
     "width": 1024,
-    "start_step": 4,
-    "start_layer": 0
+    "seed": 2
   },
   "runs": [
     {
-      "name": "cat_pose",
-      "source_image": "assets/cat.jpg",
-      "source_prompt": "a cat sitting on a chair",
-      "target_prompt": "a cat standing on a chair"
+      "name": "bird_fly",
+      "source_prompt": "a bird perched on a branch",
+      "target_prompt": "a bird flying from the branch"
     }
   ]
 }
@@ -83,17 +80,16 @@ python Reproduce/FreeFlux/non_rigid/run_non_rigid.py \
     --cache_dir ./models --save_images
 ```
 
-Output: `results/freeflux/non_rigid/{name}/source.png`, `source_recon.png`, `edited.png`
+Output: `results/freeflux/non_rigid/{name}/source.png`, `edited.png`
 
 ### Single run (no config file)
 
 ```bash
 python Reproduce/FreeFlux/non_rigid/run_non_rigid.py \
     --hf_token "$HF_TOKEN" \
-    --source_image path/to/image.jpg \
-    --source_prompt "a cat sitting on a chair" \
-    --target_prompt "a cat standing on a chair" \
-    --n_steps 28 --start_step 4 \
+    --source_prompt "a bird perched on a branch" \
+    --target_prompt "a bird flying from the branch" \
+    --n_steps 50 --seed 2 \
     --device cuda --cpu_offload \
     --cache_dir ./models --save_images
 ```
@@ -103,13 +99,11 @@ python Reproduce/FreeFlux/non_rigid/run_non_rigid.py \
 | Field | Required | Default | Description |
 |---|---|---|---|
 | `name` | Yes | — | Output subfolder name |
-| `source_image` | Yes | — | Path to the source image |
-| `source_prompt` | Yes | — | Description of the source image |
-| `target_prompt` | Yes | — | Description of the desired edit |
-| `n_steps` | No | 28 | Denoising steps |
+| `source_prompt` | Yes | — | Text description of the source scene |
+| `target_prompt` | Yes | — | Text description of the desired edit |
+| `seed` | No | 2 | Random seed for shared latents |
+| `n_steps` | No | 50 | Denoising steps (paper default: 50) |
 | `guidance_scale` | No | 3.5 | CFG scale |
-| `start_step` | No | 4 | First step to apply attention sharing |
-| `start_layer` | No | 0 | First layer to apply attention sharing |
 | `height` / `width` | No | 1024 | Output resolution |
 
 ---

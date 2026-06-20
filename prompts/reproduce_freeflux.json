@@ -1,41 +1,38 @@
 {
-  "comment": "Demo runs for FreeFlux non-rigid editing (ICCV 2025, wtybest/FreeFlux). start_step=4 and start_layer=0 match paper defaults.",
+  "comment": "Demo runs for FreeFlux non-rigid editing (ICCV 2025, wtybest/FreeFlux). Both prompts share the same seeded random latents — no source image or inversion needed. n_steps=50 and layer_idx match the paper notebook.",
 
   "global": {
     "model_path": "black-forest-labs/FLUX.1-dev",
-    "n_steps": 28,
+    "n_steps": 50,
     "guidance_scale": 3.5,
     "height": 1024,
     "width": 1024,
     "max_sequence_length": 512,
-    "start_step": 4,
-    "start_layer": 0
+    "seed": 2
   },
 
   "runs": [
     {
+      "name": "bird_fly",
+      "source_prompt": "a bird perched on a branch",
+      "target_prompt": "a bird flying from the branch"
+    },
+    {
       "name": "cat_lie_down",
-      "source_image": "inputs/cat.jpg",
-      "source_prompt": "a cat sitting",
-      "target_prompt": "a cat lying down"
+      "source_prompt": "a cat sitting on a wooden floor",
+      "target_prompt": "a cat lying down on a wooden floor"
     },
     {
       "name": "dog_turn_head",
-      "source_image": "inputs/dog.jpg",
       "source_prompt": "a yellow dog looking at the camera",
-      "target_prompt": "a yellow dog looking to the side"
+      "target_prompt": "a yellow dog looking to the side",
+      "seed": 5
     },
     {
-      "name": "car_door_open",
-      "source_image": "inputs/car.jpg",
-      "source_prompt": "a red sports car parked",
-      "target_prompt": "a red sports car with the door open"
-    },
-    {
-      "name": "bottle_tilt",
-      "source_image": "inputs/bottle.jpg",
-      "source_prompt": "a bottle standing upright on a table",
-      "target_prompt": "a bottle tilted on a table"
+      "name": "person_sitting_standing",
+      "source_prompt": "a person sitting on a chair",
+      "target_prompt": "a person standing up from a chair",
+      "seed": 0
     }
   ]
 }

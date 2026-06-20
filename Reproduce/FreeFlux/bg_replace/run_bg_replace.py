@@ -69,6 +69,7 @@ import json
 import os
 import sys
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -157,6 +158,33 @@ def _make_shared_latents(pipe, n_prompts: int, height: int, width: int, seed: in
     raw = raw.expand(n_prompts, -1, -1, -1).clone()
     latents = pipe._pack_latents(raw, n_prompts, num_channels_latents, h_lat, w_lat)
     return latents
+
+
+def _clamp_shift(predicted_mask, target_shape, shift):
+    """Clamp shift so no fg pixel is pushed outside the latent grid.
+
+    resize_and_get_coordinates() raises ValueError if any fg coordinate after
+    shifting falls outside [0, max_row) x [0, max_col). This function pre-computes
+    the tightest valid shift and warns when clamping is applied.
+    """
+    arr = np.array(predicted_mask, dtype=np.float32)
+    resized = cv2.resize(arr, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
+    binary = (resized > 0.5).astype(np.uint8)
+    rows, cols = np.where(binary == 1)
+    if len(rows) == 0:
+        return shift  # empty mask — shift is irrelevant
+
+    max_row_grid, max_col_grid = target_shape
+    lo_r, hi_r = -int(rows.min()), (max_row_grid - 1) - int(rows.max())
+    lo_c, hi_c = -int(cols.min()), (max_col_grid - 1) - int(cols.max())
+
+    clamped = (max(lo_r, min(int(shift[0]), hi_r)), max(lo_c, min(int(shift[1]), hi_c)))
+    if clamped != (int(shift[0]), int(shift[1])):
+        print(
+            f"  Warning: shift {shift} would push fg mask out of the "
+            f"{max_row_grid}x{max_col_grid} latent grid — clamped to {clamped}."
+        )
+    return clamped
 
 
 @torch.no_grad()
@@ -250,6 +278,7 @@ def run_bg_replace(pipe, source_prompt: str, target_prompt: str, foreground_word
         device=device,
     )
 
+    shift = _clamp_shift(predicted_mask, [w16, h16], shift)
     source_idx_list, target_idx_list, inpainted_idx_list, remain_idx_list = (
         resize_and_get_coordinates(predicted_mask, [w16, h16], shift=shift)
     )
