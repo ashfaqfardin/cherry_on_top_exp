@@ -275,6 +275,7 @@ def _styled_infer_cfg(
     generation_steps: int = 12,   # how many of the 12 scales to run
     pfb_step: int = 3,            # 1-indexed; paper default s=3
     sac_steps: Optional[set] = None,  # 1-indexed set; paper default {3..12}
+    return_codes: bool = False,   # if True, returns (img_np, summed_codes)
 ):
     """
     Modified version of Infinity.autoregressive_infer_cfg that injects:
@@ -461,7 +462,8 @@ def _styled_infer_cfg(
     img = vae.decode(gen_codes)                  # (1, 3, H, W) in [-1, 1]
     img = (img + 1) / 2
     img = img.clamp(0, 1).permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
-    return img[0].cpu().numpy()  # (H, W, 3) RGB uint8 — PIL-compatible
+    img_np = img[0].cpu().numpy()               # (H, W, 3) RGB uint8
+    return (img_np, summed_codes) if return_codes else img_np
 
 
 # ──────────────── Public entry point ─────────────────────────────────
@@ -488,6 +490,14 @@ def preprocess_image(pil_img: Image.Image, h: int, w: int) -> torch.Tensor:
     return t.unsqueeze(0)               # (1, 3, H, W)
 
 
+def _decode_codes(vae, codes_5d: torch.Tensor) -> np.ndarray:
+    """Decode (1, C, 1, H, W) summed_codes → (H, W, 3) uint8 RGB."""
+    img = vae.decode(codes_5d.squeeze(2))       # (1, 3, H, W) in [-1, 1]
+    img = (img + 1) / 2
+    img = img.clamp(0, 1).permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
+    return img[0].cpu().numpy()
+
+
 @torch.no_grad()
 def generate_styled(
     infinity,
@@ -508,82 +518,106 @@ def generate_styled(
     height: int = 1024,
     width: int = 1024,
     device: str = "cuda",
-    apply_spatial_patchify: bool = False,
     use_pfb: bool = True,
     use_sac: bool = True,
     generation_steps: int = 12,
     pfb_step: int = 3,
     sac_steps: Optional[set] = None,
-) -> Image.Image:
+    post_process: bool = False,
+):
     """
     Generate a stylized image given a style reference and a text prompt.
 
-    Runs the dual-stream Infinity inference (B=2):
-      index 0 — content path (unmodified generation)
-      index 1 — generation path, optionally with PFB at s=3 and SAC at s=3..12
+    post_process=False (paper default):
+      Dual-stream inference — PFB and SAC are injected DURING generation.
+      Returns PIL Image.
 
-    use_pfb / use_sac can be toggled for ablation:
-      (False, False) → baseline Infinity (single-stream equivalent via generation path)
-      (True,  False) → PFB only
-      (False, True)  → SAC only
-      (True,  True)  → full method (paper default)
+    post_process=True:
+      Generate a normal image first, then apply SVD style transfer to its
+      final VAE codes (PFB on all-scale summed codes).
+      Returns (normal_pil, styled_pil) — both from a single Infinity run.
 
-    generation_steps : how many of the 12 scales to run (paper default: 12)
-    pfb_step         : 1-indexed step at which PFB is applied (paper default: 3)
-    sac_steps        : 1-indexed set of steps for SAC (paper default: {3..12})
-
-    Returns a PIL Image.
+    use_pfb / use_sac can be toggled for ablation (post_process=False only).
     """
     from tools.run_infinity import encode_prompt
 
-    # ── Text encoding (single prompt, tiled ×2 for dual-stream) ──────
-    text_cond = encode_prompt(text_tokenizer, text_encoder, prompt)
+    _patchify = getattr(infinity, "apply_spatial_patchify", False)
+
+    # ── Text encoding ─────────────────────────────────────────────────
+    text_cond   = encode_prompt(text_tokenizer, text_encoder, prompt)
     text_cond_b2 = tile_text_cond(text_cond, n=2)
 
-    # ── Style feature extraction ──────────────────────────────────────
-    _patchify = getattr(infinity, "apply_spatial_patchify", False)
-    style_tensor = preprocess_image(style_image, height, width).to(device)
+    # ── Style image encode ────────────────────────────────────────────
+    style_tensor    = preprocess_image(style_image, height, width).to(device)
     all_bit_indices = get_style_codes(vae, style_tensor, scale_schedule)
-    F3_sty = compute_style_summed_codes(
-        vae, all_bit_indices, scale_schedule,
-        n_scales=3, apply_spatial_patchify=_patchify,
-    ).to(device)
-
-    # ── SAC: patch self-attention ─────────────────────────────────────
-    sac_state: dict = {"active": False}
-    patched = patch_self_attention_for_sac(infinity, sac_state)
 
     cfg_list = [cfg] * len(scale_schedule)
     tau_list = [tau] * len(scale_schedule)
 
+    _infer_kwargs = dict(
+        scale_schedule=scale_schedule,
+        label_B_or_BLT=text_cond_b2,
+        g_seed=seed,
+        cfg_list=cfg_list,
+        tau_list=tau_list,
+        cfg_insertion_layer=(cfg_insertion_layer,),
+        vae_type=1,
+        top_k=top_k,
+        top_p=top_p,
+        generation_steps=generation_steps,
+        pfb_step=pfb_step,
+        sac_steps=sac_steps,
+    )
+
+    # ── SAC patch ─────────────────────────────────────────────────────
+    sac_state: dict = {"active": False}
+    patched = patch_self_attention_for_sac(infinity, sac_state)
+
     try:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, cache_enabled=True):
-            img_np = _styled_infer_cfg(
-                infinity,
-                vae,
-                F3_sty=F3_sty,
-                pfb_alpha=pfb_alpha,
-                sac_state=sac_state,
-                scale_schedule=scale_schedule,
-                label_B_or_BLT=text_cond_b2,
-                g_seed=seed,
-                cfg_list=cfg_list,
-                tau_list=tau_list,
-                cfg_insertion_layer=(cfg_insertion_layer,),
-                vae_type=1,
-                top_k=top_k,
-                top_p=top_p,
-                use_pfb=use_pfb,
-                use_sac=use_sac,
-                generation_steps=generation_steps,
-                pfb_step=pfb_step,
-                sac_steps=sac_steps,
-            )
+
+            if post_process:
+                # ── Step 1: normal generation → content codes ─────────
+                normal_np, content_codes = _styled_infer_cfg(
+                    infinity, vae,
+                    F3_sty=None, pfb_alpha=pfb_alpha, sac_state=sac_state,
+                    use_pfb=False, use_sac=False,
+                    return_codes=True,
+                    **_infer_kwargs,
+                )
+                # ── Step 2: style codes for ALL scales ────────────────
+                full_style_codes = compute_style_summed_codes(
+                    vae, all_bit_indices, scale_schedule,
+                    n_scales=len(scale_schedule),
+                    apply_spatial_patchify=_patchify,
+                ).to(device)
+                # ── Step 3: PFB on final summed codes ─────────────────
+                # content_codes[1:2] = generation path (= content when no mods)
+                styled_codes = apply_pfb(
+                    content_codes[1:2].float(),
+                    full_style_codes.float(),
+                    pfb_alpha,
+                ).to(content_codes.dtype)
+                styled_np = _decode_codes(vae, styled_codes)
+                return Image.fromarray(normal_np), Image.fromarray(styled_np)
+
+            else:
+                # ── Paper dual-stream: PFB + SAC during generation ────
+                F3_sty = compute_style_summed_codes(
+                    vae, all_bit_indices, scale_schedule,
+                    n_scales=3, apply_spatial_patchify=_patchify,
+                ).to(device)
+                img_np = _styled_infer_cfg(
+                    infinity, vae,
+                    F3_sty=F3_sty, pfb_alpha=pfb_alpha, sac_state=sac_state,
+                    use_pfb=use_pfb, use_sac=use_sac,
+                    **_infer_kwargs,
+                )
+                return Image.fromarray(img_np)
+
     finally:
         unpatch_self_attention(patched)
         sac_state["active"] = False
-
-    return Image.fromarray(img_np)
 
 
 def _hf_download_checkpoint(
