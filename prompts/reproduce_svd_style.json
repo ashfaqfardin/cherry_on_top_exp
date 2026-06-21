@@ -3,11 +3,11 @@
 
   "global": {
     "compare": true,
-    "cfg": 3.0,
+    "cfg": 3.5,
     "tau": 1.0,
-    "top_k": 0,
+    "top_k": 900,
     "top_p": 0.85,
-    "cfg_insertion_layer": -5,
+    "cfg_insertion_layer": -6,
     "height": 1024,
     "width": 1024,
     "seed": 42
