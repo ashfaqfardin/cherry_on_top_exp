@@ -26,6 +26,12 @@ import argparse
 import json
 import os
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)  # timm, torch.amp deprecations from Infinity
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # ── make repo root importable ────────────────────────────────────────
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -51,6 +57,9 @@ def _add_infinity_to_path(path: str) -> bool:
 for _cand in _INF_CANDIDATES:
     if _add_infinity_to_path(_cand):
         break
+
+import logging
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import torch
 from PIL import Image

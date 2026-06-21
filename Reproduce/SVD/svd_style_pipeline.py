@@ -635,6 +635,11 @@ def load_model(
     scale_schedule = [(1, int(h), int(w)) for (_, h, w) in raw_schedule]
 
     # ── T5 text encoder ───────────────────────────────────────────────
+    # Point transformers cache to cache_dir so T5 is stored alongside
+    # the .pth checkpoints instead of ~/.cache/huggingface.
+    _abs_cache = os.path.abspath(cache_dir)
+    os.environ["TRANSFORMERS_CACHE"] = _abs_cache
+    os.environ["HF_HOME"] = _abs_cache
     text_tokenizer, text_encoder = load_tokenizer(t5_path)
     text_encoder = text_encoder.to(device)
 
