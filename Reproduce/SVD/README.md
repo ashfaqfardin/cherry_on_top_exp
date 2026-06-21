@@ -89,7 +89,9 @@ Or pass `--hf_token YOUR_TOKEN` directly.
 !pip install -r /content/Infinity/requirements.txt
 
 # 3. Install flash-attn (required by Infinity even in slow_attn mode)
-!pip install flash-attn --no-build-isolation   # ~5–10 min
+!pip install ninja packaging whl
+
+!pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 # 4. Install other dependencies
 !pip install transformers huggingface_hub sentencepiece
