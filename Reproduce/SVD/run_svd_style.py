@@ -70,6 +70,16 @@ from Reproduce.SVD.svd_style_pipeline import generate_styled, load_model
 # ──────────────────────────── helpers ────────────────────────────────
 
 
+def _parse_sac_steps(value, pfb_step: int = 3, generation_steps: int = 12):
+    """Parse sac_steps from CLI string, JSON list, or None → set of ints."""
+    if value is None or value == "":
+        return None  # pipeline uses default {pfb_step..generation_steps}
+    if isinstance(value, (list, set)):
+        return set(int(s) for s in value)
+    # comma-separated string: "3,4,5,6,7,8,9,10,11,12"
+    return set(int(s.strip()) for s in str(value).split(",") if s.strip())
+
+
 def _save(img: Image.Image, out_dir: str, name: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{name}.png")
@@ -97,6 +107,9 @@ def _run_one(
     save_images: bool,
     use_pfb: bool = True,
     use_sac: bool = True,
+    generation_steps: int = 12,
+    pfb_step: int = 3,
+    sac_steps=None,
 ) -> Image.Image:
     mode = ("baseline" if not use_pfb and not use_sac
             else "PFB only" if use_pfb and not use_sac
@@ -128,6 +141,9 @@ def _run_one(
         device=device,
         use_pfb=use_pfb,
         use_sac=use_sac,
+        generation_steps=generation_steps,
+        pfb_step=pfb_step,
+        sac_steps=sac_steps,
     )
 
     if save_images:
@@ -177,6 +193,13 @@ def parse_args() -> argparse.Namespace:
                    help="Disable Principal Feature Blending (ablation)")
     p.add_argument("--no_sac", action="store_true",
                    help="Disable Structural Attention Correction (ablation)")
+    p.add_argument("--generation_steps", type=int, default=12,
+                   help="Number of generation scales to run (paper default: 12)")
+    p.add_argument("--pfb_step", type=int, default=3,
+                   help="1-indexed scale at which PFB is applied (paper default: 3)")
+    p.add_argument("--sac_steps", type=str, default="",
+                   help="Comma-separated 1-indexed scales for SAC, e.g. '3,4,5,6,7,8,9,10,11,12'. "
+                        "Default: all steps from pfb_step to generation_steps.")
     p.add_argument("--cfg", type=float, default=3.0,
                    help="Classifier-free guidance scale")
     p.add_argument("--tau", type=float, default=1.0,
@@ -271,6 +294,11 @@ def main() -> None:
             save_images=args.save_images,
             use_pfb=not run.get("no_pfb", args.no_pfb),
             use_sac=not run.get("no_sac", args.no_sac),
+            generation_steps=run.get("generation_steps", _g("generation_steps", 12)),
+            pfb_step=run.get("pfb_step",                 _g("pfb_step",         3)),
+            sac_steps=_parse_sac_steps(
+                run.get("sac_steps", _g("sac_steps", args.sac_steps))
+            ),
         )
 
     print("\nDone.")

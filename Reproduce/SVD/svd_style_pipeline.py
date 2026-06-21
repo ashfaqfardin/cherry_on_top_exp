@@ -268,17 +268,17 @@ def _styled_infer_cfg(
     cfg_insertion_layer=(-5,),
     vae_type: int = 1,
     gumbel: int = 0,
-    trunk_scale: int = 1000,
     sampling_per_bits: int = 1,
     use_pfb: bool = True,
     use_sac: bool = True,
-    pfb_scale: int = 2,      # 0-indexed; paper s=3 → si=2
-    sac_start_scale: int = 2, # 0-indexed; paper S_fine starts at s=3 → si=2
+    generation_steps: int = 12,   # how many of the 12 scales to run
+    pfb_step: int = 3,            # 1-indexed; paper default s=3
+    sac_steps: Optional[set] = None,  # 1-indexed set; paper default {3..12}
 ):
     """
     Modified version of Infinity.autoregressive_infer_cfg that injects:
-      • sac_state['active'] = (si >= sac_start_scale and use_sac) before each scale's block loop
-      • PFB on summed_codes[1:2] immediately after si == 2
+      • sac_state['active'] = (s in sac_steps and use_sac) before each scale's block loop
+      • PFB on summed_codes[1:2] immediately after s == pfb_step
 
     Returns a uint8 numpy array (H, W, 3) of the GENERATION path (index 1).
 
@@ -347,17 +347,21 @@ def _styled_infer_cfg(
             abs_cfg_layers.append(leng + item)
         # item == 1 (add on probs) not used here
 
+    # Convert paper 1-indexed step notation to sets for O(1) lookup
+    _sac_steps = sac_steps if sac_steps is not None else set(range(3, len(scale_schedule) + 1))
+
     num_stages_minus_1 = len(scale_schedule) - 1
     summed_codes = None
     sac_state["active"] = False
 
     for si, pn in enumerate(scale_schedule):
+        s = si + 1  # 1-indexed step (paper notation)
         cfg = cfg_list[si]
-        if si >= trunk_scale:
+        if s > generation_steps:
             break
 
-        # ── Activate SAC from sac_start_scale onward ──────────────────
-        sac_state["active"] = use_sac and (si >= sac_start_scale)
+        # ── Activate SAC for steps in sac_steps (paper: S_fine = {3..12}) ─
+        sac_state["active"] = use_sac and (s in _sac_steps)
 
         attn_fn = None
         if inf.use_flex_attn:
@@ -420,8 +424,8 @@ def _styled_infer_cfg(
                                       mode=vae.quantizer.z_interplote_up)
             summed_codes = upsampled if summed_codes is None else summed_codes + upsampled
 
-            # ── PFB injection at pfb_scale (paper: si=2) ──────────────
-            if use_pfb and si == pfb_scale:
+            # ── PFB injection at pfb_step (paper: s=3) ────────────────
+            if use_pfb and s == pfb_step:
                 sc_dtype = summed_codes.dtype
                 summed_codes = summed_codes.clone()
                 summed_codes[1:2] = apply_pfb(
@@ -506,6 +510,9 @@ def generate_styled(
     apply_spatial_patchify: bool = False,
     use_pfb: bool = True,
     use_sac: bool = True,
+    generation_steps: int = 12,
+    pfb_step: int = 3,
+    sac_steps: Optional[set] = None,
 ) -> Image.Image:
     """
     Generate a stylized image given a style reference and a text prompt.
@@ -519,6 +526,10 @@ def generate_styled(
       (True,  False) → PFB only
       (False, True)  → SAC only
       (True,  True)  → full method (paper default)
+
+    generation_steps : how many of the 12 scales to run (paper default: 12)
+    pfb_step         : 1-indexed step at which PFB is applied (paper default: 3)
+    sac_steps        : 1-indexed set of steps for SAC (paper default: {3..12})
 
     Returns a PIL Image.
     """
@@ -562,6 +573,9 @@ def generate_styled(
                 top_p=top_p,
                 use_pfb=use_pfb,
                 use_sac=use_sac,
+                generation_steps=generation_steps,
+                pfb_step=pfb_step,
+                sac_steps=sac_steps,
             )
     finally:
         unpatch_self_attention(patched)

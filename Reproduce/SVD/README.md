@@ -170,6 +170,9 @@ Every key that appears in the [All flags](#all-flags) table can be used in `glob
 {
   "global": {
     "pfb_alpha": 1.0,
+    "generation_steps": 12,
+    "pfb_step": 3,
+    "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     "cfg": 3.0,
     "tau": 1.0,
     "top_k": 900,
