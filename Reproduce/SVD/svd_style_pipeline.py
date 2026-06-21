@@ -326,21 +326,6 @@ def _styled_infer_cfg(
     ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
     last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + inf.pos_start.expand(bs, 1, -1)
 
-    # ── Option 2: Inject global style into F0_gen (SOS of generation path) ──
-    # Project F3_sty through Infinity's own word_embed (same path the scale loop uses)
-    # to get a (1, D) global style vector, then add it only to the generation-path
-    # slots (odd indices: 1=cond, 3=uncond) so the very first token is style-biased.
-    if use_pfb:
-        _sc = F3_sty.squeeze(2)                                   # (1, C, H, W)
-        if inf.apply_spatial_patchify:
-            _sc = torch.nn.functional.pixel_unshuffle(_sc, 2)     # (1, C*4, H//2, W//2)
-        _sc = _sc.reshape(1, _sc.shape[1], -1).permute(0, 2, 1)  # (1, L, C_eff)
-        _style_vec = inf.word_embed(
-            inf.norm0_ve(_sc.to(last_stage.dtype))
-        ).mean(dim=1)                                              # (1, D)
-        last_stage = last_stage.clone()
-        last_stage[1::2] = last_stage[1::2] + _style_vec.unsqueeze(1)
-
     with torch.amp.autocast("cuda", enabled=False):
         cond_BD_or_gss = inf.shared_ada_lin(cond_BD.float()).float().contiguous()
 
