@@ -18,28 +18,28 @@
       "comment": "── Watercolor ──",
       "name": "cat_watercolor",
       "style_image": "inputs/watercolor_ref.png",
-      "prompt": "A cat, watercolor",
-      "pfb_alpha": 0.85,
+      "prompt": "A cat, watercolor painting",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
-      "sac_steps": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+      "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
     },
     {
       "name": "flower_watercolor",
       "style_image": "inputs/watercolor_ref.png",
-      "prompt": "A flower, watercolor",
-      "pfb_alpha": 0.85,
+      "prompt": "A flower, watercolor painting",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
-      "sac_steps": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+      "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
     },
     {
       "name": "mountain_watercolor",
       "style_image": "inputs/watercolor_ref.png",
-      "prompt": "A mountain, watercolor",
-      "pfb_alpha": 0.85,
+      "prompt": "A mountain, watercolor painting",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
-      "sac_steps": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+      "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
     },
 
@@ -76,8 +76,8 @@
       "comment": "── 3D Render ──",
       "name": "robot_3d",
       "style_image": "inputs/3d_render_ref.png",
-      "prompt": "A robot, 3d rendering",
-      "pfb_alpha": 0.9,
+      "prompt": "A robot, Stylized 3D Clay Render",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
@@ -85,8 +85,8 @@
     {
       "name": "car_3d",
       "style_image": "inputs/3d_render_ref.png",
-      "prompt": "A car, 3d rendering",
-      "pfb_alpha": 0.9,
+      "prompt": "A car, Stylized 3D Clay Render",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
@@ -94,8 +94,8 @@
     {
       "name": "dragon_3d",
       "style_image": "inputs/3d_render_ref.png",
-      "prompt": "A dragon, 3d rendering",
-      "pfb_alpha": 0.9,
+      "prompt": "A dragon, Stylized 3D Clay Render",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
@@ -105,8 +105,8 @@
       "comment": "── Cartoon 3D ──",
       "name": "fox_cartoon3d",
       "style_image": "inputs/cartoon3d_ref.png",
-      "prompt": "A fox, cartoon",
-      "pfb_alpha": 0.9,
+      "prompt": "A fox, 3d cartoon",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
@@ -114,8 +114,8 @@
     {
       "name": "bear_cartoon3d",
       "style_image": "inputs/cartoon3d_ref.png",
-      "prompt": "A bear, cartoon",
-      "pfb_alpha": 0.9,
+      "prompt": "A bear, 3d cartoon",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
@@ -123,8 +123,8 @@
     {
       "name": "bird_cartoon3d",
       "style_image": "inputs/cartoon3d_ref.png",
-      "prompt": "A bird, cartoon",
-      "pfb_alpha": 0.9,
+      "prompt": "A bird, 3d cartoon",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
       "generation_steps": 12
@@ -134,8 +134,8 @@
       "comment": "── Drawing ──",
       "name": "cat_drawing",
       "style_image": "inputs/drawing_ref.png",
-      "prompt": "A cat, drawing",
-      "pfb_alpha": 1.1,
+      "prompt": "A cat, crayon drawing",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
       "generation_steps": 12
@@ -143,8 +143,8 @@
     {
       "name": "house_drawing",
       "style_image": "inputs/drawing_ref.png",
-      "prompt": "A house, drawing",
-      "pfb_alpha": 1.1,
+      "prompt": "A house, crayon drawing",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
       "generation_steps": 12
@@ -152,8 +152,8 @@
     {
       "name": "tree_drawing",
       "style_image": "inputs/drawing_ref.png",
-      "prompt": "A tree, drawing",
-      "pfb_alpha": 1.1,
+      "prompt": "A tree, crayon drawing",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
       "generation_steps": 12
@@ -161,8 +161,8 @@
     {
       "name": "pickup_truck_drawing",
       "style_image": "inputs/sketch_ref.png",
-      "prompt": "A pickup truck, drawing",
-      "pfb_alpha": 1.1,
+      "prompt": "A pickup truck, crayon drawing",
+      "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
       "generation_steps": 12
