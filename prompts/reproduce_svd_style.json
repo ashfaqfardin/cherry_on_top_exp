@@ -160,7 +160,7 @@
     },
     {
       "name": "pickup_truck_drawing",
-      "style_image": "inputs/drawing_ref.png",
+      "style_image": "inputs/sketch_ref.png",
       "prompt": "A pickup truck in pencil drawing style",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
