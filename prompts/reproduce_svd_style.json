@@ -4,7 +4,7 @@
   "global": {
     "compare": true,
     "cfg": 3.0,
-    "tau": 0.9,
+    "tau": 1.0,
     "top_k": 600,
     "top_p": 0.85,
     "cfg_insertion_layer": -6,
