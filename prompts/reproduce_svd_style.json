@@ -76,7 +76,7 @@
       "comment": "── 3D Render ──",
       "name": "robot_3d",
       "style_image": "inputs/3d_render_ref.png",
-      "prompt": "A robot, Stylized 3D Clay Render",
+      "prompt": "A robot, 3D Render",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -85,7 +85,7 @@
     {
       "name": "car_3d",
       "style_image": "inputs/3d_render_ref.png",
-      "prompt": "A car, Stylized 3D Clay Render",
+      "prompt": "A car, 3D Render",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -94,7 +94,7 @@
     {
       "name": "dragon_3d",
       "style_image": "inputs/3d_render_ref.png",
-      "prompt": "A dragon, Stylized 3D Clay Render",
+      "prompt": "A dragon, 3D Render",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
