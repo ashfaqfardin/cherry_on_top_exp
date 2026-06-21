@@ -8,10 +8,10 @@
     "pfb_step": 3,
     "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     "cfg": 3.0,
-    "tau": 0.0,
+    "tau": 1.0,
     "top_k": 0,
-    "top_p": 0.97,
-    "cfg_insertion_layer": -5,
+    "top_p": 0.85,
+    "cfg_insertion_layer": -6,
     "height": 1024,
     "width": 1024,
     "seed": 42
