@@ -100,15 +100,17 @@ def compute_style_summed_codes(
     # final_size is (1, H, W) — trilinear expects 5D input (B, C, D, H, W)
     final_size = vae_schedule[-1]  # e.g. (1, 64, 64) for 1024×1024
 
-    # Use only the codes at scale n_scales (no accumulation over previous scales)
-    si = n_scales - 1
-    codes = vae.quantizer.lfq.indices_to_codes(all_bit_indices[si], label_type="bit_label")
-    if codes.dim() == 4:
-        codes = codes.unsqueeze(2)                 # (B, C, 1, h, w)
-    upsampled = F.interpolate(
-        codes, size=final_size, mode=vae.quantizer.z_interplote_up
-    )                                              # (B, C, 1, H, W)
-    return upsampled.float()
+    summed = None
+    for si in range(n_scales):
+        codes = vae.quantizer.lfq.indices_to_codes(all_bit_indices[si], label_type="bit_label")
+        if codes.dim() == 4:
+            codes = codes.unsqueeze(2)             # (B, C, 1, h, w)
+        upsampled = F.interpolate(
+            codes, size=final_size, mode=vae.quantizer.z_interplote_up
+        )                                          # (B, C, 1, H, W)
+        summed = upsampled if summed is None else summed + upsampled
+
+    return summed.float()
 
 
 # ──────────────── SAC: patch / unpatch SelfAttention ─────────────────
