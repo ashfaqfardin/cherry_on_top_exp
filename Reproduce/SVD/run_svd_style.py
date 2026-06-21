@@ -88,25 +88,25 @@ def _save(img: Image.Image, out_dir: str, name: str) -> None:
 
 
 def _make_comparison(
+    normal_img: Image.Image,
     style_img: Image.Image,
-    baseline_img: Image.Image,
     styled_img: Image.Image,
 ) -> Image.Image:
-    """Three-panel strip: style reference | baseline | styled."""
+    """Three-panel strip: normal generation | style reference | styled output."""
     from PIL import ImageDraw
 
-    W, H = baseline_img.size
+    W, H = normal_img.size
     label_h = 36
 
     style_resized = style_img.resize((W, H), Image.LANCZOS)
 
     canvas = Image.new("RGB", (W * 3, H + label_h), (20, 20, 20))
-    canvas.paste(style_resized, (0, 0))
-    canvas.paste(baseline_img, (W, 0))
-    canvas.paste(styled_img, (W * 2, 0))
+    canvas.paste(normal_img,    (0,      0))
+    canvas.paste(style_resized, (W,      0))
+    canvas.paste(styled_img,    (W * 2,  0))
 
     draw = ImageDraw.Draw(canvas)
-    for i, label in enumerate(["Style Reference", "Baseline (no style)", "Styled (PFB + SAC)"]):
+    for i, label in enumerate(["Normal (no style)", "Style Reference", "Styled (PFB + SAC)"]):
         tw = len(label) * 6   # default PIL font ≈ 6 px/char
         x = i * W + (W - tw) // 2
         draw.text((x, H + 10), label, fill=(210, 210, 210))
@@ -181,9 +181,9 @@ def _run_one(
         )
         if save_images:
             run_dir = os.path.join(out_dir, name)
-            _save(baseline_img, run_dir, "baseline")
+            _save(baseline_img, run_dir, "normal")
             _save(styled_img,   run_dir, "styled")
-            _save(_make_comparison(style_img, baseline_img, styled_img),
+            _save(_make_comparison(baseline_img, style_img, styled_img),
                   run_dir, "comparison")
         return styled_img
     else:
