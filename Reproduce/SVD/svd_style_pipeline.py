@@ -100,17 +100,17 @@ def compute_style_summed_codes(
     # final_size is (1, H, W) — trilinear expects 5D input (B, C, D, H, W)
     final_size = vae_schedule[-1]  # e.g. (1, 64, 64) for 1024×1024
 
-    # Raw scale-n_scales codes only — no accumulation across earlier scales.
-    # F3_gen in the generation loop is also intercepted before accumulation,
-    # so both sides of PFB operate in the same raw scale-3 feature space.
-    si = n_scales - 1
-    codes = vae.quantizer.lfq.indices_to_codes(all_bit_indices[si], label_type="bit_label")
-    if codes.dim() == 4:
-        codes = codes.unsqueeze(2)                 # (B, C, 1, h, w)
-    upsampled = F.interpolate(
-        codes, size=final_size, mode=vae.quantizer.z_interplote_up
-    )                                              # (B, C, 1, H, W)
-    return upsampled.float()
+    summed = None
+    for si in range(n_scales):
+        codes = vae.quantizer.lfq.indices_to_codes(all_bit_indices[si], label_type="bit_label")
+        if codes.dim() == 4:
+            codes = codes.unsqueeze(2)             # (B, C, 1, h, w)
+        upsampled = F.interpolate(
+            codes, size=final_size, mode=vae.quantizer.z_interplote_up
+        )                                          # (B, C, 1, H, W)
+        summed = upsampled if summed is None else summed + upsampled
+
+    return summed.float()
 
 
 # ──────────────── SAC: patch / unpatch SelfAttention ─────────────────
@@ -422,20 +422,21 @@ def _styled_infer_cfg(
         if si != num_stages_minus_1:
             upsampled = F.interpolate(codes, size=vae_scale_schedule[-1],
                                       mode=vae.quantizer.z_interplote_up)
+            summed_codes = upsampled if summed_codes is None else summed_codes + upsampled
 
             # ── PFB injection at pfb_step (paper: s=3) ────────────────
-            # Applied to raw scale-s codes BEFORE accumulation so that both
-            # F3_gen and F3_sty are raw scale-3 features (same space).
+            # Applied to summed_codes AFTER accumulation: F3_sty and summed_codes[1:2]
+            # are both accumulated over scales 1..pfb_step, so they share the same
+            # representation space and the PFB blend is meaningful.
+            # The modified summed_codes then conditions all remaining scales (4..12).
             if use_pfb and s == pfb_step:
-                up_dtype = upsampled.dtype
-                upsampled = upsampled.clone()
-                upsampled[1:2] = apply_pfb(
-                    upsampled[1:2].float(),          # raw generation-path scale-s codes
-                    F3_sty.to(upsampled.device),     # raw style scale-s codes
+                sc_dtype = summed_codes.dtype
+                summed_codes = summed_codes.clone()
+                summed_codes[1:2] = apply_pfb(
+                    summed_codes[1:2].float(),       # accumulated generation path
+                    F3_sty.to(summed_codes.device),  # accumulated style features
                     pfb_alpha,
-                ).to(up_dtype)
-
-            summed_codes = upsampled if summed_codes is None else summed_codes + upsampled
+                ).to(sc_dtype)
 
             next_size = vae_scale_schedule[si + 1]
             last_stage = F.interpolate(summed_codes, size=next_size,
@@ -539,7 +540,7 @@ def generate_styled(
     all_bit_indices = get_style_codes(vae, style_tensor, scale_schedule)
     F3_sty = compute_style_summed_codes(
         vae, all_bit_indices, scale_schedule,
-        n_scales=3, apply_spatial_patchify=_patchify,
+        n_scales=pfb_step, apply_spatial_patchify=_patchify,
     ).to(device)
 
     # ── SAC: patch self-attention ─────────────────────────────────────
