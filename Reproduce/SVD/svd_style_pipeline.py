@@ -609,6 +609,31 @@ def _hf_download_checkpoint(
     return dest
 
 
+def _hf_download_8b_weights(local_dir: str, token: str | None = None) -> str:
+    """
+    Download the Infinity-8B safetensors shards from FoundationVision/Infinity.
+    Returns the local directory containing the shards and index file.
+    """
+    _INF_REPO = "FoundationVision/Infinity"
+    _SHARDS = [
+        "infinity_8b_weights/model-00001-of-00004.safetensors",
+        "infinity_8b_weights/model-00002-of-00004.safetensors",
+        "infinity_8b_weights/model-00003-of-00004.safetensors",
+        "infinity_8b_weights/model-00004-of-00004.safetensors",
+        "infinity_8b_weights/model.safetensors.index.json",
+    ]
+    weight_dir = os.path.join(local_dir, "infinity_8b_weights")
+    os.makedirs(weight_dir, exist_ok=True)
+    for f in _SHARDS:
+        dest = os.path.join(local_dir, f)
+        if not os.path.isfile(dest):
+            print(f"  Downloading {f} …")
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(repo_id=_INF_REPO, filename=f,
+                            local_dir=local_dir, token=token)
+    return weight_dir
+
+
 def load_model(
     model_path: str,
     vae_path: str,
@@ -616,41 +641,56 @@ def load_model(
     device: str = "cuda",
     cache_dir: str = "./models",
     hf_token: str | None = None,
+    model_size: str = "8b",
 ):
     """
-    Load Infinity-2B, BSQ-VAE-d32, and Flan-T5-XL.
+    Load Infinity (8B by default), BSQ-VAE-d32, and Flan-T5-XL.
 
-    model_path : local path to infinity_2b_reg.pth; auto-downloaded from
-                 FoundationVision/infinity if the file is missing.
-    vae_path   : local path to infinity_vae_d32.pth; same auto-download logic.
-    t5_path    : HuggingFace model ID or local dir for the T5 text encoder
-                 (e.g. 'google/flan-t5-xl')
+    model_path : local path or directory for the Infinity checkpoint.
+                 - 8B: directory containing the 4 safetensors shards
+                       (auto-downloaded to cache_dir/infinity_8b_weights/)
+                 - 2B: path to infinity_2b_reg.pth
+                       (auto-downloaded to cache_dir/infinity_2b_reg.pth)
+    vae_path   : local path to infinity_vae_d32.pth; auto-downloaded if missing.
+    t5_path    : HuggingFace model ID or local dir for the T5 text encoder.
     device     : 'cuda' or 'cpu'
     cache_dir  : directory for downloaded checkpoints
     hf_token   : HuggingFace token; falls back to HF_TOKEN env variable.
+    model_size : '8b' (default) or '2b'
 
     Returns (infinity, vae, text_tokenizer, text_encoder, scale_schedule).
     scale_schedule is for 1024×1024 (pn='1M', aspect 1:1), 12 scales.
     """
-    import os
     import argparse
 
     from tools.run_infinity import load_tokenizer, load_visual_tokenizer, load_transformer
     from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 
-    # ── resolve HF token and inject into environment ──────────────────
-    # Setting HF_TOKEN ensures all huggingface_hub / transformers calls
-    # (including load_tokenizer inside Infinity) are authenticated.
+    # ── resolve HF token ──────────────────────────────────────────────
     token = hf_token or os.environ.get("HF_TOKEN") or None
     if token:
         os.environ["HF_TOKEN"] = token
 
-    # ── auto-download checkpoints if missing ──────────────────────────
     _INF_REPO = "FoundationVision/infinity"
-    if not os.path.isfile(model_path):
-        model_path = _hf_download_checkpoint(
-            _INF_REPO, "infinity_2b_reg.pth", cache_dir, token=token
-        )
+
+    # ── auto-download model checkpoint if missing ─────────────────────
+    if model_size == "8b":
+        weight_dir = os.path.join(cache_dir, "infinity_8b_weights")
+        index_file = os.path.join(weight_dir, "model.safetensors.index.json")
+        if not os.path.isfile(index_file):
+            weight_dir = _hf_download_8b_weights(cache_dir, token=token)
+        model_path = weight_dir
+        _model_type      = "infinity_8b"
+        _checkpoint_type = "torch_shard"
+    else:
+        if not os.path.isfile(model_path):
+            model_path = _hf_download_checkpoint(
+                _INF_REPO, "infinity_2b_reg.pth", cache_dir, token=token
+            )
+        _model_type      = "infinity_2b"
+        _checkpoint_type = "torch"
+
+    # ── VAE ───────────────────────────────────────────────────────────
     if not os.path.isfile(vae_path):
         vae_path = _hf_download_checkpoint(
             _INF_REPO, "infinity_vae_d32.pth", cache_dir, token=token
@@ -658,13 +698,11 @@ def load_model(
 
     # ── scale schedule for 1024×1024 (aspect 1:1) ────────────────────
     pn = "1M"
-    h_div_w_key = 1.000   # float key used by dynamic_resolution_h_w
+    h_div_w_key = 1.000
     raw_schedule = dynamic_resolution_h_w[h_div_w_key][pn]["scales"]
     scale_schedule = [(1, int(h), int(w)) for (_, h, w) in raw_schedule]
 
     # ── T5 text encoder ───────────────────────────────────────────────
-    # Point transformers cache to cache_dir so T5 is stored alongside
-    # the .pth checkpoints instead of ~/.cache/huggingface.
     _abs_cache = os.path.abspath(cache_dir)
     os.environ["TRANSFORMERS_CACHE"] = _abs_cache
     os.environ["HF_HOME"] = _abs_cache
@@ -672,21 +710,19 @@ def load_model(
     text_encoder = text_encoder.to(device)
 
     # ── BSQ-VAE d32 ───────────────────────────────────────────────────
-    # Args expected by load_visual_tokenizer (from tools/run_infinity.py)
     vae_args = argparse.Namespace(
-        vae_type=32,             # codebook_dim = 32
+        vae_type=32,
         vae_path=vae_path,
         apply_spatial_patchify=0,
     )
     vae = load_visual_tokenizer(vae_args)
     vae = vae.to(device).eval()
 
-    # ── Infinity-2B transformer ───────────────────────────────────────
-    # Args expected by load_transformer (from tools/run_infinity.py)
+    # ── Infinity transformer ──────────────────────────────────────────
     inf_args = argparse.Namespace(
-        model_type="infinity_2b",
+        model_type=_model_type,
         model_path=model_path,
-        checkpoint_type="torch",
+        checkpoint_type=_checkpoint_type,
         cache_dir=cache_dir,
         enable_model_cache=0,
         rope2d_each_sa_layer=1,

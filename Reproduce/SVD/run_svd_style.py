@@ -210,9 +210,11 @@ def parse_args() -> argparse.Namespace:
                    help="Path to the cloned Infinity repo (the directory that "
                         "contains tools/run_infinity.py).  Auto-detected when "
                         "omitted.")
+    p.add_argument("--model_size", type=str, default="8b", choices=["8b", "2b"],
+                   help="Which Infinity model to use: '8b' (default) or '2b'")
     p.add_argument("--infinity_path", type=str, default="",
-                   help="Path to Infinity-2B checkpoint (.pth).  "
-                        "Falls back to cache_dir/infinity_2b_reg.pth")
+                   help="Path to Infinity checkpoint (.pth for 2B, directory for 8B).  "
+                        "Auto-detected from cache_dir when omitted.")
     p.add_argument("--vae_path", type=str, default="",
                    help="Path to BSQ-VAE d32 checkpoint (.pth).  "
                         "Falls back to cache_dir/infinity_vae_d32.pth")
@@ -281,13 +283,16 @@ def _resolve_path(path: str, fallback_dir: str, fallback_name: str) -> str:
 def main() -> None:
     args = parse_args()
 
-    inf_ckpt = _resolve_path(args.infinity_path, args.cache_dir, "infinity_2b_reg.pth")
-    vae_ckpt = _resolve_path(args.vae_path,      args.cache_dir, "infinity_vae_d32.pth")
+    # For 8B the model_path is a directory; for 2B it's a .pth file.
+    if args.model_size == "8b":
+        inf_ckpt = args.infinity_path or os.path.join(args.cache_dir, "infinity_8b_weights")
+    else:
+        inf_ckpt = _resolve_path(args.infinity_path, args.cache_dir, "infinity_2b_reg.pth")
+    vae_ckpt = _resolve_path(args.vae_path, args.cache_dir, "infinity_vae_d32.pth")
 
-    import os
     hf_token = args.hf_token or os.environ.get("HF_TOKEN") or None
 
-    print("[Loading models …]")
+    print(f"[Loading Infinity-{args.model_size.upper()} …]")
     infinity, vae, text_tokenizer, text_encoder, scale_schedule = load_model(
         model_path=inf_ckpt,
         vae_path=vae_ckpt,
@@ -295,6 +300,7 @@ def main() -> None:
         device=args.device,
         cache_dir=args.cache_dir,
         hf_token=hf_token,
+        model_size=args.model_size,
     )
 
     # ── build run list ───────────────────────────────────────────────

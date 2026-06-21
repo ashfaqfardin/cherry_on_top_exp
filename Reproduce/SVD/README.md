@@ -306,4 +306,5 @@ Expected: lower α → more style (risk of content leakage), higher α → less 
 
 - **`lm_head.weight UNEXPECTED` warning**: harmless. This appears when loading `google/flan-t5-xl` as an encoder-only model — the decoder head is unused and safely ignored.
 - **VRAM**: ~18 GB for 1024×1024 at bfloat16. A40/A100/H100 recommended. On 16 GB GPUs, reduce resolution or use CPU offloading (not yet implemented).
-- **Prompt format**: the paper's benchmark uses `"A <subject>, <category>, in <style> style"` (e.g. `"A cat, animals, in watercolor painting style"`). This format tends to produce stronger style transfer than informal prompts.
+- **Prompt format**: the prompt describes **content only** — `"A <subject>, <category>"` (e.g. `"A cat, animals"`). Style comes entirely from the reference image via SVD feature extraction; adding style words to the prompt competes with the reference and weakens the transfer.
+- **Model**: Infinity-8B is the default (`--model_size 8b`). Pass `--model_size 2b` to use the lighter 2B checkpoint.
