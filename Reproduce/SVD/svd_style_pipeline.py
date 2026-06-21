@@ -98,10 +98,19 @@ def compute_style_summed_codes(
     )
     final_size = vae_schedule[-1]  # e.g. (1, 64, 64) for 1024×1024
 
+    # F.interpolate needs spatial dims only; squeeze/unsqueeze the T=1 dim
+    # so we always interpolate in 2D (bilinear/nearest are not defined for 5D).
+    tgt_h, tgt_w = final_size[-2], final_size[-1]
+
     summed = None
     for si in range(n_scales):
         codes = vae.quantizer.lfq.indices_to_codes(all_bit_indices[si], label_type="bit_label")
-        upsampled = F.interpolate(codes, size=final_size, mode=vae.quantizer.z_interplote_up)
+        if codes.dim() == 5:                       # (B, C, 1, h, w)
+            codes = codes.squeeze(2)               # (B, C, h, w)
+        upsampled = F.interpolate(
+            codes, size=(tgt_h, tgt_w), mode=vae.quantizer.z_interplote_up
+        )                                          # (B, C, H, W)
+        upsampled = upsampled.unsqueeze(2)         # (B, C, 1, H, W)
         summed = upsampled if summed is None else summed + upsampled
 
     return summed.float()
@@ -443,8 +452,8 @@ def _styled_infer_cfg(
     gen_codes = summed_codes[1:2].squeeze(-3)   # (1, d, H, W)
     img = vae.decode(gen_codes)                  # (1, 3, H, W) in [-1, 1]
     img = (img + 1) / 2
-    img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
-    return img[0].cpu().numpy()  # (H, W, 3) RGB uint8
+    img = img.clamp(0, 1).permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
+    return img[0].cpu().numpy()  # (H, W, 3) RGB uint8 — PIL-compatible
 
 
 # ──────────────── Public entry point ─────────────────────────────────

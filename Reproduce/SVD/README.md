@@ -1,11 +1,11 @@
 # SVD Style Personalization — Training-Free Style Transfer on Infinity-2B
 
-> Based on "A Training-Free Style-Personalization via SVD-Based Feature Decomposition" (CVPR 2025
+> Based on "A Training-Free Style-Personalization via SVD-Based Feature Decomposition" (CVPR 2025)
 > Implemented from scratch — no official code.
 
 Given a **style reference image** and a **text prompt**, generates a 1024×1024 image that follows the prompt while adopting the visual style of the reference.
 
-All commands are run from the **repo root** (`e:/Cherry_on_top/`).
+All commands are run from the **repo root** (`Cherry_on_top/`).
 
 ---
 
@@ -25,11 +25,84 @@ Two mechanisms are applied to the generation path:
 
 ---
 
-## Prerequisites
+## Setup
 
-1. Clone the [Infinity repo](https://github.com/FoundationVision/Infinity) and add it to `PYTHONPATH`, or place it at `<repo_root>/Infinity/`.
-2. Checkpoints (`infinity_2b_reg.pth` and `infinity_vae_d32.pth`) are **auto-downloaded** from `FoundationVision/infinity` on first run. Pass your HuggingFace token via `--hf_token` or set `HF_TOKEN` in the environment to avoid rate limits.
-3. The T5 text encoder (`google/flan-t5-xl`) is loaded from HuggingFace automatically.
+### Requirements
+
+- Python 3.10+
+- CUDA 11.8+ (for GPU inference)
+- PyTorch 2.1+ with CUDA
+
+> **Flash Attention is NOT required.** This implementation uses Infinity's `slow_attn` mode (`customized_flash_attn=False`), which runs on any CUDA-capable GPU without installing `flash-attn`.
+
+Install Python dependencies:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install transformers huggingface_hub Pillow numpy sentencepiece
+```
+
+### 1. Clone the Infinity repo
+
+Place it at `<repo_root>/Infinity/` (auto-detected) or anywhere and pass `--infinity_repo`:
+
+```bash
+# Option A — auto-detected location (recommended)
+git clone https://github.com/FoundationVision/Infinity.git Infinity
+
+# Option B — custom location
+git clone https://github.com/FoundationVision/Infinity.git /path/to/Infinity
+# then pass --infinity_repo /path/to/Infinity when running
+```
+
+Install Infinity's dependencies:
+
+```bash
+pip install -r Infinity/requirements.txt
+```
+
+### 2. Model checkpoints
+
+Checkpoints are **auto-downloaded** from `FoundationVision/infinity` on first run into `./models/`:
+
+- `infinity_2b_reg.pth` (~7 GB) — Infinity-2B transformer
+- `infinity_vae_d32.pth` (~1 GB) — BSQ-VAE d32
+
+Set your HuggingFace token to avoid rate limits:
+
+```bash
+export HF_TOKEN=hf_your_token_here
+```
+
+Or pass `--hf_token YOUR_TOKEN` directly.
+
+### 3. Colab setup
+
+```python
+# 1. Clone this repo
+!git clone https://github.com/ashfaqfardin/cherry_on_top_exp /content/cherry_on_top_exp
+%cd /content/cherry_on_top_exp
+
+# 2. Clone Infinity
+!git clone https://github.com/FoundationVision/Infinity.git /content/Infinity
+!pip install -r /content/Infinity/requirements.txt
+
+# 3. Install other dependencies
+!pip install transformers huggingface_hub sentencepiece
+
+# 4. Set your HF token
+import os
+os.environ["HF_TOKEN"] = "hf_your_token_here"
+```
+
+Then run from `/content/cherry_on_top_exp/`:
+
+```bash
+!python Reproduce/SVD/run_svd_style.py \
+    --style_image  inputs/watercolor_ref.jpg \
+    --prompt       "a cat in watercolor painting style" \
+    --seed 0 --device cuda --save_images
+```
 
 ---
 
@@ -45,7 +118,9 @@ python Reproduce/SVD/run_svd_style.py \
     --save_images
 ```
 
-Checkpoints are downloaded automatically on first run to `./models/`. You can also point to existing files:
+Output: `results/svd_style/output/generated.png`
+
+If checkpoints are already downloaded, you can point to them directly:
 
 ```bash
 python Reproduce/SVD/run_svd_style.py \
@@ -56,22 +131,36 @@ python Reproduce/SVD/run_svd_style.py \
     --seed 0 --device cuda --save_images
 ```
 
-Output: `results/svd_style/output/generated.png`
-
 ---
 
-## Config file (multiple runs)
+## Multiple runs (config file)
+
+The config runner loads models once and processes all runs sequentially — much faster than launching the script once per image.
 
 ```bash
 python Reproduce/SVD/run_svd_style.py \
-    --config prompts/reproduce_svd_style.json \
-    --device cuda \
+    --config   prompts/reproduce_svd_style.json \
+    --hf_token YOUR_HF_TOKEN \
+    --device   cuda \
     --save_images
 ```
 
 Output per run: `results/svd_style/{name}/generated.png`
 
+In Colab:
+
+```python
+!python Reproduce/SVD/run_svd_style.py \
+    --config   prompts/reproduce_svd_style.json \
+    --device   cuda \
+    --save_images
+# HF_TOKEN already set in the environment — no need to pass it again
+```
+
 ### Config format
+
+All keys in `global` apply to every run unless overridden at the run level.
+Every key that appears in the [All flags](#all-flags) table can be used in `global` or per-run.
 
 ```json
 {
@@ -79,21 +168,35 @@ Output per run: `results/svd_style/{name}/generated.png`
     "pfb_alpha": 1.0,
     "cfg": 3.0,
     "tau": 1.0,
-    "seed": 0,
+    "top_k": 900,
+    "top_p": 0.97,
+    "cfg_insertion_layer": -5,
     "height": 1024,
-    "width": 1024
+    "width": 1024,
+    "seed": 0
   },
   "runs": [
     {
       "name": "cat_watercolor",
       "style_image": "inputs/watercolor_ref.jpg",
       "prompt": "a cat sitting on a windowsill in watercolor painting style"
+    },
+    {
+      "name": "castle_oil",
+      "style_image": "inputs/oilpainting_ref.jpg",
+      "prompt": "a medieval castle on a hill in oil painting style",
+      "pfb_alpha": 0.8,
+      "seed": 42
     }
   ]
 }
 ```
 
-Per-run keys override `global`. `style_image` is relative to the repo root.
+**Resolution precedence**: run key → `global` key → CLI flag → built-in default.
+`style_image` paths are relative to the repo root.
+
+A ready-to-run demo config with 4 style presets is at [prompts/reproduce_svd_style.json](../../prompts/reproduce_svd_style.json).
+Place your own style images in `inputs/` before running it.
 
 ---
 
@@ -102,10 +205,11 @@ Per-run keys override `global`. `style_image` is relative to the repo root.
 | Flag | Default | Description |
 |---|---|---|
 | `--hf_token` | env `HF_TOKEN` | HuggingFace access token for downloads |
+| `--infinity_repo` | auto-detected | Path to the cloned Infinity repo (the directory containing `tools/run_infinity.py`) |
 | `--infinity_path` | `models/infinity_2b_reg.pth` | Infinity-2B transformer checkpoint (auto-downloaded) |
-| `--vae_path` | `models/infinity_vae_d32.pth` | BSQ-VAE d32 checkpoint |
-| `--t5_path` | `google/flan-t5-xl` | HuggingFace ID or local path for T5 |
-| `--cache_dir` | `./models` | Directory for model weight cache |
+| `--vae_path` | `models/infinity_vae_d32.pth` | BSQ-VAE d32 checkpoint (auto-downloaded) |
+| `--t5_path` | `google/flan-t5-xl` | HuggingFace ID or local path for T5 text encoder |
+| `--cache_dir` | `./models` | Directory for downloaded model weights |
 | `--style_image` | — | Path to reference style image |
 | `--prompt` | — | Text prompt for the generated image |
 | `--name` | `output` | Output subfolder name |
@@ -121,3 +225,10 @@ Per-run keys override `global`. `style_image` is relative to the repo root.
 | `--out_dir` | `results/svd_style` | Root output directory |
 | `--save_images` | off | Write output images to disk |
 | `--config` | — | Path to JSON config file |
+
+---
+
+## Notes
+
+- **`lm_head.weight UNEXPECTED` warning**: harmless. This appears when loading `google/flan-t5-xl` as an encoder-only model — the decoder head is unused and safely ignored.
+- **VRAM**: ~18 GB for 1024×1024 at bfloat16. A40/A100/H100 recommended. On 16 GB GPUs, reduce resolution or use CPU offloading (not yet implemented).
