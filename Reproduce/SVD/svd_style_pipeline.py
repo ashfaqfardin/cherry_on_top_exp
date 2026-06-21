@@ -541,11 +541,12 @@ def generate_styled(
     text_cond_b2 = tile_text_cond(text_cond, n=2)
 
     # ── Style feature extraction ──────────────────────────────────────
+    _patchify = getattr(infinity, "apply_spatial_patchify", False)
     style_tensor = preprocess_image(style_image, height, width).to(device)
     all_bit_indices = get_style_codes(vae, style_tensor, scale_schedule)
     F3_sty = compute_style_summed_codes(
         vae, all_bit_indices, scale_schedule,
-        n_scales=3, apply_spatial_patchify=apply_spatial_patchify,
+        n_scales=3, apply_spatial_patchify=_patchify,
     ).to(device)
 
     # ── SAC: patch self-attention ─────────────────────────────────────
@@ -712,9 +713,12 @@ def load_model(
         index_file = os.path.join(weight_dir, "model.safetensors.index.json")
         if not os.path.isfile(index_file):
             weight_dir = _hf_download_8b_weights(cache_dir, token=token)
-        model_path = weight_dir
+        model_path       = weight_dir
         _model_type      = "infinity_8b"
         _checkpoint_type = "torch_shard"
+        _vae_type        = 56     # 8B uses 56-bit BSQ-VAE
+        _patchify        = 1      # 8B uses spatial patchify
+        _vae_file        = "infinity_vae_d56_f8_14_patchify.pth"
     else:
         if not os.path.isfile(model_path):
             model_path = _hf_download_checkpoint(
@@ -722,11 +726,14 @@ def load_model(
             )
         _model_type      = "infinity_2b"
         _checkpoint_type = "torch"
+        _vae_type        = 32
+        _patchify        = 0
+        _vae_file        = "infinity_vae_d32.pth"
 
     # ── VAE ───────────────────────────────────────────────────────────
     if not os.path.isfile(vae_path):
         vae_path = _hf_download_checkpoint(
-            _INF_REPO, "infinity_vae_d32.pth", cache_dir, token=token
+            _INF_REPO, _vae_file, cache_dir, token=token
         )
 
     # ── scale schedule for 1024×1024 (aspect 1:1) ────────────────────
@@ -742,11 +749,11 @@ def load_model(
     text_tokenizer, text_encoder = load_tokenizer(t5_path)
     text_encoder = text_encoder.to(device)
 
-    # ── BSQ-VAE d32 ───────────────────────────────────────────────────
+    # ── BSQ-VAE ───────────────────────────────────────────────────────
     vae_args = argparse.Namespace(
-        vae_type=32,
+        vae_type=_vae_type,
         vae_path=vae_path,
-        apply_spatial_patchify=0,
+        apply_spatial_patchify=_patchify,
     )
     vae = load_visual_tokenizer(vae_args)
     vae = vae.to(device).eval()
@@ -765,9 +772,9 @@ def load_model(
         use_bit_label=1,
         pn=pn,
         bf16=1,
-        vae_type=32,
+        vae_type=_vae_type,
         text_channels=2048,
-        apply_spatial_patchify=0,
+        apply_spatial_patchify=_patchify,
         use_flex_attn=0,
     )
     if model_size == "8b":

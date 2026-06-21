@@ -288,7 +288,10 @@ def main() -> None:
         inf_ckpt = args.infinity_path or os.path.join(args.cache_dir, "infinity_8b_weights")
     else:
         inf_ckpt = _resolve_path(args.infinity_path, args.cache_dir, "infinity_2b_reg.pth")
-    vae_ckpt = _resolve_path(args.vae_path, args.cache_dir, "infinity_vae_d32.pth")
+    # VAE filename differs by model size; load_model picks the right one when path is empty
+    _vae_default = ("infinity_vae_d56_f8_14_patchify.pth" if args.model_size == "8b"
+                    else "infinity_vae_d32.pth")
+    vae_ckpt = _resolve_path(args.vae_path, args.cache_dir, _vae_default)
 
     hf_token = args.hf_token or os.environ.get("HF_TOKEN") or None
 
