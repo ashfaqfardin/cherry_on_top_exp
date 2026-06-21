@@ -22,7 +22,7 @@
     {
       "name": "cat_watercolor",
       "style_image": "inputs/watercolor_ref.jpg",
-      "prompt": "A cat, watercolor painting"
+      "prompt": "A cat"
     },
     {
       "name": "flower_watercolor",
@@ -37,7 +37,7 @@
     {
       "name": "castle_oilpainting",
       "style_image": "inputs/oilpainting_ref.png",
-      "prompt": "A castle, oil painting"
+      "prompt": "A castle"
     },
     {
       "name": "horse_oilpainting",
@@ -52,7 +52,7 @@
     {
       "name": "robot_3d",
       "style_image": "inputs/3d_render_ref.png",
-      "prompt": "A robot, 3D render"
+      "prompt": "A robot"
     },
     {
       "name": "car_3d",
