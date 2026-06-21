@@ -75,7 +75,7 @@
     {
       "comment": "── 3D Render ──",
       "name": "robot_3d",
-      "style_image": "inputs/3d_render_ref.png",
+      "style_image": "inputs/cartoon3d_ref.png",
       "prompt": "A robot, 3D Render",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
@@ -84,7 +84,7 @@
     },
     {
       "name": "car_3d",
-      "style_image": "inputs/3d_render_ref.png",
+      "style_image": "inputs/cartoon3d_ref.png",
       "prompt": "A car, 3D Render",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
@@ -93,7 +93,7 @@
     },
     {
       "name": "dragon_3d",
-      "style_image": "inputs/3d_render_ref.png",
+      "style_image": "inputs/cartoon3d_ref.png",
       "prompt": "A dragon, 3D Render",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
