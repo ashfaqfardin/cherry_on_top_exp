@@ -420,17 +420,20 @@ def _styled_infer_cfg(
         if si != num_stages_minus_1:
             upsampled = F.interpolate(codes, size=vae_scale_schedule[-1],
                                       mode=vae.quantizer.z_interplote_up)
-            summed_codes = upsampled if summed_codes is None else summed_codes + upsampled
 
             # ── PFB injection at pfb_step (paper: s=3) ────────────────
+            # Applied to raw scale-s codes BEFORE accumulation so that both
+            # F3_gen and F3_sty are raw scale-3 features (same space).
             if use_pfb and s == pfb_step:
-                sc_dtype = summed_codes.dtype
-                summed_codes = summed_codes.clone()
-                summed_codes[1:2] = apply_pfb(
-                    summed_codes[1:2].float(),       # generation path
-                    F3_sty.to(summed_codes.device),  # style features at scale 3
+                up_dtype = upsampled.dtype
+                upsampled = upsampled.clone()
+                upsampled[1:2] = apply_pfb(
+                    upsampled[1:2].float(),          # raw generation-path scale-s codes
+                    F3_sty.to(upsampled.device),     # raw style scale-s codes
                     pfb_alpha,
-                ).to(sc_dtype)
+                ).to(up_dtype)
+
+            summed_codes = upsampled if summed_codes is None else summed_codes + upsampled
 
             next_size = vae_scale_schedule[si + 1]
             last_stage = F.interpolate(summed_codes, size=next_size,
