@@ -87,6 +87,33 @@ def _save(img: Image.Image, out_dir: str, name: str) -> None:
     print(f"  saved → {path}")
 
 
+def _make_comparison(
+    style_img: Image.Image,
+    baseline_img: Image.Image,
+    styled_img: Image.Image,
+) -> Image.Image:
+    """Three-panel strip: style reference | baseline | styled."""
+    from PIL import ImageDraw
+
+    W, H = baseline_img.size
+    label_h = 36
+
+    style_resized = style_img.resize((W, H), Image.LANCZOS)
+
+    canvas = Image.new("RGB", (W * 3, H + label_h), (20, 20, 20))
+    canvas.paste(style_resized, (0, 0))
+    canvas.paste(baseline_img, (W, 0))
+    canvas.paste(styled_img, (W * 2, 0))
+
+    draw = ImageDraw.Draw(canvas)
+    for i, label in enumerate(["Style Reference", "Baseline (no style)", "Styled (PFB + SAC)"]):
+        tw = len(label) * 6   # default PIL font ≈ 6 px/char
+        x = i * W + (W - tw) // 2
+        draw.text((x, H + 10), label, fill=(210, 210, 210))
+
+    return canvas
+
+
 def _run_one(
     infinity, vae, text_tokenizer, text_encoder, scale_schedule,
     *,
@@ -110,22 +137,19 @@ def _run_one(
     generation_steps: int = 12,
     pfb_step: int = 3,
     sac_steps=None,
+    compare: bool = False,
 ) -> Image.Image:
     mode = ("baseline" if not use_pfb and not use_sac
             else "PFB only" if use_pfb and not use_sac
             else "SAC only" if not use_pfb and use_sac
             else "PFB+SAC")
-    print(f"\n[{name}]  ({mode})")
+    print(f"\n[{name}]  ({mode}){' [compare]' if compare else ''}")
     print(f"  style image : {style_image_path}")
     print(f"  prompt      : {prompt}")
 
     style_img = Image.open(style_image_path).convert("RGB")
 
-    img = generate_styled(
-        infinity,
-        vae,
-        text_tokenizer,
-        text_encoder,
+    _kwargs = dict(
         style_image=style_img,
         prompt=prompt,
         scale_schedule=scale_schedule,
@@ -139,18 +163,37 @@ def _run_one(
         height=height,
         width=width,
         device=device,
-        use_pfb=use_pfb,
-        use_sac=use_sac,
         generation_steps=generation_steps,
         pfb_step=pfb_step,
         sac_steps=sac_steps,
     )
 
-    if save_images:
-        run_dir = os.path.join(out_dir, name)
-        _save(img, run_dir, "generated")
-
-    return img
+    if compare:
+        print("  [1/2] baseline (no style) …")
+        baseline_img = generate_styled(
+            infinity, vae, text_tokenizer, text_encoder,
+            use_pfb=False, use_sac=False, **_kwargs,
+        )
+        print("  [2/2] styled (PFB+SAC) …")
+        styled_img = generate_styled(
+            infinity, vae, text_tokenizer, text_encoder,
+            use_pfb=use_pfb, use_sac=use_sac, **_kwargs,
+        )
+        if save_images:
+            run_dir = os.path.join(out_dir, name)
+            _save(baseline_img, run_dir, "baseline")
+            _save(styled_img,   run_dir, "styled")
+            _save(_make_comparison(style_img, baseline_img, styled_img),
+                  run_dir, "comparison")
+        return styled_img
+    else:
+        img = generate_styled(
+            infinity, vae, text_tokenizer, text_encoder,
+            use_pfb=use_pfb, use_sac=use_sac, **_kwargs,
+        )
+        if save_images:
+            _save(img, os.path.join(out_dir, name), "generated")
+        return img
 
 
 # ──────────────────────────── CLI ────────────────────────────────────
@@ -189,6 +232,9 @@ def parse_args() -> argparse.Namespace:
     # ── method hyper-parameters ───────────────────────────────────────
     p.add_argument("--pfb_alpha", type=float, default=1.0,
                    help="SVD exponential reweighting factor α (paper default 1.0)")
+    p.add_argument("--compare", action="store_true",
+                   help="Generate baseline (no style) AND styled image; save both plus "
+                        "a side-by-side comparison strip (comparison.png)")
     p.add_argument("--no_pfb", action="store_true",
                    help="Disable Principal Feature Blending (ablation)")
     p.add_argument("--no_sac", action="store_true",
@@ -299,6 +345,7 @@ def main() -> None:
             sac_steps=_parse_sac_steps(
                 run.get("sac_steps", _g("sac_steps", args.sac_steps))
             ),
+            compare=run.get("compare", _g("compare", args.compare)),
         )
 
     print("\nDone.")

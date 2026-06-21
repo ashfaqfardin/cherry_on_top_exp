@@ -2,6 +2,7 @@
   "comment": "Demo runs for SVD-based style personalization on Infinity-2B. Each run generates a 1024×1024 image in the style of the reference image. Place your own style reference images in inputs/ before running.",
 
   "global": {
+    "compare": true,
     "pfb_alpha": 1.0,
     "generation_steps": 12,
     "pfb_step": 3,

@@ -232,6 +232,7 @@ Place your own style images in `inputs/` before running it.
 | `--out_dir` | `results/svd_style` | Root output directory |
 | `--save_images` | off | Write output images to disk |
 | `--config` | — | Path to JSON config file |
+| `--compare` | off | Generate baseline (no style) and styled image in one run; saves `baseline.png`, `styled.png`, and a side-by-side `comparison.png` |
 | `--no_pfb` | off | Disable Principal Feature Blending (ablation) |
 | `--no_sac` | off | Disable Structural Attention Correction (ablation) |
 
