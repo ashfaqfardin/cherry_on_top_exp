@@ -635,6 +635,38 @@ def _hf_download_8b_weights(local_dir: str, token: str | None = None) -> str:
     return weight_dir
 
 
+def _patch_load_sharded_checkpoint() -> None:
+    """
+    Newer transformers removed load_sharded_checkpoint from modeling_utils.
+    Inject a safetensors-based replacement so Infinity's torch_shard loader works.
+    """
+    import json
+    import transformers.modeling_utils as _mu
+    if hasattr(_mu, "load_sharded_checkpoint"):
+        return  # already present — nothing to do
+
+    from safetensors.torch import load_file as _load_st
+
+    def load_sharded_checkpoint(model, folder, strict=True, prefer_safe=True):
+        index_path = os.path.join(folder, "model.safetensors.index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+        shard_files = sorted(set(index["weight_map"].values()))
+        state_dict: dict = {}
+        for shard in shard_files:
+            print(f"  [8B] loading shard {shard} …")
+            state_dict.update(_load_st(os.path.join(folder, shard), device="cpu"))
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            print(f"  [8B] {len(unexpected)} unexpected keys (ignored)")
+        if missing:
+            print(f"  [8B] WARNING: {len(missing)} missing keys")
+        return model
+
+    _mu.load_sharded_checkpoint = load_sharded_checkpoint
+    print("  [8B] patched transformers.modeling_utils.load_sharded_checkpoint")
+
+
 def load_model(
     model_path: str,
     vae_path: str,
@@ -738,6 +770,8 @@ def load_model(
         apply_spatial_patchify=0,
         use_flex_attn=0,
     )
+    if model_size == "8b":
+        _patch_load_sharded_checkpoint()
     infinity = load_transformer(vae, inf_args)
     infinity = infinity.to(device).eval()
 
