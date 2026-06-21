@@ -270,10 +270,14 @@ def _styled_infer_cfg(
     gumbel: int = 0,
     trunk_scale: int = 1000,
     sampling_per_bits: int = 1,
+    use_pfb: bool = True,
+    use_sac: bool = True,
+    pfb_scale: int = 2,      # 0-indexed; paper s=3 → si=2
+    sac_start_scale: int = 2, # 0-indexed; paper S_fine starts at s=3 → si=2
 ):
     """
     Modified version of Infinity.autoregressive_infer_cfg that injects:
-      • sac_state['active'] = (si >= 2) before each scale's block loop
+      • sac_state['active'] = (si >= sac_start_scale and use_sac) before each scale's block loop
       • PFB on summed_codes[1:2] immediately after si == 2
 
     Returns a uint8 numpy array (H, W, 3) of the GENERATION path (index 1).
@@ -352,8 +356,8 @@ def _styled_infer_cfg(
         if si >= trunk_scale:
             break
 
-        # ── Activate SAC from scale s=3 (si=2) onward ─────────────────
-        sac_state["active"] = si >= 2
+        # ── Activate SAC from sac_start_scale onward ──────────────────
+        sac_state["active"] = use_sac and (si >= sac_start_scale)
 
         attn_fn = None
         if inf.use_flex_attn:
@@ -416,8 +420,8 @@ def _styled_infer_cfg(
                                       mode=vae.quantizer.z_interplote_up)
             summed_codes = upsampled if summed_codes is None else summed_codes + upsampled
 
-            # ── PFB injection at scale s=3 (si=2) ─────────────────────
-            if si == 2:
+            # ── PFB injection at pfb_scale (paper: si=2) ──────────────
+            if use_pfb and si == pfb_scale:
                 sc_dtype = summed_codes.dtype
                 summed_codes = summed_codes.clone()
                 summed_codes[1:2] = apply_pfb(
@@ -500,13 +504,21 @@ def generate_styled(
     width: int = 1024,
     device: str = "cuda",
     apply_spatial_patchify: bool = False,
+    use_pfb: bool = True,
+    use_sac: bool = True,
 ) -> Image.Image:
     """
     Generate a stylized image given a style reference and a text prompt.
 
     Runs the dual-stream Infinity inference (B=2):
       index 0 — content path (unmodified generation)
-      index 1 — generation path (PFB at s=3, SAC at s=3..12)
+      index 1 — generation path, optionally with PFB at s=3 and SAC at s=3..12
+
+    use_pfb / use_sac can be toggled for ablation:
+      (False, False) → baseline Infinity (single-stream equivalent via generation path)
+      (True,  False) → PFB only
+      (False, True)  → SAC only
+      (True,  True)  → full method (paper default)
 
     Returns a PIL Image.
     """
@@ -548,6 +560,8 @@ def generate_styled(
                 vae_type=1,
                 top_k=top_k,
                 top_p=top_p,
+                use_pfb=use_pfb,
+                use_sac=use_sac,
             )
     finally:
         unpatch_self_attention(patched)

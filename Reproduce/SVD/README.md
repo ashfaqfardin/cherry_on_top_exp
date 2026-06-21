@@ -229,6 +229,72 @@ Place your own style images in `inputs/` before running it.
 | `--out_dir` | `results/svd_style` | Root output directory |
 | `--save_images` | off | Write output images to disk |
 | `--config` | — | Path to JSON config file |
+| `--no_pfb` | off | Disable Principal Feature Blending (ablation) |
+| `--no_sac` | off | Disable Structural Attention Correction (ablation) |
+
+---
+
+## Validation
+
+### Step 1 — Verify vanilla Infinity first
+
+Before running the style method, confirm Infinity itself works with its own script:
+
+```bash
+cd /content/Infinity
+python tools/predict.py \
+    --model_path ../models/infinity_2b_reg.pth \
+    --vae_path   ../models/infinity_vae_d32.pth \
+    --text_encoder_path google/flan-t5-xl \
+    --prompt "a cat sitting on a windowsill" \
+    --device cuda
+```
+
+If this generates a clean image, the model and environment are correct.
+
+### Step 2 — Ablation (matches paper Table 2)
+
+```bash
+# (a) Baseline — pure Infinity, no style
+python Reproduce/SVD/run_svd_style.py \
+    --style_image inputs/watercolor_ref.jpg \
+    --prompt "A cat, animals, in watercolor painting style" \
+    --name ablation_baseline --no_pfb --no_sac --seed 0 --device cuda --save_images
+
+# (b) PFB only
+python Reproduce/SVD/run_svd_style.py \
+    --style_image inputs/watercolor_ref.jpg \
+    --prompt "A cat, animals, in watercolor painting style" \
+    --name ablation_pfb_only --no_sac --seed 0 --device cuda --save_images
+
+# (c) SAC only
+python Reproduce/SVD/run_svd_style.py \
+    --style_image inputs/watercolor_ref.jpg \
+    --prompt "A cat, animals, in watercolor painting style" \
+    --name ablation_sac_only --no_pfb --seed 0 --device cuda --save_images
+
+# (d) Full method — PFB + SAC (paper default)
+python Reproduce/SVD/run_svd_style.py \
+    --style_image inputs/watercolor_ref.jpg \
+    --prompt "A cat, animals, in watercolor painting style" \
+    --name ablation_full --seed 0 --device cuda --save_images
+```
+
+Expected trend: (a) no style, (b) style but possible structure distortion, (d) style + stable structure.
+
+### Step 3 — Alpha sweep (matches paper Table 3)
+
+```bash
+for alpha in 0.2 0.6 1.0 2.0 5.0; do
+  python Reproduce/SVD/run_svd_style.py \
+      --style_image inputs/watercolor_ref.jpg \
+      --prompt "A cat, animals, in watercolor painting style" \
+      --pfb_alpha $alpha \
+      --name alpha_${alpha} --seed 0 --device cuda --save_images
+done
+```
+
+Expected: lower α → more style (risk of content leakage), higher α → less style (closer to baseline).
 
 ---
 
@@ -236,3 +302,4 @@ Place your own style images in `inputs/` before running it.
 
 - **`lm_head.weight UNEXPECTED` warning**: harmless. This appears when loading `google/flan-t5-xl` as an encoder-only model — the decoder head is unused and safely ignored.
 - **VRAM**: ~18 GB for 1024×1024 at bfloat16. A40/A100/H100 recommended. On 16 GB GPUs, reduce resolution or use CPU offloading (not yet implemented).
+- **Prompt format**: the paper's benchmark uses `"A <subject>, <category>, in <style> style"` (e.g. `"A cat, animals, in watercolor painting style"`). This format tends to produce stronger style transfer than informal prompts.

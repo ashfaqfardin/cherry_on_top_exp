@@ -95,8 +95,14 @@ def _run_one(
     device: str,
     out_dir: str,
     save_images: bool,
+    use_pfb: bool = True,
+    use_sac: bool = True,
 ) -> Image.Image:
-    print(f"\n[{name}]")
+    mode = ("baseline" if not use_pfb and not use_sac
+            else "PFB only" if use_pfb and not use_sac
+            else "SAC only" if not use_pfb and use_sac
+            else "PFB+SAC")
+    print(f"\n[{name}]  ({mode})")
     print(f"  style image : {style_image_path}")
     print(f"  prompt      : {prompt}")
 
@@ -120,6 +126,8 @@ def _run_one(
         height=height,
         width=width,
         device=device,
+        use_pfb=use_pfb,
+        use_sac=use_sac,
     )
 
     if save_images:
@@ -165,6 +173,10 @@ def parse_args() -> argparse.Namespace:
     # ── method hyper-parameters ───────────────────────────────────────
     p.add_argument("--pfb_alpha", type=float, default=1.0,
                    help="SVD exponential reweighting factor α (paper default 1.0)")
+    p.add_argument("--no_pfb", action="store_true",
+                   help="Disable Principal Feature Blending (ablation)")
+    p.add_argument("--no_sac", action="store_true",
+                   help="Disable Structural Attention Correction (ablation)")
     p.add_argument("--cfg", type=float, default=3.0,
                    help="Classifier-free guidance scale")
     p.add_argument("--tau", type=float, default=1.0,
@@ -257,6 +269,8 @@ def main() -> None:
             device=args.device,
             out_dir=args.out_dir,
             save_images=args.save_images,
+            use_pfb=not run.get("no_pfb", args.no_pfb),
+            use_sac=not run.get("no_sac", args.no_sac),
         )
 
     print("\nDone.")
