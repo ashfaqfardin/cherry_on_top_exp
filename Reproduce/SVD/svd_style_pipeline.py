@@ -716,8 +716,10 @@ def load_model(
         model_path       = weight_dir
         _model_type      = "infinity_8b"
         _checkpoint_type = "torch_shard"
-        _vae_type        = 56     # 8B uses 56-bit BSQ-VAE
-        _patchify        = 1      # 8B uses spatial patchify
+        # d56 VAE = codebook_dim 14 × 4 positions (2×2 spatial patchify)
+        # → word_embed (3584, 56), head (112, 3584) in checkpoint
+        _vae_type        = 14
+        _patchify        = 1
         _vae_file        = "infinity_vae_d56_f8_14_patchify.pth"
     else:
         if not os.path.isfile(model_path):
