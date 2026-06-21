@@ -134,7 +134,7 @@
       "comment": "── Drawing ──",
       "name": "cat_drawing",
       "style_image": "inputs/drawing_ref.png",
-      "prompt": "A cat, crayon drawing",
+      "prompt": "A cat, kid crayon drawing",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
@@ -143,7 +143,7 @@
     {
       "name": "house_drawing",
       "style_image": "inputs/drawing_ref.png",
-      "prompt": "A house, crayon drawing",
+      "prompt": "A house, kid crayon drawing",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
@@ -152,7 +152,7 @@
     {
       "name": "tree_drawing",
       "style_image": "inputs/drawing_ref.png",
-      "prompt": "A tree, crayon drawing",
+      "prompt": "A tree, kid crayon drawing",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
@@ -161,7 +161,7 @@
     {
       "name": "pickup_truck_drawing",
       "style_image": "inputs/sketch_ref.png",
-      "prompt": "A pickup truck, crayon drawing",
+      "prompt": "A pickup truck, kid crayon drawing",
       "pfb_alpha": 1.0,
       "pfb_step": 3,
       "sac_steps": [3, 4, 5, 6, 7, 8, 9],
