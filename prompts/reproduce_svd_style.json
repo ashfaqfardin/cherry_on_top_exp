@@ -5,7 +5,7 @@
     "compare": true,
     "pfb_alpha": 1.0,
     "generation_steps": 12,
-    "pfb_step": 3,
+    "pfb_step": 2,
     "sac_steps": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     "cfg": 3.0,
     "tau": 1.0,
