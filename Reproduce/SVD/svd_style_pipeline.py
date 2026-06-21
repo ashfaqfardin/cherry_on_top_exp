@@ -96,21 +96,18 @@ def compute_style_summed_codes(
         if apply_spatial_patchify
         else list(scale_schedule)
     )
+    # final_size is (1, H, W) — trilinear expects 5D input (B, C, D, H, W)
     final_size = vae_schedule[-1]  # e.g. (1, 64, 64) for 1024×1024
-
-    # F.interpolate needs spatial dims only; squeeze/unsqueeze the T=1 dim
-    # so we always interpolate in 2D (bilinear/nearest are not defined for 5D).
-    tgt_h, tgt_w = final_size[-2], final_size[-1]
 
     summed = None
     for si in range(n_scales):
         codes = vae.quantizer.lfq.indices_to_codes(all_bit_indices[si], label_type="bit_label")
-        if codes.dim() == 5:                       # (B, C, 1, h, w)
-            codes = codes.squeeze(2)               # (B, C, h, w)
+        # indices_to_codes returns 4D (B, C, h, w); trilinear needs 5D
+        if codes.dim() == 4:
+            codes = codes.unsqueeze(2)             # (B, C, 1, h, w)
         upsampled = F.interpolate(
-            codes, size=(tgt_h, tgt_w), mode=vae.quantizer.z_interplote_up
-        )                                          # (B, C, H, W)
-        upsampled = upsampled.unsqueeze(2)         # (B, C, 1, H, W)
+            codes, size=final_size, mode=vae.quantizer.z_interplote_up
+        )                                          # (B, C, 1, H, W)
         summed = upsampled if summed is None else summed + upsampled
 
     return summed.float()
@@ -411,6 +408,8 @@ def _styled_infer_cfg(
         idx_Bld = idx_Bld.unsqueeze(1)  # (B, 1, h, w, d)
 
         codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type="bit_label")
+        if codes.dim() == 4:                       # (B, C, h, w) → need 5D for trilinear
+            codes = codes.unsqueeze(2)             # (B, C, 1, h, w)
 
         if si != num_stages_minus_1:
             upsampled = F.interpolate(codes, size=vae_scale_schedule[-1],

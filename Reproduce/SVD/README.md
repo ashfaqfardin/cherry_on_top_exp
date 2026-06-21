@@ -33,13 +33,14 @@ Two mechanisms are applied to the generation path:
 - CUDA 11.8+ (for GPU inference)
 - PyTorch 2.1+ with CUDA
 
-> **Flash Attention is NOT required.** This implementation uses Infinity's `slow_attn` mode (`customized_flash_attn=False`), which runs on any CUDA-capable GPU without installing `flash-attn`.
+> **Flash Attention must be installed** even though this implementation uses Infinity's `slow_attn` mode. Infinity's `basic.py` imports `flash_attn` unconditionally at module load time, so the package must be present regardless.
 
 Install Python dependencies:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install transformers huggingface_hub Pillow numpy sentencepiece
+pip install flash-attn --no-build-isolation   # required by Infinity (~5–10 min to compile)
 ```
 
 ### 1. Clone the Infinity repo
@@ -87,10 +88,13 @@ Or pass `--hf_token YOUR_TOKEN` directly.
 !git clone https://github.com/FoundationVision/Infinity.git /content/Infinity
 !pip install -r /content/Infinity/requirements.txt
 
-# 3. Install other dependencies
+# 3. Install flash-attn (required by Infinity even in slow_attn mode)
+!pip install flash-attn --no-build-isolation   # ~5–10 min
+
+# 4. Install other dependencies
 !pip install transformers huggingface_hub sentencepiece
 
-# 4. Set your HF token
+# 5. Set your HF token
 import os
 os.environ["HF_TOKEN"] = "hf_your_token_here"
 ```
