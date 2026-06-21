@@ -11,7 +11,7 @@
     "tau": 1.0,
     "top_k": 0,
     "top_p": 0.85,
-    "cfg_insertion_layer": -6,
+    "cfg_insertion_layer": -5,
     "height": 1024,
     "width": 1024,
     "seed": 42
