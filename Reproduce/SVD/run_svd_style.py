@@ -91,7 +91,6 @@ def _make_comparison(
     normal_img: Image.Image,
     style_img: Image.Image,
     styled_img: Image.Image,
-    _post_process_label: bool = False,
 ) -> Image.Image:
     """Three-panel strip: normal generation | style reference | styled output."""
     from PIL import ImageDraw
@@ -107,8 +106,7 @@ def _make_comparison(
     canvas.paste(styled_img,    (W * 2,  0))
 
     draw = ImageDraw.Draw(canvas)
-    styled_label = "Styled (post-process)" if _post_process_label else "Styled (PFB + SAC)"
-    for i, label in enumerate(["Normal (no style)", "Style Reference", styled_label]):
+    for i, label in enumerate(["Normal (no style)", "Style Reference", "Styled (PFB + SAC)"]):
         tw = len(label) * 6
         x = i * W + (W - tw) // 2
         draw.text((x, H + 10), label, fill=(210, 210, 210))
@@ -140,14 +138,11 @@ def _run_one(
     pfb_step: int = 3,
     sac_steps=None,
     compare: bool = False,
-    post_process: bool = False,
 ) -> Image.Image:
-    mode = "post-process" if post_process else (
-        "baseline" if not use_pfb and not use_sac
-        else "PFB only" if use_pfb and not use_sac
-        else "SAC only" if not use_pfb and use_sac
-        else "PFB+SAC"
-    )
+    mode = ("baseline" if not use_pfb and not use_sac
+            else "PFB only" if use_pfb and not use_sac
+            else "SAC only" if not use_pfb and use_sac
+            else "PFB+SAC")
     print(f"\n[{name}]  ({mode}){' [compare]' if compare else ''}")
     print(f"  style image : {style_image_path}")
     print(f"  prompt      : {prompt}")
@@ -173,24 +168,7 @@ def _run_one(
         sac_steps=sac_steps,
     )
 
-    if post_process:
-        # One Infinity run → normal image + codes; PFB applied to codes → styled
-        print("  [1/1] generating + applying style to codes …")
-        normal_img, styled_img = generate_styled(
-            infinity, vae, text_tokenizer, text_encoder,
-            post_process=True, **_kwargs,
-        )
-        if save_images:
-            run_dir = os.path.join(out_dir, name)
-            _save(normal_img, run_dir, "normal")
-            _save(styled_img, run_dir, "styled")
-            if compare:
-                _save(_make_comparison(normal_img, style_img, styled_img,
-                                       _post_process_label=True),
-                      run_dir, "comparison")
-        return styled_img
-
-    elif compare:
+    if compare:
         print("  [1/2] normal generation …")
         normal_img = generate_styled(
             infinity, vae, text_tokenizer, text_encoder,
@@ -208,7 +186,6 @@ def _run_one(
             _save(_make_comparison(normal_img, style_img, styled_img),
                   run_dir, "comparison")
         return styled_img
-
     else:
         img = generate_styled(
             infinity, vae, text_tokenizer, text_encoder,
@@ -257,12 +234,9 @@ def parse_args() -> argparse.Namespace:
     # ── method hyper-parameters ───────────────────────────────────────
     p.add_argument("--pfb_alpha", type=float, default=1.0,
                    help="SVD exponential reweighting factor α (paper default 1.0)")
-    p.add_argument("--post_process", action="store_true",
-                   help="Generate a normal image first, then apply SVD style transfer "
-                        "to its VAE codes (one Infinity run, faster). "
-                        "Use with --compare to also save comparison.png.")
     p.add_argument("--compare", action="store_true",
-                   help="Save normal.png, styled.png, and a side-by-side comparison strip")
+                   help="Generate normal (no style) AND styled image; save both plus "
+                        "a side-by-side comparison strip (comparison.png)")
     p.add_argument("--no_pfb", action="store_true",
                    help="Disable Principal Feature Blending (ablation)")
     p.add_argument("--no_sac", action="store_true",
@@ -381,7 +355,6 @@ def main() -> None:
                 run.get("sac_steps", _g("sac_steps", args.sac_steps))
             ),
             compare=run.get("compare", _g("compare", args.compare)),
-            post_process=run.get("post_process", _g("post_process", args.post_process)),
         )
 
     print("\nDone.")

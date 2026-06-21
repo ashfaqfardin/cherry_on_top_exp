@@ -3,7 +3,6 @@
 
   "global": {
     "compare": true,
-    "post_process": true,
     "pfb_alpha": 1.0,
     "generation_steps": 12,
     "pfb_step": 3,
