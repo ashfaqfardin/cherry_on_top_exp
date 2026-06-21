@@ -46,7 +46,7 @@
     {
       "comment": "── Oil Painting ── rich brushstrokes, heavy texture → slightly lower alpha to preserve more of the reference's dominant components",
       "name": "castle_oilpainting",
-      "style_image": "inputs/oilpainting_ref.png",
+      "style_image": "inputs/oilpainting_ref.jpg",
       "prompt": "A castle",
       "pfb_alpha": 0.8,
       "pfb_step": 3,
@@ -55,7 +55,7 @@
     },
     {
       "name": "horse_oilpainting",
-      "style_image": "inputs/oilpainting_ref.png",
+      "style_image": "inputs/oilpainting_ref.jpg",
       "prompt": "A horse",
       "pfb_alpha": 0.8,
       "pfb_step": 3,
@@ -64,7 +64,7 @@
     },
     {
       "name": "portrait_oilpainting",
-      "style_image": "inputs/oilpainting_ref.png",
+      "style_image": "inputs/oilpainting_ref.jpg",
       "prompt": "A portrait",
       "pfb_alpha": 0.8,
       "pfb_step": 3,
@@ -75,7 +75,7 @@
     {
       "comment": "── 3D Render ── shading/lighting style is subtle; inject earlier (pfb_step=2) and use low alpha to preserve more singular components",
       "name": "robot_3d",
-      "style_image": "inputs/3d_render_ref.png",
+      "style_image": "inputs/3d_render_ref.jpg",
       "prompt": "A robot",
       "pfb_alpha": 0.3,
       "pfb_step": 2,
@@ -84,7 +84,7 @@
     },
     {
       "name": "car_3d",
-      "style_image": "inputs/3d_render_ref.png",
+      "style_image": "inputs/3d_render_ref.jpg",
       "prompt": "A car",
       "pfb_alpha": 0.3,
       "pfb_step": 2,
@@ -93,7 +93,7 @@
     },
     {
       "name": "dragon_3d",
-      "style_image": "inputs/3d_render_ref.png",
+      "style_image": "inputs/3d_render_ref.jpg",
       "prompt": "A dragon",
       "pfb_alpha": 0.3,
       "pfb_step": 2,
