@@ -85,18 +85,14 @@ Or pass `--hf_token YOUR_TOKEN` directly.
 %cd /content/cherry_on_top_exp
 
 # 2. Clone Infinity
-!git clone https://github.com/FoundationVision/Infinity.git /content/Infinity
-!pip install -r /content/Infinity/requirements.txt
+!git clone https://github.com/FoundationVision/Infinity.git
 
 # 3. Install flash-attn (required by Infinity even in slow_attn mode)
 !pip install ninja packaging whl
 
 !pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
-# 4. Install other dependencies
-!pip install transformers huggingface_hub sentencepiece
-
-# 5. Set your HF token
+# 4. Set your HF token
 import os
 os.environ["HF_TOKEN"] = "hf_your_token_here"
 ```

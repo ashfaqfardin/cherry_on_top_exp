@@ -283,6 +283,14 @@ def _resolve_path(path: str, fallback_dir: str, fallback_name: str) -> str:
 def main() -> None:
     args = parse_args()
 
+    # ── Apply --infinity_repo (overrides the module-level auto-detection) ──
+    if args.infinity_repo:
+        if not _add_infinity_to_path(args.infinity_repo):
+            raise ValueError(
+                f"--infinity_repo '{args.infinity_repo}' does not appear to be the "
+                f"Infinity repo root (expected a 'tools/' subdirectory inside it)."
+            )
+
     # For 8B the model_path is a directory; for 2B it's a .pth file.
     if args.model_size == "8b":
         inf_ckpt = args.infinity_path or os.path.join(args.cache_dir, "infinity_8b_weights")
