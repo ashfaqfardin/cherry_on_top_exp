@@ -231,7 +231,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    print("[FreeFlux] Loading FLUX.1-dev...")
+    print(f"[FreeFlux] Loading {args.model_path}...")
     pipe = load_freeflux_pipeline(
         args.model_path, args.hf_token,
         device=args.device, cpu_offload=args.cpu_offload,

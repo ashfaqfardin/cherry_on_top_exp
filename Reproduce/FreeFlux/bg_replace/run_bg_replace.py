@@ -431,7 +431,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    print("[FreeFlux bg-replace] Loading FLUX.1-dev + custom transformer...")
+    print(f"[FreeFlux bg-replace] Loading {args.model_path} + custom transformer...")
     pipe = load_bg_replace_pipeline(
         args.model_path, args.hf_token,
         device=args.device, cpu_offload=args.cpu_offload,

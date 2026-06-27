@@ -447,7 +447,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    print("[FreeFlux add-object] Loading FLUX.1-dev + custom transformer...")
+    print(f"[FreeFlux add-object] Loading {args.model_path} + custom transformer...")
     pipe = load_add_object_pipeline(
         args.model_path, args.hf_token,
         device=args.device, cpu_offload=args.cpu_offload,
