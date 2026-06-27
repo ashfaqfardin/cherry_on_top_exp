@@ -22,6 +22,16 @@ Architecture note:
   - With CFG (bs=2*B=4): even indices = content, odd = generation
 """
 
+import math
+import os
+import sys
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torchvision.transforms.functional import to_tensor
+from typing import List, Optional, Tuple
+
 # ─────────────────────────── PFB helpers ────────────────────────────
 
 
