@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # FreeFlux — all three editing variants
-# Run from the repo root: bash Reproduce/FreeFlux/run.sh
+# Can be run from anywhere: bash Reproduce/FreeFlux/run.sh
+
+# Resolve repo root from the script's own location (works regardless of CWD)
+cd "$(dirname "$0")/../.." || exit 1
 
 # ── Non-rigid editing (no extra dependencies) ────────────────────────────────
 python Reproduce/FreeFlux/non_rigid/run_non_rigid.py \
