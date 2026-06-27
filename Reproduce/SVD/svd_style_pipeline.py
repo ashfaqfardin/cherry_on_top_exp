@@ -22,53 +22,6 @@ Architecture note:
   - With CFG (bs=2*B=4): even indices = content, odd = generation
 """
 
-import math
-import os
-import sys
-import numpy as np
-import torch
-import torch.nn.functional as F
-from PIL import Image
-from torchvision.transforms.functional import to_tensor
-from typing import List, Optional, Tuple
-
-
-def _patch_infinity_flash_attn() -> None:
-    """
-    Patch infinity/models/basic.py to make flash_attn optional (idempotent).
-
-    Infinity imports flash_attn unconditionally at module level even when
-    running in slow_attn mode, causing an ImportError when the package is not
-    installed.  This function finds basic.py via sys.path and wraps the import
-    in try/except so inference works without flash_attn.
-
-    The patch is idempotent: if basic.py already contains the try/except (from
-    a previous run) or flash_attn is already installed, this is a no-op.
-    """
-    for p in sys.path:
-        basic_py = os.path.join(p, "infinity", "models", "basic.py")
-        if not os.path.isfile(basic_py):
-            continue
-        with open(basic_py, encoding="utf-8") as f:
-            content = f.read()
-        needle = "from flash_attn import flash_attn_func"
-        if needle not in content:
-            return  # already patched or different structure
-        replacement = (
-            "try:\n"
-            "    from flash_attn import flash_attn_func\n"
-            "    flash_fused_op_installed = True\n"
-            "except ImportError:\n"
-            "    flash_attn_func = None\n"
-            "    flash_fused_op_installed = False"
-        )
-        patched = content.replace(needle, replacement)
-        if patched != content:
-            with open(basic_py, "w", encoding="utf-8") as f:
-                f.write(patched)
-            print(f"  [patch] Made flash_attn optional in {basic_py}")
-        return
-
 # ─────────────────────────── PFB helpers ────────────────────────────
 
 
@@ -728,7 +681,6 @@ def load_model(
     """
     import argparse
 
-    _patch_infinity_flash_attn()  # no-op if already patched or flash_attn is installed
     from tools.run_infinity import load_tokenizer, load_visual_tokenizer, load_transformer
     from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 
