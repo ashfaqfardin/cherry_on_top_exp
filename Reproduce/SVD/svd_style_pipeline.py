@@ -24,12 +24,23 @@ Architecture note:
 
 import math
 import os
+import sys
+import types
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms.functional import to_tensor
 from typing import List, Optional, Tuple
+
+# Infinity's basic.py unconditionally imports flash_attn at module level even
+# when running in slow-attention mode.  Inject a no-op stub so the import
+# succeeds without installing the package.  Our SAC-patched forward never
+# calls flash_attn_func, so the stub is never invoked.
+if "flash_attn" not in sys.modules:
+    _fa = types.ModuleType("flash_attn")
+    _fa.flash_attn_func = None
+    sys.modules["flash_attn"] = _fa
 
 # ─────────────────────────── PFB helpers ────────────────────────────
 
