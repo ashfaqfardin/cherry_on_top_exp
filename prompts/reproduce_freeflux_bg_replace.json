@@ -2,7 +2,7 @@
   "comment": "Demo runs for FreeFlux bg-replace editing (ICCV 2025, wtybest/FreeFlux). bg_replace generates the source image from scratch (no real-image input). fg_mask_mode=auto uses cross-attention + SAM2 auto-points.",
 
   "global": {
-    "model_path": "black-forest-labs/FLUX.1-dev",
+    "model_path": "black-forest-labs/FLUX.1-schnell",
     "n_steps": 50,
     "guidance_scale": 3.5,
     "height": 1024,

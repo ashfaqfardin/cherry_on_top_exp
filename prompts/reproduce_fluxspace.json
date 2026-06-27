@@ -2,7 +2,7 @@
   "comment": "Exact hyperparameters from the official FluxSpace demo notebook (gemlab-vt/FluxSpace). max_sequence_length=256 matches the demo; seed is per-run.",
 
   "global": {
-    "model_path": "black-forest-labs/FLUX.1-dev",
+    "model_path": "black-forest-labs/FLUX.1-schnell",
     "n_steps": 30,
     "guidance_scale": 3.5,
     "height": 1024,
