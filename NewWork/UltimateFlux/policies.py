@@ -226,6 +226,7 @@ class ObjectAdditionPolicy(BasePolicy):
         self.inject_steps_frac  = inject_steps_frac
         self._captured_kv: Dict[int, List] = {}
         self._token_mask: Optional[torch.Tensor] = None
+        self._txt_len_single: int = 256   # set in pre_generate from max_sequence_length
         self._phase = 1
 
     def pre_generate(
@@ -241,6 +242,8 @@ class ObjectAdditionPolicy(BasePolicy):
         **kwargs,
     ):
         """Phase 1: capture layout K,V with source-only denoising."""
+        self._txt_len_single = max_sequence_length   # image tokens start at this offset in SS blocks
+
         if self.raw_mask is not None:
             self._token_mask = _image_mask_to_token_mask(self.raw_mask, height, width, device)
 
@@ -291,6 +294,13 @@ class ObjectAdditionPolicy(BasePolicy):
         if v_p1_img.dim() == 3:
             v_p1_img = v_p1_img.unsqueeze(0)
 
+        # Image-token offset in the combined sequence:
+        #   double-stream (layer < 19): txt_len is passed non-zero from sampler
+        #   single-stream (layer >= 19): sampler passes txt_len=0 because there is
+        #     no separate encoder_hidden_states, but the hidden_states still carry
+        #     a text prefix of length _txt_len_single before the image tokens.
+        img_offset = txt_len if layer < N_DOUBLE else self._txt_len_single
+
         # B=2: index 0 = source branch, index 1 = edit branch
         k_src, k_edit = k.chunk(2)
         v_src, v_edit = v.chunk(2)
@@ -303,12 +313,12 @@ class ObjectAdditionPolicy(BasePolicy):
             outside = (1.0 - self._token_mask.squeeze()).to(k.device)  # (L_img,)
             outside4 = outside.view(1, 1, -1, 1)
             inside4  = (1.0 - outside).view(1, 1, -1, 1)
-            k_edit[:, :, txt_len:, :] = k_p1_img * outside4 + k_edit[:, :, txt_len:, :] * inside4
-            v_edit[:, :, txt_len:, :] = v_p1_img * outside4 + v_edit[:, :, txt_len:, :] * inside4
+            k_edit[:, :, img_offset:, :] = k_p1_img * outside4 + k_edit[:, :, img_offset:, :] * inside4
+            v_edit[:, :, img_offset:, :] = v_p1_img * outside4 + v_edit[:, :, img_offset:, :] * inside4
         else:
-            # No mask: inject Phase 1 K,V everywhere (full context preservation)
-            k_edit[:, :, txt_len:, :] = k_p1_img
-            v_edit[:, :, txt_len:, :] = v_p1_img
+            # No mask: inject Phase 1 K,V into image-token positions only
+            k_edit[:, :, img_offset:, :] = k_p1_img
+            v_edit[:, :, img_offset:, :] = v_p1_img
 
         k = torch.cat([k_src, k_edit])
         v = torch.cat([v_src, v_edit])
