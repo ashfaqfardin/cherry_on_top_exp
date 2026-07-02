@@ -90,66 +90,63 @@ def _step_active(step: int, n_steps: int, frac: Tuple[float, float]) -> bool:
     return int(frac[0] * n_steps) <= step < int(frac[1] * n_steps)
 
 
-# ────────────────── Phase-1 K,V capture processor ────────────────────────────
+# ─────────────────── Reasoning processor (object addition) ───────────────────
 
-class _KVCaptureProcessor:
+class _ReasoningAttnProcessor:
     """
-    Lightweight attention processor used exclusively during Phase 1 of
-    ObjectAdditionPolicy.  Runs standard FLUX attention and saves the image-token
-    slice of K and V at each specified layer for every denoising step.
+    Used during the ObjectAdditionPolicy reasoning pass.
 
-    Saved: captured_kv[layer][step] = (k_img, v_img)
-           k_img / v_img shape: (B, H, L_img, D) on CPU.
+    Runs standard FLUX attention with K,V injection at hotspot layers (same as
+    NonRigidPolicy) so the target branch stays anchored to the source layout.
+
+    At derive_step and double-stream hotspot layers, additionally computes
+    cross-attention scores from the added-word T5 tokens to image tokens —
+    giving us a heatmap of where in the image the new object will appear.
+    Only the added-word rows of the attention matrix are computed (memory-efficient).
     """
 
     def __init__(
         self,
-        capture_layers: List[int],
+        hotspot_layers: List[int],
+        subject_idx: List[int],
+        derive_step: int,
+        txt_len_single: int = 512,
         total_layers: int = N_LAYERS,
-        total_steps: int = 4,
-        txt_len_single: int = 256,
     ):
-        self.capture_layers = set(capture_layers)
-        self.total_layers   = total_layers
-        self.total_steps    = total_steps
-        self.txt_len_single = txt_len_single   # text prefix length in single-stream blocks
-        self.cur_step       = 0
-        self.cur_att_layer  = 0
-        self.captured_kv: Dict[int, List] = {l: [] for l in capture_layers}
+        self.hotspot_layers  = set(hotspot_layers)
+        self.double_hotspots = {l for l in hotspot_layers if l < N_DOUBLE}
+        self.subject_idx     = subject_idx
+        self.derive_step     = derive_step
+        self.txt_len_single  = txt_len_single
+        self.total_layers    = total_layers
+        self.cur_step        = 0
+        self.cur_layer       = 0
+        self.object_attn: Optional[torch.Tensor] = None  # (L_img,) accumulated
+        self.num_captures    = 0
 
     def _tick(self):
-        self.cur_att_layer += 1
-        if self.cur_att_layer == self.total_layers:
-            self.cur_att_layer = 0
-            self.cur_step = (self.cur_step + 1) % self.total_steps
+        self.cur_layer += 1
+        if self.cur_layer == self.total_layers:
+            self.cur_layer = 0
+            self.cur_step += 1
 
-    def __call__(
-        self,
-        attn,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
-    ):
-        layer     = self.cur_att_layer
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None):
+        layer     = self.cur_layer
         is_double = encoder_hidden_states is not None
         B         = hidden_states.shape[0]
 
         q = attn.to_q(hidden_states)
         k = attn.to_k(hidden_states)
         v = attn.to_v(hidden_states)
-
         inner_dim = k.shape[-1]
         head_dim  = inner_dim // attn.heads
 
         q = q.view(B, -1, attn.heads, head_dim).transpose(1, 2)
         k = k.view(B, -1, attn.heads, head_dim).transpose(1, 2)
         v = v.view(B, -1, attn.heads, head_dim).transpose(1, 2)
-
-        if attn.norm_q is not None:
-            q = attn.norm_q(q)
-        if attn.norm_k is not None:
-            k = attn.norm_k(k)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
 
         txt_len = 0
         if is_double:
@@ -159,10 +156,8 @@ class _KVCaptureProcessor:
             eq = eq.view(B, -1, attn.heads, head_dim).transpose(1, 2)
             ek = ek.view(B, -1, attn.heads, head_dim).transpose(1, 2)
             ev = ev.view(B, -1, attn.heads, head_dim).transpose(1, 2)
-            if attn.norm_added_q is not None:
-                eq = attn.norm_added_q(eq)
-            if attn.norm_added_k is not None:
-                ek = attn.norm_added_k(ek)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
             txt_len = eq.shape[2]
             q = torch.cat([eq, q], dim=2)
             k = torch.cat([ek, k], dim=2)
@@ -172,22 +167,37 @@ class _KVCaptureProcessor:
             q = apply_rotary_emb(q, image_rotary_emb)
             k = apply_rotary_emb(k, image_rotary_emb)
 
-        # Save only image-token slice to avoid text-length mismatch between phases.
-        # For double-stream blocks txt_len comes from encoder_hidden_states (dynamic).
-        # For single-stream blocks text+image are concatenated in hidden_states; use
-        # the static txt_len_single which must match the max_sequence_length passed
-        # to pipe() in both Phase 1 and Phase 2.
-        if layer in self.capture_layers:
-            img_start = txt_len if is_double else self.txt_len_single
-            self.captured_kv[layer].append((
-                k[:, :, img_start:, :].detach().cpu(),
-                v[:, :, img_start:, :].detach().cpu(),
-            ))
+        # K,V injection at hotspot layers — anchors target to source spatial structure
+        if layer in self.hotspot_layers and B >= 2:
+            img_offset = txt_len if is_double else self.txt_len_single
+            k_src, k_tgt = k.chunk(2)
+            v_src, v_tgt = v.chunk(2)
+            k_tgt_mod = k_tgt.clone()
+            v_tgt_mod = v_tgt.clone()
+            k_tgt_mod[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
+            v_tgt_mod[:, :, img_offset:, :] = v_src[:, :, img_offset:, :]
+            k = torch.cat([k_src, k_tgt_mod])
+            v = torch.cat([v_src, v_tgt_mod])
+
+        # Cross-attention score capture at derive_step, double-stream hotspot layers
+        if (self.cur_step == self.derive_step and layer in self.double_hotspots
+                and is_double and txt_len > 0 and B >= 2 and self.subject_idx):
+            valid = [i for i in self.subject_idx if i < txt_len]
+            if valid:
+                q_word = q[1:2, :, valid, :].float()  # (1, H, n_word, D)
+                k_img  = k[1:2, :, txt_len:, :].float()  # (1, H, L_img, D)
+                scores = torch.einsum('bhid,bhjd->bhij', q_word, k_img) * (head_dim ** -0.5)
+                probs  = scores.softmax(dim=-1)           # (1, H, n_word, L_img)
+                contrib = probs[0].mean(0).sum(0).detach().cpu()  # (L_img,)
+                if self.object_attn is None:
+                    self.object_attn = contrib
+                else:
+                    self.object_attn = self.object_attn + contrib
+                self.num_captures += 1
 
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False,
                                              attn_mask=attention_mask)
-        out = out.transpose(1, 2).reshape(B, -1, attn.heads * head_dim)
-        out = out.to(q.dtype)
+        out = out.transpose(1, 2).reshape(B, -1, attn.heads * head_dim).to(q.dtype)
 
         if is_double:
             enc_out = out[:, :encoder_hidden_states.shape[1]]
@@ -202,26 +212,125 @@ class _KVCaptureProcessor:
         return out
 
 
+def _get_t5_token_indices(pipe, text: str, word: str) -> List[int]:
+    """Return 0-based T5 token indices where word appears in text (no special tokens)."""
+    tok = getattr(pipe, 'tokenizer_2', None) or pipe.tokenizer
+    prompt_ids = tok(text, add_special_tokens=False).input_ids
+    word_ids   = tok(word, add_special_tokens=False).input_ids
+    if not word_ids:
+        return []
+    indices: List[int] = []
+    for i in range(len(prompt_ids) - len(word_ids) + 1):
+        if prompt_ids[i:i + len(word_ids)] == word_ids:
+            indices.extend(range(i, i + len(word_ids)))
+    if not indices:
+        for wt in word_ids:
+            indices += [j for j, pt in enumerate(prompt_ids) if pt == wt]
+    return sorted(set(indices))
+
+
+@torch.no_grad()
+def _derive_object_mask(
+    pipe,
+    source_prompt: str,
+    target_prompt: str,
+    added_word: str,
+    seed: int,
+    n_steps: int,
+    guidance_scale: float,
+    height: int,
+    width: int,
+    max_sequence_length: int,
+    derive_step: int,
+    device: str,
+    hotspot_layers: List[int],
+    top_k_frac: float = 0.15,
+) -> List[int]:
+    """
+    Run a short B=2 reasoning pass to find where the new object should appear.
+
+    Returns absolute token indices (>= max_sequence_length) corresponding to the
+    image-token positions where the added-word T5 tokens have highest cross-attention.
+    """
+    from diffusers.utils.torch_utils import randn_tensor
+
+    exec_device = getattr(pipe, '_execution_device', device)
+    num_ch = pipe.transformer.config.in_channels // 4
+    lat_h  = height // 8
+    lat_w  = width  // 8
+
+    g   = torch.Generator(device=exec_device).manual_seed(seed)
+    one = randn_tensor((1, num_ch, lat_h, lat_w), generator=g,
+                       device=exec_device, dtype=torch.bfloat16)
+    shared = (one.expand(2, -1, -1, -1).clone()
+              .view(2, num_ch, lat_h // 2, 2, lat_w // 2, 2)
+              .permute(0, 2, 4, 1, 3, 5)
+              .reshape(2, (lat_h // 2) * (lat_w // 2), num_ch * 4))
+
+    subject_idx = _get_t5_token_indices(pipe, target_prompt, added_word)
+    if not subject_idx:
+        print(f"[UltimateFlux] '{added_word}' not found in T5 tokens — skipping mask derivation")
+        return []
+    print(f"[UltimateFlux] T5 indices for '{added_word}': {subject_idx}")
+
+    proc = _ReasoningAttnProcessor(
+        hotspot_layers=hotspot_layers,
+        subject_idx=subject_idx,
+        derive_step=derive_step,
+        txt_len_single=max_sequence_length,
+        total_layers=N_LAYERS,
+    )
+    pipe.transformer.set_attn_processor(proc)
+
+    # Run only derive_step+1 steps — enough to capture attention at step derive_step
+    reasoning_steps = min(n_steps, derive_step + 1)
+    print(f"[UltimateFlux] Reasoning pass ({reasoning_steps} steps)…")
+    pipe(
+        prompt=[source_prompt, target_prompt],
+        latents=shared,
+        num_inference_steps=reasoning_steps,
+        guidance_scale=guidance_scale,
+        height=height,
+        width=width,
+        max_sequence_length=max_sequence_length,
+        output_type="pil",
+    )
+
+    if proc.object_attn is None or proc.num_captures == 0:
+        print("[UltimateFlux] Warning: no attention scores captured in reasoning pass")
+        return []
+
+    attn_avg = proc.object_attn / proc.num_captures  # (L_img,)
+    n_img    = attn_avg.shape[0]
+    k        = max(1, int(top_k_frac * n_img))
+    rel_idx  = attn_avg.topk(k).indices                  # relative image indices
+    abs_idx  = (rel_idx + max_sequence_length).tolist()  # absolute (>= max_sequence_length)
+    print(f"[UltimateFlux] Derived {len(abs_idx)} object-region tokens "
+          f"(top {top_k_frac*100:.0f}% of {n_img})")
+    return abs_idx
+
+
 # ─────────────────────────── Task 2: Object addition ─────────────────────────
 
 class ObjectAdditionPolicy(BasePolicy):
     """
-    Two-phase object addition using FreeFlux's layout-aware K,V capture.
+    Object addition using FreeFlux's layout-aware K,V injection.
 
-    Phase 1  (runs inside pre_generate):
-        A full source-only denoising pass with _KVCaptureProcessor.
-        K,V are captured at FreeFlux's position-dependent layers
-        `{1,2,4,26,30,54,55}` (combined indices) at every step.
-        These layers encode spatial/positional layout information.
+    Reasoning pass  (runs inside pre_generate when added_word is given):
+        Short B=2 denoising pass that captures cross-attention from the
+        added-word T5 tokens to image tokens, identifying WHERE in the scene
+        the new object should appear.  Produces derive_idx_list (absolute token
+        positions in the combined [text, image] sequence).
 
-    Phase 2  (the main generate_dual_branch call):
+    Main generation (the generate_dual_branch call):
         B=2 denoising with [source_prompt, edit_prompt].
-        Phase 1 K,V are injected into the edit branch (index 1) at the same
-        hotspot layers, OUTSIDE the placement mask so the new object can emerge
-        freely inside the mask while background context is frozen.
+        At hotspot layers, source K,V are copied to the edit branch for ALL image
+        tokens (freezing the background), then RESTORED for derive_idx_list tokens
+        so the new object can emerge there freely.
 
-    placement_mask: binary PIL Image — 1 (white) = region where the new object
-                    should appear.  If None, Phase 1 K,V are injected globally.
+    If placement_mask is provided, it overrides the automatic mask derivation.
+    If neither added_word nor placement_mask is given, source K,V are injected
+    everywhere — background is frozen but the new object can't appear.
     """
 
     # FreeFlux dev position-dependent (layout-hotspot) combined layer indices.
@@ -230,111 +339,90 @@ class ObjectAdditionPolicy(BasePolicy):
 
     def __init__(
         self,
+        added_word: Optional[str] = None,
         placement_mask: Optional[Image.Image] = None,
-        inject_steps_frac: Tuple[float, float] = (0.0, 0.75),
+        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        derive_step: int = 7,
+        top_k_frac: float = 0.15,
     ):
-        self.raw_mask           = placement_mask
-        self.inject_steps_frac  = inject_steps_frac
-        self._captured_kv: Dict[int, List] = {}
-        self._token_mask: Optional[torch.Tensor] = None
-        self._txt_len_single: int = 512   # set in pre_generate from max_sequence_length
-        self._phase = 1
+        self.added_word        = added_word
+        self.raw_mask          = placement_mask
+        self.inject_steps_frac = inject_steps_frac
+        self.derive_step       = derive_step
+        self.top_k_frac        = top_k_frac
+        self._derive_idx: Optional[torch.Tensor] = None  # (N,) long on device
+        self._token_mask: Optional[torch.Tensor] = None  # (1,1,L_img) float
+        self._txt_len_single: int = 512
 
-    def pre_generate(
-        self,
-        pipe,
-        device: str = "cuda",
-        height: int = 1024,
-        width: int = 1024,
-        num_steps: int = 28,
-        seed: int = 0,
-        source_prompt: str = "",
-        max_sequence_length: int = 512,
-        guidance_scale: float = 3.5,
-        **kwargs,
-    ):
-        """Phase 1: capture layout K,V with source-only denoising."""
-        self._txt_len_single = max_sequence_length   # image tokens start at this offset in SS blocks
+    def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
+                     num_steps=28, seed=0, source_prompt="", edit_prompt="",
+                     max_sequence_length=512, guidance_scale=3.5, **kwargs):
+        self._txt_len_single = max_sequence_length
+        target_prompt = edit_prompt or source_prompt
 
         if self.raw_mask is not None:
             self._token_mask = _image_mask_to_token_mask(self.raw_mask, height, width, device)
-
-        capture_proc = _KVCaptureProcessor(
-            capture_layers=self.HOTSPOT_LAYERS,
-            total_layers=N_LAYERS,
-            total_steps=num_steps,
-            txt_len_single=max_sequence_length,   # single-stream text prefix length
-        )
-        pipe.transformer.set_attn_processor(capture_proc)
-
-        generator = torch.Generator(device=device).manual_seed(seed)
-        print(f"[UltimateFlux] ObjectAdditionPolicy Phase 1: capturing layout K,V …")
-        _ = pipe(
-            prompt=source_prompt,
-            generator=generator,
-            num_inference_steps=num_steps,
-            guidance_scale=guidance_scale,         # must match Phase 2 for consistent K,V
-            height=height,
-            width=width,
-            max_sequence_length=max_sequence_length,   # must match Phase 2
-            output_type="pil",
-        )
-
-        self._captured_kv = capture_proc.captured_kv
-        captured_counts   = {l: len(v) for l, v in self._captured_kv.items()}
-        print(f"[UltimateFlux] Phase 1 done. Captured steps per layer: {captured_counts}")
-        self._phase = 2
+            self._derive_idx = None
+        elif self.added_word:
+            abs_idx = _derive_object_mask(
+                pipe=pipe,
+                source_prompt=source_prompt,
+                target_prompt=target_prompt,
+                added_word=self.added_word,
+                seed=seed,
+                n_steps=num_steps,
+                guidance_scale=guidance_scale,
+                height=height,
+                width=width,
+                max_sequence_length=max_sequence_length,
+                derive_step=self.derive_step,
+                device=device,
+                hotspot_layers=self.HOTSPOT_LAYERS,
+                top_k_frac=self.top_k_frac,
+            )
+            if abs_idx:
+                self._derive_idx = torch.tensor(abs_idx, dtype=torch.long)
+        else:
+            print("[UltimateFlux] ObjectAdditionPolicy: no added_word or mask — "
+                  "background frozen globally, new object may not appear. "
+                  "Pass added_word='<noun>' for automatic mask derivation.")
+            self._derive_idx = None
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        if self._phase != 2:
-            return q, k, v
         if layer not in self.HOTSPOT_LAYERS:
             return q, k, v
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
-        captured = self._captured_kv.get(layer, [])
-        if step >= len(captured):
-            return q, k, v
-
-        k_p1_img, v_p1_img = captured[step]           # (1, H, L_img, D) on CPU
-        k_p1_img = k_p1_img.to(k.device, dtype=k.dtype)
-        v_p1_img = v_p1_img.to(v.device, dtype=v.dtype)
-        # Guard against an unexpected missing batch dim
-        if k_p1_img.dim() == 3:
-            k_p1_img = k_p1_img.unsqueeze(0)
-        if v_p1_img.dim() == 3:
-            v_p1_img = v_p1_img.unsqueeze(0)
-
-        # Image-token offset in the combined sequence:
-        #   double-stream (layer < 19): txt_len is passed non-zero from sampler
-        #   single-stream (layer >= 19): sampler passes txt_len=0 because there is
-        #     no separate encoder_hidden_states, but the hidden_states still carry
-        #     a text prefix of length _txt_len_single before the image tokens.
         img_offset = txt_len if layer < N_DOUBLE else self._txt_len_single
 
-        # B=2: index 0 = source branch, index 1 = edit branch
         k_src, k_edit = k.chunk(2)
         v_src, v_edit = v.chunk(2)
-        k_edit = k_edit.clone()
-        v_edit = v_edit.clone()
+        k_new = k_edit.clone()
+        v_new = v_edit.clone()
 
         if self._token_mask is not None:
-            # Outside mask (1 - mask): inject Phase 1 K,V to freeze context
-            # Inside mask (mask):      keep edit K,V so new object can emerge
-            outside = (1.0 - self._token_mask.squeeze()).to(k.device)  # (L_img,)
+            # User-provided mask: source K,V in background (mask=0), edit K,V in object (mask=1)
+            outside  = (1.0 - self._token_mask.squeeze()).to(k.device)   # (L_img,)
             outside4 = outside.view(1, 1, -1, 1)
-            inside4  = (1.0 - outside).view(1, 1, -1, 1)
-            k_edit[:, :, img_offset:, :] = k_p1_img * outside4 + k_edit[:, :, img_offset:, :] * inside4
-            v_edit[:, :, img_offset:, :] = v_p1_img * outside4 + v_edit[:, :, img_offset:, :] * inside4
+            inside4  = (1.0 - outside4)
+            k_new[:, :, img_offset:, :] = (k_src[:, :, img_offset:, :] * outside4
+                                           + k_edit[:, :, img_offset:, :] * inside4)
+            v_new[:, :, img_offset:, :] = (v_src[:, :, img_offset:, :] * outside4
+                                           + v_edit[:, :, img_offset:, :] * inside4)
         else:
-            # No mask: inject Phase 1 K,V into image-token positions only
-            k_edit[:, :, img_offset:, :] = k_p1_img
-            v_edit[:, :, img_offset:, :] = v_p1_img
+            # Replace all image tokens with source (freeze background)
+            k_new[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
+            v_new[:, :, img_offset:, :] = v_src[:, :, img_offset:, :]
 
-        k = torch.cat([k_src, k_edit])
-        v = torch.cat([v_src, v_edit])
-        return q, k, v
+            # Restore object-region tokens so the new object can emerge freely
+            if self._derive_idx is not None:
+                idx = self._derive_idx.to(k.device)
+                idx = idx.clamp(0, k.shape[2] - 1)
+                k_new[:, :, idx, :] = k_edit[:, :, idx, :]
+                v_new[:, :, idx, :] = v_edit[:, :, idx, :]
+
+        return q, torch.cat([k_src, k_new]), torch.cat([v_src, v_new])
 
 
 # ─────────────────────────── Task 1: Non-rigid ───────────────────────────────
@@ -350,7 +438,7 @@ class NonRigidPolicy(BasePolicy):
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
-        inject_steps_frac: Tuple[float, float] = (0.0, 0.8),
+        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
         self.inject_layers = inject_layers if inject_layers is not None else TIER_A
         self.inject_steps_frac = inject_steps_frac
@@ -373,16 +461,31 @@ class NonRigidPolicy(BasePolicy):
 
 class ObjectReplacementPolicy(BasePolicy):
     """
-    TIER_A layers: inject source image-token K,V globally (freeze appearance/context).
-    All other layers: inject outside the replacement mask only (background preservation).
+    Swap one object for another while keeping the background pixel-identical.
+
+    With mask (best quality):
+        Inject source K,V at ALL 57 layers, but ONLY outside the replacement
+        mask.  Background (mask=0) is fully frozen at every layer; the object
+        region (mask=1) is completely free → new object emerges from edit prompt.
+
+    Without mask (approximate):
+        Inject source K,V at TIER_A (content-similarity) ∪ HOTSPOT_LAYERS
+        (position-dependent) globally — 20 layers total.  Covers both appearance
+        and spatial-layout features, giving better background preservation than
+        TIER_A alone.  The remaining 37 free layers let the object identity change
+        via Q from the edit branch.
 
     mask: binary PIL Image — 1 (white) = pixels where the object IS being replaced.
     """
 
+    # Union of content-similarity (TIER_A) and layout-hotspot layers — used for
+    # the no-mask case to cover both appearance and positional feature channels.
+    _PRESERVE_LAYERS = sorted(set(TIER_A) | {1, 2, 4, 26, 30, 54, 55})
+
     def __init__(
         self,
         mask: Optional[Image.Image] = None,
-        inject_steps_frac: Tuple[float, float] = (0.0, 0.9),
+        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
         self.raw_mask = mask
         self.inject_steps_frac = inject_steps_frac
@@ -401,54 +504,208 @@ class ObjectReplacementPolicy(BasePolicy):
 
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
 
-        if layer in TIER_A:
-            k, v = _kv_full_inject(k, v, img_offset)
-        elif self._token_mask is not None:
-            # Outside-mask injection: source K,V where mask=0, original where mask=1
-            outside = (1.0 - self._token_mask.squeeze(0).squeeze(0))  # (L_img,)
+        if self._token_mask is not None:
+            # Masked: freeze background at ALL layers; object region is fully free.
+            # (Previous bug: TIER_A was injected globally, freezing object appearance
+            # even inside the mask and preventing proper object replacement.)
+            outside = (1.0 - self._token_mask.squeeze(0).squeeze(0))  # (L_img,) bg=1
             k, v = _masked_kv_inject(k, v, outside, img_offset)
+        else:
+            # No mask: inject at TIER_A ∪ HOTSPOT_LAYERS (20 layers) globally.
+            # Preserves both content-similarity (appearance) and position-dependent
+            # (layout) features.  The remaining 37 layers allow the object identity
+            # to change through Q from the edit branch.
+            if layer in self._PRESERVE_LAYERS:
+                k, v = _kv_full_inject(k, v, img_offset)
 
         return q, k, v
 
 
 # ─────────────────────────── Task 4: Background replacement ──────────────────
 
+@torch.no_grad()
+def _generate_source_preview(
+    pipe,
+    source_prompt: str,
+    seed: int,
+    height: int,
+    width: int,
+    num_steps: int,
+    guidance_scale: float,
+    max_sequence_length: int,
+    device: str,
+) -> Optional[Image.Image]:
+    """
+    Generate the source image with standard attention using the same seed/latent
+    that generate_dual_branch will use for its source branch.  The result is
+    pixel-identical to what the source branch produces in the dual-branch loop,
+    so any mask derived from it transfers directly.
+    """
+    from diffusers.utils.torch_utils import randn_tensor
+    from diffusers.models.attention_processor import FluxAttnProcessor2_0
+
+    try:
+        exec_device = getattr(pipe, '_execution_device', device)
+        num_ch = pipe.transformer.config.in_channels // 4
+        lat_h, lat_w = height // 8, width // 8
+
+        g   = torch.Generator(device=exec_device).manual_seed(seed)
+        one = randn_tensor((1, num_ch, lat_h, lat_w), generator=g,
+                           device=exec_device, dtype=torch.bfloat16)
+        latent = (one.view(1, num_ch, lat_h // 2, 2, lat_w // 2, 2)
+                  .permute(0, 2, 4, 1, 3, 5)
+                  .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4))
+
+        pipe.transformer.set_attn_processor(FluxAttnProcessor2_0())
+        result = pipe(
+            prompt=source_prompt,
+            latents=latent,
+            num_inference_steps=num_steps,
+            guidance_scale=guidance_scale,
+            height=height,
+            width=width,
+            max_sequence_length=max_sequence_length,
+            output_type="pil",
+        )
+        return result.images[0]
+    except Exception as exc:
+        print(f"[UltimateFlux] Source preview generation failed: {exc}")
+        return None
+
+
+def _auto_fg_mask_sam2(
+    source_image: Image.Image,
+    device: str = "cuda",
+    sam2_model_id: str = "facebook/sam2-hiera-large",
+) -> Optional[Image.Image]:
+    """
+    Run SAM2 automatic mask generation on source_image.
+    Returns a binary PIL mask (white = foreground subject) or None.
+
+    Requires: pip install sam2
+    Model is downloaded automatically from HuggingFace on first use.
+    """
+    try:
+        import numpy as np
+        from sam2.build_sam import build_sam2_hf
+        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    except ImportError:
+        print("[UltimateFlux] SAM2 not installed. Run: pip install sam2")
+        return None
+
+    try:
+        sam2 = build_sam2_hf(sam2_model_id, device=device)
+        generator = SAM2AutomaticMaskGenerator(
+            sam2,
+            points_per_side=32,
+            pred_iou_thresh=0.88,
+            stability_score_thresh=0.95,
+        )
+
+        img_np = np.array(source_image.convert("RGB"))
+        masks  = generator.generate(img_np)
+
+        if not masks:
+            print("[UltimateFlux] SAM2 found no masks in the source image.")
+            return None
+
+        # Score each mask: prefer high stability + centred in the image
+        H, W = img_np.shape[:2]
+        cx, cy = W / 2.0, H / 2.0
+
+        def _score(m):
+            bx = m['bbox'][0] + m['bbox'][2] / 2.0
+            by = m['bbox'][1] + m['bbox'][3] / 2.0
+            dist_norm = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5 / max(W, H)
+            return m['stability_score'] - dist_norm
+
+        best = max(masks, key=_score)
+        fg   = (best['segmentation'].astype(np.uint8) * 255)
+        return Image.fromarray(fg)
+
+    except Exception as exc:
+        print(f"[UltimateFlux] SAM2 segmentation failed: {exc}")
+        import traceback; traceback.print_exc()
+        return None
+
+
 class BackgroundReplacePolicy(BasePolicy):
     """
-    Value-only injection at all 57 layers inside the foreground mask.
-    V from source flows into edit branch within the fg region → preserves subject.
-    Background tokens (mask=0) are unrestricted → freely regenerated.
+    Regenerate the background while preserving the foreground subject.
 
-    fg_mask: binary PIL Image — 1 (white) = foreground object to preserve.
+    Mask source (priority order):
+      1. fg_mask  — user-supplied PIL mask (white = foreground to keep).
+      2. SAM2     — automatic segmentation of a source preview image (same seed
+                    as the main generation so the mask aligns exactly).
+                    Enabled when use_sam2=True (default) and SAM2 is installed.
+      3. Fallback — TIER_A K,V injection globally; subject is approximately
+                    preserved without a precise boundary.
+
+    Masked path (options 1 & 2, FreeFlux approach):
+        Value-only injection inside the fg region at all 57 layers.
+        Subject V values from source are blended in; background V is free.
+
+    sam2_model_id: HuggingFace model ID for SAM2 (default: sam2-hiera-large).
     """
 
-    def __init__(self, fg_mask: Optional[Image.Image] = None):
-        self.raw_mask = fg_mask
+    def __init__(
+        self,
+        fg_mask: Optional[Image.Image] = None,
+        use_sam2: bool = True,
+        sam2_model_id: str = "facebook/sam2-hiera-large",
+    ):
+        self.raw_mask      = fg_mask
+        self.use_sam2      = use_sam2
+        self.sam2_model_id = sam2_model_id
         self._token_mask: Optional[torch.Tensor] = None
-        self._txt_len_single = 512  # updated in pre_generate
+        self._txt_len_single = 512
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
-                     max_sequence_length=512, **kwargs):
-        if self.raw_mask is not None:
-            self._token_mask = _image_mask_to_token_mask(self.raw_mask, height, width, device)
+                     num_steps=28, seed=0, source_prompt="",
+                     guidance_scale=3.5, max_sequence_length=512, **kwargs):
         self._txt_len_single = max_sequence_length
 
-    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        if self._token_mask is None:
-            return q, k, v
+        if self.raw_mask is not None:
+            # User-supplied mask — highest priority
+            self._token_mask = _image_mask_to_token_mask(
+                self.raw_mask, height, width, device)
+            return
 
-        # txt_len > 0 for double-stream; use _txt_len_single for single-stream
+        if self.use_sam2:
+            print("[UltimateFlux] BackgroundReplacePolicy: generating source preview for SAM2…")
+            src_img = _generate_source_preview(
+                pipe, source_prompt, seed, height, width,
+                num_steps, guidance_scale, max_sequence_length, device,
+            )
+            if src_img is not None:
+                print("[UltimateFlux] Running SAM2 automatic segmentation…")
+                fg_mask = _auto_fg_mask_sam2(
+                    src_img, device=device, sam2_model_id=self.sam2_model_id)
+                if fg_mask is not None:
+                    self._token_mask = _image_mask_to_token_mask(
+                        fg_mask, height, width, device)
+                    print("[UltimateFlux] SAM2 foreground mask ready.")
+                    return
+            print("[UltimateFlux] SAM2 unavailable — falling back to TIER_A global injection.")
+
+    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
 
-        v_src, v_edit = v.chunk(2)
-        v_edit = v_edit.clone()
+        if self._token_mask is not None:
+            # Masked (FreeFlux approach): value-only injection inside foreground.
+            v_src, v_edit = v.chunk(2)
+            v_edit = v_edit.clone()
+            fg  = self._token_mask.squeeze(0).squeeze(0).to(v.device)  # (L_img,)
+            fg4 = fg.view(1, 1, -1, 1)
+            v_edit[:, :, img_offset:, :] = (
+                v_src[:, :, img_offset:, :] * fg4 + v_edit[:, :, img_offset:, :] * (1 - fg4)
+            )
+            v = torch.cat([v_src, v_edit])
+        else:
+            # Fallback (no mask): K,V injection at TIER_A globally.
+            if layer in TIER_A:
+                k, v = _kv_full_inject(k, v, img_offset)
 
-        fg = self._token_mask.squeeze(0).squeeze(0).to(v.device)  # (L_img,)
-        fg4 = fg.view(1, 1, -1, 1)
-        v_edit[:, :, img_offset:, :] = (
-            v_src[:, :, img_offset:, :] * fg4 + v_edit[:, :, img_offset:, :] * (1 - fg4)
-        )
-        v = torch.cat([v_src, v_edit])
         return q, k, v
 
 
@@ -456,60 +713,42 @@ class BackgroundReplacePolicy(BasePolicy):
 
 class FineGrainedAttrPolicy(BasePolicy):
     """
-    Orthogonal-projection edit on image-token keys at TIER_A layers.
+    Identity-preserving attribute editing.
 
-    Adapts FluxSpace §4: the edit vector (k_edit − k_src) for image tokens is
-    projected away from the content direction k_src (Gram-Schmidt), isolating
-    the attribute direction while leaving identity intact. Text tokens are always
-    left untouched so each branch preserves its own prompt conditioning.
-    Norm is preserved to avoid contrast collapse.
+    Injects K,V from source at _PRESERVE_LAYERS (TIER_A ∪ HOTSPOT_LAYERS, 20
+    layers) to lock the subject's appearance and spatial layout.  The attribute
+    change (glasses, hair colour, …) emerges in the remaining 37 free layers,
+    driven purely by the edit-prompt text conditioning.
 
-    For shape-linked edits (e.g. breed change) pass inject_layers=TIER_B.
+    inject_layers override:
+      - None (default) → _PRESERVE_LAYERS: tightest lock, for subtle adds
+        (glasses, colour shift, accessory)
+      - TIER_A: looser lock, for edits that also affect shape (breed change)
     """
+    _PRESERVE_LAYERS = sorted(set(TIER_A) | {1, 2, 4, 26, 30, 54, 55})  # 20 layers
 
     def __init__(
         self,
-        edit_scale: float = 5.0,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
-        self.edit_scale = edit_scale
-        self.inject_layers = inject_layers if inject_layers is not None else TIER_A
+        self._inject_layers = (
+            inject_layers if inject_layers is not None else self._PRESERVE_LAYERS
+        )
         self.inject_steps_frac = inject_steps_frac
-        self._txt_len_single = 512  # updated in pre_generate
+        self._txt_len_single = 512
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
         self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        if layer not in self.inject_layers:
+        if layer not in self._inject_layers:
             return q, k, v
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-
-        k_src, k_edit = k.chunk(2)
-
-        # Work on image tokens only (positions img_offset:)
-        k_src_img  = k_src[:, :, img_offset:, :]
-        k_edit_img = k_edit[:, :, img_offset:, :]
-
-        # Gram-Schmidt: project edit direction away from content direction
-        edit_dir  = k_edit_img - k_src_img
-        dot       = (edit_dir * k_src_img).sum(dim=-1, keepdim=True)
-        norm_sq   = (k_src_img * k_src_img).sum(dim=-1, keepdim=True) + 1e-8
-        orth_dir  = edit_dir - (dot / norm_sq) * k_src_img
-
-        # Norm-preserving application
-        orig_norm = torch.norm(k_edit_img, dim=-1, keepdim=True) + 1e-8
-        k_new_img = k_src_img + self.edit_scale * orth_dir
-        k_new_img = k_new_img / (torch.norm(k_new_img, dim=-1, keepdim=True) + 1e-8) * orig_norm
-
-        # Rebuild: text tokens unchanged, image tokens replaced
-        k_new = k_edit.clone()
-        k_new[:, :, img_offset:, :] = k_new_img
-        k = torch.cat([k_src, k_new])
+        k, v = _kv_full_inject(k, v, img_offset)
         return q, k, v
 
 
@@ -663,7 +902,10 @@ class StylePersonalizationPolicy(BasePolicy):
         style_image: Optional[Image.Image] = None,
         alpha: float = 1.0,
         sac_steps_frac: Tuple[float, float] = (0.0, 1.0),
-        pfb_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        # PFB applied only in the first quarter of denoising — analogous to
+        # step 3/12 in SVD-Style (Infinity). Applying at all steps over-injects
+        # style features and creates noise in the output.
+        pfb_steps_frac: Tuple[float, float] = (0.0, 0.25),
     ):
         self.style_image = style_image
         self.alpha = alpha
@@ -671,9 +913,11 @@ class StylePersonalizationPolicy(BasePolicy):
         self.pfb_steps_frac = pfb_steps_frac
         self._h_sty: Optional[torch.Tensor] = None
         self._step_counter = [0]     # mutable ref shared with closure
+        self._n_steps = 28           # updated in pre_generate
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
                      num_steps=28, seed=0, style_image=None, **kwargs):
+        self._n_steps = num_steps
         img = style_image if style_image is not None else self.style_image
         if img is not None:
             print("[UltimateFlux] Extracting style features from reference image…")
@@ -710,29 +954,33 @@ class StylePersonalizationPolicy(BasePolicy):
 
     def get_block_hooks(self) -> Dict[int, Callable]:
         """PFB: blend style features into block 1 hidden states."""
-        h_sty         = self._h_sty
-        alpha         = self.alpha
-        pfb_frac      = self.pfb_steps_frac
-        step_counter  = self._step_counter
+        h_sty        = self._h_sty
+        alpha        = self.alpha
+        pfb_frac     = self.pfb_steps_frac
+        step_counter = self._step_counter
+        n_steps      = self._n_steps
 
         def _pfb_hook(module, inp, out):
+            # Gate: only apply PFB within the configured step window.
+            # step_counter tracks how many times this hook has fired = current step.
+            cur_step = step_counter[0]
+            step_counter[0] += 1
+
+            if h_sty is None:
+                return out
+
             # FluxTransformerBlock returns (encoder_hidden_states, hidden_states).
-            # out[0] = text hidden states (leave untouched).
-            # out[1] = image hidden states — apply PFB here.
             is_tuple = isinstance(out, tuple)
             has_two  = is_tuple and len(out) >= 2
-
             h = out[1] if has_two else (out[0] if is_tuple else out)
 
-            if h_sty is None or h.shape[0] < 2:
+            if h.shape[0] < 2 or not _step_active(cur_step, n_steps, pfb_frac):
                 return out
 
             h_edit  = h[1:2]                                 # (1, L_img, C)
             h_style = h_sty.to(h.device, dtype=h.dtype)
             h_new   = _apply_pfb(h_edit, h_style, alpha)
             h_out   = torch.cat([h[0:1], h_new], dim=0)
-
-            step_counter[0] += 1
 
             if has_two:
                 return (out[0], h_out)   # keep text unchanged, replace image hidden states

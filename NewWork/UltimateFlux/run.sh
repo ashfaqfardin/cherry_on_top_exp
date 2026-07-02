@@ -56,6 +56,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name table_add_vase \
     --source_prompt "a wooden dining table in a bright room" \
     --edit_prompt   "a wooden dining table with a vase of flowers in a bright room" \
+    --added_word    "vase" \
     --seed 50
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -66,6 +67,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name park_add_dog \
     --source_prompt "a park bench surrounded by trees" \
     --edit_prompt   "a park bench with a dog sitting next to it surrounded by trees" \
+    --added_word    "dog" \
     --seed 55
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +108,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name cat_forest_to_beach \
     --source_prompt "a cat sitting in a forest" \
     --edit_prompt   "a cat sitting on a sunny beach" \
+    --use_sam2 \
     --seed 20
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -116,6 +119,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name dog_park_to_city \
     --source_prompt "a dog standing in a park" \
     --edit_prompt   "a dog standing on a city street" \
+    --use_sam2 \
     --seed 25
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,7 +135,6 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name man_add_glasses \
     --source_prompt "a portrait photo of a man" \
     --edit_prompt   "a portrait photo of a man wearing eyeglasses" \
-    --edit_scale 5.0 \
     --seed 30
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -142,7 +145,6 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name car_color_change \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
-    --edit_scale 4.5 \
     --seed 40
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -217,7 +217,7 @@ def generate_dual_branch(
     Returns (source_image, edit_image).  source_image is the unmodified
     reconstruction; edit_image is the policy-steered output.
     """
-    # 1. Policy pre-hook (style extraction, Phase 1 capture, inversion, etc.)
+    # 1. Policy pre-hook (style extraction, reasoning pass, inversion, etc.)
     policy.pre_generate(
         pipe,
         device=device,
@@ -226,6 +226,7 @@ def generate_dual_branch(
         num_steps=num_steps,
         seed=seed,
         source_prompt=source_prompt,
+        edit_prompt=edit_prompt,
         max_sequence_length=max_sequence_length,
         guidance_scale=guidance_scale,
     )

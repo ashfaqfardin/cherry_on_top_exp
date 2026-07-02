@@ -77,8 +77,11 @@ def build_policy(cfg: dict):
         if cfg.get("placement_mask"):
             mask = Image.open(cfg["placement_mask"]).convert("L")
         return ObjectAdditionPolicy(
+            added_word=cfg.get("added_word", None),
             placement_mask=mask,
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 0.75])),
+            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+            derive_step=cfg.get("derive_step", 7),
+            top_k_frac=cfg.get("top_k_frac", 0.15),
         )
 
     if task == "object_replace":
@@ -94,14 +97,19 @@ def build_policy(cfg: dict):
         fg_mask = None
         if cfg.get("fg_mask_image"):
             fg_mask = Image.open(cfg["fg_mask_image"]).convert("L")
-        return BackgroundReplacePolicy(fg_mask=fg_mask)
+        return BackgroundReplacePolicy(
+            fg_mask=fg_mask,
+            use_sam2=cfg.get("use_sam2", True),
+            sam2_model_id=cfg.get("sam2_model_id", "facebook/sam2-hiera-large"),
+        )
 
     if task == "attr_edit":
         inject_layers = cfg.get("inject_layers", None)
-        if inject_layers == "tier_b":
-            inject_layers = TIER_B
+        if inject_layers == "tier_a":
+            inject_layers = TIER_A          # looser lock: shape-linked edits
+        elif inject_layers is not None:
+            inject_layers = None            # unrecognised → default _PRESERVE_LAYERS
         return FineGrainedAttrPolicy(
-            edit_scale=cfg.get("edit_scale", 5.0),
             inject_layers=inject_layers,
             inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
         )
@@ -166,12 +174,22 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         print(f"  Saved → {src_path}")
         print(f"  Saved → {edit_path}")
 
-        # Side-by-side comparison
-        w = src_img.width + edit_img.width
-        h = max(src_img.height, edit_img.height)
-        comp = Image.new("RGB", (w, h))
-        comp.paste(src_img, (0, 0))
-        comp.paste(edit_img, (src_img.width, 0))
+        # Side-by-side comparison.
+        # For style task: [style_ref | source | styled] so the reference is visible.
+        panels = [src_img, edit_img]
+        style_ref_path = cfg.get("style_image")
+        if cfg.get("task") == "style" and style_ref_path:
+            ref = Image.open(style_ref_path).convert("RGB").resize(
+                (src_img.width, src_img.height), Image.LANCZOS)
+            panels = [ref, src_img, edit_img]
+
+        comp_w = sum(p.width for p in panels)
+        comp_h = max(p.height for p in panels)
+        comp   = Image.new("RGB", (comp_w, comp_h))
+        x = 0
+        for panel in panels:
+            comp.paste(panel, (x, 0))
+            x += panel.width
         comp_path = os.path.join(run_dir, "compare.png")
         comp.save(comp_path)
         print(f"  Saved → {comp_path}")
@@ -204,11 +222,17 @@ def parse_args():
     p.add_argument("--edit_prompt",   default="")
     p.add_argument("--prompt",        default=None, help="Sets both source and edit prompt")
     p.add_argument("--style_image",   default=None)
+    p.add_argument("--added_word",    default=None, help="Word for new object (object_add), e.g. 'vase'")
     p.add_argument("--placement_mask",default=None, help="Placement region mask (object_add)")
     p.add_argument("--mask_image",    default=None, help="Object region mask (object_replace)")
     p.add_argument("--fg_mask_image", default=None, help="Foreground mask (bg_replace)")
+    p.add_argument("--use_sam2",      action="store_true", default=True,
+                   help="Auto-segment foreground with SAM2 when no fg_mask_image given (bg_replace)")
+    p.add_argument("--no_sam2",       dest="use_sam2", action="store_false",
+                   help="Disable SAM2; fall back to TIER_A global injection (bg_replace)")
+    p.add_argument("--sam2_model_id", default="facebook/sam2-hiera-large",
+                   help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
-    p.add_argument("--edit_scale",    type=float, default=5.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
     p.add_argument("--guidance_scale",type=float, default=3.5)
@@ -258,11 +282,13 @@ def main():
         "source_prompt": source_prompt,
         "edit_prompt":   edit_prompt,
         "style_image":    args.style_image,
+        "added_word":     args.added_word,
         "placement_mask": args.placement_mask,
         "mask_image":     args.mask_image,
-        "fg_mask_image": args.fg_mask_image,
+        "fg_mask_image":  args.fg_mask_image,
+        "use_sam2":       args.use_sam2,
+        "sam2_model_id":  args.sam2_model_id,
         "pfb_alpha":     args.pfb_alpha,
-        "edit_scale":    args.edit_scale,
         "seed":          args.seed,
         "num_steps":     args.num_steps,
         "guidance_scale":args.guidance_scale,

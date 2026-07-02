@@ -19,21 +19,21 @@
       "task": "non_rigid",
       "source_prompt": "a bird perched on a branch",
       "edit_prompt":   "a bird flying away from the branch",
-      "inject_steps_frac": [0.0, 0.8]
+      "inject_steps_frac": [0.0, 1.0]
     },
     {
       "name": "cat_sit_to_lie",
       "task": "non_rigid",
       "source_prompt": "a cat sitting on a wooden floor",
       "edit_prompt":   "a cat lying down on a wooden floor",
-      "inject_steps_frac": [0.0, 0.8]
+      "inject_steps_frac": [0.0, 1.0]
     },
     {
       "name": "dog_standing_to_jumping",
       "task": "non_rigid",
       "source_prompt": "a golden retriever standing in a park",
       "edit_prompt":   "a golden retriever jumping in a park",
-      "inject_steps_frac": [0.0, 0.75],
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 7
     },
 
@@ -43,7 +43,9 @@
       "task": "object_add",
       "source_prompt": "a wooden dining table in a bright room",
       "edit_prompt":   "a wooden dining table with a vase of flowers in a bright room",
-      "inject_steps_frac": [0.0, 0.75],
+      "added_word": "vase",
+      "inject_steps_frac": [0.0, 1.0],
+      "derive_step": 7,
       "seed": 50
     },
     {
@@ -51,7 +53,9 @@
       "task": "object_add",
       "source_prompt": "a park bench surrounded by trees",
       "edit_prompt":   "a park bench with a dog sitting next to it surrounded by trees",
-      "inject_steps_frac": [0.0, 0.75],
+      "added_word": "dog",
+      "inject_steps_frac": [0.0, 1.0],
+      "derive_step": 7,
       "seed": 55
     },
 
@@ -61,7 +65,7 @@
       "task": "object_replace",
       "source_prompt": "a red apple on a wooden table",
       "edit_prompt":   "an orange on a wooden table",
-      "inject_steps_frac": [0.0, 0.9],
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 10
     },
     {
@@ -69,7 +73,7 @@
       "task": "object_replace",
       "source_prompt": "a wooden chair in a bright room",
       "edit_prompt":   "a metal chair in a bright room",
-      "inject_steps_frac": [0.0, 0.9],
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 15
     },
 
@@ -95,7 +99,6 @@
       "task": "attr_edit",
       "source_prompt": "a portrait photo of a man",
       "edit_prompt":   "a portrait photo of a man wearing eyeglasses",
-      "edit_scale": 5.0,
       "inject_steps_frac": [0.0, 1.0],
       "seed": 30
     },
@@ -104,8 +107,7 @@
       "task": "attr_edit",
       "source_prompt": "a woman with brown hair",
       "edit_prompt":   "a woman with blonde hair",
-      "edit_scale": 4.0,
-      "inject_steps_frac": [0.0, 0.8],
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 35
     },
     {
@@ -113,8 +115,7 @@
       "task": "attr_edit",
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
-      "edit_scale": 4.5,
-      "inject_steps_frac": [0.0, 0.9],
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 40
     },
     {
@@ -122,9 +123,8 @@
       "task": "attr_edit",
       "source_prompt": "a labrador sitting on grass",
       "edit_prompt":   "a husky sitting on grass",
-      "edit_scale": 6.0,
-      "inject_layers": "tier_b",
-      "inject_steps_frac": [0.0, 0.9],
+      "inject_layers": "tier_a",
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 45
     },
 
