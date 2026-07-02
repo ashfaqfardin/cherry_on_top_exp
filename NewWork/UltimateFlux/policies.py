@@ -96,10 +96,12 @@ class _KVCaptureProcessor:
         capture_layers: List[int],
         total_layers: int = N_LAYERS,
         total_steps: int = 4,
+        txt_len_single: int = 256,
     ):
         self.capture_layers = set(capture_layers)
         self.total_layers   = total_layers
         self.total_steps    = total_steps
+        self.txt_len_single = txt_len_single   # text prefix length in single-stream blocks
         self.cur_step       = 0
         self.cur_att_layer  = 0
         self.captured_kv: Dict[int, List] = {l: [] for l in capture_layers}
@@ -159,11 +161,16 @@ class _KVCaptureProcessor:
             q = apply_rotary_emb(q, image_rotary_emb)
             k = apply_rotary_emb(k, image_rotary_emb)
 
-        # Save image-token slice only (avoids txt_len mismatch between phases)
+        # Save only image-token slice to avoid text-length mismatch between phases.
+        # For double-stream blocks txt_len comes from encoder_hidden_states (dynamic).
+        # For single-stream blocks text+image are concatenated in hidden_states; use
+        # the static txt_len_single which must match the max_sequence_length passed
+        # to pipe() in both Phase 1 and Phase 2.
         if layer in self.capture_layers:
+            img_start = txt_len if is_double else self.txt_len_single
             self.captured_kv[layer].append((
-                k[:, :, txt_len:, :].detach().cpu(),
-                v[:, :, txt_len:, :].detach().cpu(),
+                k[:, :, img_start:, :].detach().cpu(),
+                v[:, :, img_start:, :].detach().cpu(),
             ))
 
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False,
@@ -230,6 +237,7 @@ class ObjectAdditionPolicy(BasePolicy):
         num_steps: int = 4,
         seed: int = 0,
         source_prompt: str = "",
+        max_sequence_length: int = 256,
         **kwargs,
     ):
         """Phase 1: capture layout K,V with source-only denoising."""
@@ -240,6 +248,7 @@ class ObjectAdditionPolicy(BasePolicy):
             capture_layers=self.HOTSPOT_LAYERS,
             total_layers=N_LAYERS,
             total_steps=num_steps,
+            txt_len_single=max_sequence_length,   # single-stream text prefix length
         )
         pipe.transformer.set_attn_processor(capture_proc)
 
@@ -252,6 +261,7 @@ class ObjectAdditionPolicy(BasePolicy):
             guidance_scale=0.0,
             height=height,
             width=width,
+            max_sequence_length=max_sequence_length,   # must match Phase 2
             output_type="pil",
         )
 
@@ -275,6 +285,11 @@ class ObjectAdditionPolicy(BasePolicy):
         k_p1_img, v_p1_img = captured[step]           # (1, H, L_img, D) on CPU
         k_p1_img = k_p1_img.to(k.device, dtype=k.dtype)
         v_p1_img = v_p1_img.to(v.device, dtype=v.dtype)
+        # Guard against an unexpected missing batch dim
+        if k_p1_img.dim() == 3:
+            k_p1_img = k_p1_img.unsqueeze(0)
+        if v_p1_img.dim() == 3:
+            v_p1_img = v_p1_img.unsqueeze(0)
 
         # B=2: index 0 = source branch, index 1 = edit branch
         k_src, k_edit = k.chunk(2)

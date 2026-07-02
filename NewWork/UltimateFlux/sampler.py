@@ -227,6 +227,7 @@ def generate_dual_branch(
         num_steps=num_steps,
         seed=seed,
         source_prompt=source_prompt,
+        max_sequence_length=max_sequence_length,
     )
 
     # 2. Install custom attention processor
