@@ -333,9 +333,13 @@ class ObjectAdditionPolicy(BasePolicy):
     everywhere — background is frozen but the new object can't appear.
     """
 
-    # FreeFlux dev position-dependent (layout-hotspot) combined layer indices.
-    # Source: run_add_object.py _PROCESSOR_ARGS["layer_idx"]
-    HOTSPOT_LAYERS = [1, 2, 4, 26, 30, 54, 55]
+    # Only the double-stream hotspot layers [1, 2, 4] are used for injection.
+    # Using all 7 hotspot layers (including single-stream [26, 30, 54, 55]) anchors
+    # the layout too rigidly: freed derive_idx tokens that overlap with existing
+    # object boundaries generate a duplicate of the existing object instead of the
+    # new one.  Double-stream-only gives enough coarse spatial anchoring while
+    # leaving enough compositional freedom for the new object to appear cleanly.
+    HOTSPOT_LAYERS = [1, 2, 4]
 
     def __init__(
         self,
@@ -343,7 +347,7 @@ class ObjectAdditionPolicy(BasePolicy):
         placement_mask: Optional[Image.Image] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
         derive_step: int = 7,
-        top_k_frac: float = 0.15,
+        top_k_frac: float = 0.08,
     ):
         self.added_word        = added_word
         self.raw_mask          = placement_mask
@@ -511,11 +515,13 @@ class ObjectReplacementPolicy(BasePolicy):
             outside = (1.0 - self._token_mask.squeeze(0).squeeze(0))  # (L_img,) bg=1
             k, v = _masked_kv_inject(k, v, outside, img_offset)
         else:
-            # No mask: inject at TIER_A ∪ HOTSPOT_LAYERS (20 layers) globally.
-            # Preserves both content-similarity (appearance) and position-dependent
-            # (layout) features.  The remaining 37 layers allow the object identity
-            # to change through Q from the edit branch.
-            if layer in self._PRESERVE_LAYERS:
+            # No mask: inject only at HOTSPOT_LAYERS (position-dependent, 7 layers).
+            # Preserves spatial layout / composition so the background doesn't drift.
+            # TIER_A (appearance layers) is intentionally LEFT FREE so the object's
+            # texture and colour can change (apple→orange, wood→metal).
+            # Injecting TIER_A here would freeze the object's appearance and prevent
+            # the replacement from taking effect.
+            if layer in {1, 2, 4, 26, 30, 54, 55}:
                 k, v = _kv_full_inject(k, v, img_offset)
 
         return q, k, v

@@ -104,9 +104,12 @@ def build_policy(cfg: dict):
         )
 
     if task == "attr_edit":
+        _HOTSPOT = [1, 2, 4, 26, 30, 54, 55]
         inject_layers = cfg.get("inject_layers", None)
-        if inject_layers == "tier_a":
-            inject_layers = TIER_A          # looser lock: shape-linked edits
+        if inject_layers == "hotspot":
+            inject_layers = _HOTSPOT        # colour/texture change: structure only
+        elif inject_layers == "tier_a":
+            inject_layers = TIER_A          # breed/shape change: appearance lock
         elif inject_layers is not None:
             inject_layers = None            # unrecognised → default _PRESERVE_LAYERS
         return FineGrainedAttrPolicy(
@@ -232,6 +235,9 @@ def parse_args():
                    help="Disable SAM2; fall back to TIER_A global injection (bg_replace)")
     p.add_argument("--sam2_model_id", default="facebook/sam2-hiera-large",
                    help="HuggingFace SAM2 model ID (bg_replace)")
+    p.add_argument("--inject_layers", default=None,
+                   choices=["hotspot", "tier_a"],
+                   help="Layer set for attr_edit: hotspot=colour/texture change, tier_a=shape/breed change")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
@@ -288,6 +294,7 @@ def main():
         "fg_mask_image":  args.fg_mask_image,
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
+        "inject_layers":  args.inject_layers,
         "pfb_alpha":     args.pfb_alpha,
         "seed":          args.seed,
         "num_steps":     args.num_steps,
