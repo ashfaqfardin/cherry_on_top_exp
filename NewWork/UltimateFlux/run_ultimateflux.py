@@ -155,33 +155,18 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  edit_prompt:   {edit_prompt}")
 
     if policy is None:
-        # Colour / texture change: Prompt-to-Prompt two-pass approach.
-        # Pass 1 → image_a (source_prompt + seed), recording K,V at all double-stream layers.
-        # Pass 2 → edit image (edit_prompt + same z_T), injecting stored K,V.
-        # Single-stream blocks (19-56) are free → edit text drives colour there.
-        # Colour mode: two-phase P2P.
-        #
-        # Phase 1 (first anchor_end_frac × steps, default 25% = 7/28 steps):
-        #   K+V at 9 critical DS layers → aligns edit branch to source.
-        #   By step 7, Q_edit ≈ Q_src (branches converged on same structure).
-        #
-        # Phase 2 (remaining 75% = 21/28 steps):
-        #   K-only at same 9 layers → K anchors WHERE-to-attend (identity stays).
-        #   V from edit branch → carries new colour ("blue car", "blonde hair").
-        #   Phase 1 alignment makes Q_edit @ K_src^T valid — not broken.
-        #
-        # Tune via anchor_end_frac in JSON:
-        #   0.15 → 4 steps align, 24 steps K-only  (more colour, slight identity risk)
-        #   0.25 → 7 steps align, 21 steps K-only  (balanced, default)
-        #   0.50 → 14 steps align, 14 steps K-only (stronger identity, less colour)
-        _DS_TIER_A   = [l for l in TIER_A if l < N_DOUBLE]  # [0,7,8,9,10,18]
-        _DS_HOTSPOT  = [1, 2, 4]
-        _color_layers = sorted(set(_DS_TIER_A) | set(_DS_HOTSPOT))  # 9 layers
+        # Colour editing: generate source, then img2img with edit prompt.
+        # No attention injection — the img2img starting latent carries source
+        # structure; the edit prompt drives colour change cleanly.
+        # Tune img2img_strength in JSON:
+        #   0.4 → subtle shift, very strong identity
+        #   0.6 → balanced colour change + identity  (default)
+        #   0.8 → strong colour change, some identity drift
         src_img, edit_img = generate_p2p(
             pipe=pipe,
             source_prompt=source_prompt,
             edit_prompt=edit_prompt,
-            inject_layers=_color_layers,
+            inject_layers=[],
             seed=seed,
             num_steps=num_steps,
             guidance_scale=guidance,
@@ -189,8 +174,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
-            anchor_end_frac=cfg.get("anchor_end_frac", 0.25),
-            freq_sigma=cfg.get("freq_sigma", 0.08),
+            img2img_strength=cfg.get("img2img_strength", 0.6),
         )
     else:
         src_img, edit_img = generate_dual_branch(

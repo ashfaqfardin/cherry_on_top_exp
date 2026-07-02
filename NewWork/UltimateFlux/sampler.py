@@ -14,7 +14,6 @@ Layer index convention (combined 0-based across all 57 blocks):
 
 import os
 import sys
-import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import FluxPipeline
@@ -297,164 +296,14 @@ def generate_dual_branch(
     return src_img, edit_img
 
 
-# ──────────────────── Prompt-to-Prompt two-pass editing ───────────────────────
-
-class _KVRecordPolicy(BasePolicy):
-    """Pass-1 helper: records image-token K,V at target layers, no injection."""
-
-    def __init__(self, record_layers: List[int], max_seq_len: int = 512):
-        self._layers = set(record_layers)
-        self._max_seq_len = max_seq_len
-        self.stored: Dict[tuple, tuple] = {}  # (step, layer) → (k, v, offset)
-
-    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        if layer in self._layers:
-            offset = txt_len if txt_len > 0 else self._max_seq_len
-            self.stored[(step, layer)] = (
-                k[:, :, offset:, :].detach().clone(),
-                v[:, :, offset:, :].detach().clone(),
-                offset,
-            )
-        return q, k, v
-
-
-class _KVInjectPolicy(BasePolicy):
-    """
-    Pass-2 two-phase injection for colour editing.
-
-    Phase 1  (step < anchor_end = anchor_end_frac × n_steps):
-        K+V injection at target layers.
-        Forces edit branch attention to match source → aligns hidden states so that
-        Q_edit ≈ Q_src by the end of phase 1.  Establishes identity / composition.
-
-    Phase 2  (step >= anchor_end):
-        K-only injection at target layers.
-        K from source keeps WHERE-to-attend anchored → identity / spatial structure.
-        V stays from the edit branch → carries new colour ("blue car", "blonde hair").
-        Because phase 1 aligned Q_edit ≈ Q_src, Q_edit @ K_src^T is a valid
-        attention pattern — not broken like raw K-only from step 0.
-
-    anchor_end_frac=1.0 → K+V for all steps (full identity lock, colour won't change).
-    anchor_end_frac=0.0 → K-only for all steps (structure but identity may drift).
-    anchor_end_frac=0.25 → 7/28 steps K+V to align, 21/28 steps K-only for colour.
-    """
-
-    def __init__(
-        self,
-        stored: Dict[tuple, tuple],
-        max_seq_len: int = 512,
-        anchor_end_frac: float = 0.25,
-    ):
-        self._stored = stored
-        self._max_seq_len = max_seq_len
-        self._anchor = anchor_end_frac
-
-    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        entry = self._stored.get((step, layer))
-        if entry is None:
-            return q, k, v
-        stored_k, stored_v, _ = entry
-        offset = txt_len if txt_len > 0 else self._max_seq_len
-        k = k.clone()
-        k[:, :, offset:, :] = stored_k                    # always: K → structure
-        if step < int(self._anchor * n_steps):
-            v = v.clone()
-            v[:, :, offset:, :] = stored_v                # phase 1: V → align
-        # phase 2: V from edit → new colour
-        return q, k, v
-
-
-def _color_transfer_latent(
-    src_latent: torch.Tensor,
-    edit_latent: torch.Tensor,
-    lat_h: int,
-    lat_w: int,
-    sigma_frac: float = 0.15,
-) -> torch.Tensor:
-    """
-    Local color transfer in FLUX latent space.
-
-    Removes the old color from the source and blends the new color with the
-    source's structural residual.  Per channel:
-
-        local_mean_src  = Gaussian-smoothed source latent  (source "color field")
-        local_mean_edit = Gaussian-smoothed edit latent    (edit "color field")
-        src_structure   = src  - local_mean_src            (color-removed structural residual)
-        edit_structure  = edit - local_mean_edit
-
-        result = local_mean_edit
-               + src_structure × clip(local_std_edit / local_std_src, 0.1, 10)
-
-    The variance rescaling re-expresses the source's structural contrast at the
-    edit's local contrast level.  This is what kills bleeding: a red car edge has
-    high amplitude in the source residual; after scaling it down to match the blue
-    car's (typically lower) local std, the old-color amplitude disappears and the
-    edge is expressed purely through the edit's color field.
-
-    sigma_frac: Gaussian σ as a fraction of min(lat_h, lat_w).
-        0.10 → fine-grained local color estimation
-        0.15 → balanced (default)
-        0.25 → coarse / global color estimation
-
-    Operates on packed FLUX latents: (1, (lat_h//2)*(lat_w//2), num_ch*4).
-    """
-    num_ch = src_latent.shape[-1] // 4   # 16 for FLUX
-
-    def _unpack(x):
-        return (x.reshape(1, lat_h // 2, lat_w // 2, num_ch, 2, 2)
-                  .permute(0, 3, 1, 4, 2, 5)
-                  .reshape(1, num_ch, lat_h, lat_w))
-
-    def _pack(x):
-        return (x.view(1, num_ch, lat_h // 2, 2, lat_w // 2, 2)
-                  .permute(0, 2, 4, 1, 3, 5)
-                  .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4))
-
-    src_np  = _unpack(src_latent).float().cpu().numpy()    # (1, 16, lat_h, lat_w)
-    edit_np = _unpack(edit_latent).float().cpu().numpy()
-
-    H, W = lat_h, lat_w
-    sigma = min(H, W) * sigma_frac
-    cy, cx = H / 2.0, W / 2.0
-    Y, X   = np.mgrid[:H, :W].astype(np.float32)
-    low_mask = np.exp(-0.5 * ((Y - cy) ** 2 + (X - cx) ** 2) / (sigma ** 2))
-
-    def _smooth(x: np.ndarray) -> np.ndarray:
-        """Gaussian low-pass via FFT — same mask for every channel."""
-        return np.fft.ifft2(
-            np.fft.ifftshift(np.fft.fftshift(np.fft.fft2(x)) * low_mask)
-        ).real
-
-    eps = 1e-4
-    out = np.empty_like(src_np)
-    for c in range(num_ch):
-        src_ch  = src_np[0, c]
-        edit_ch = edit_np[0, c]
-
-        src_mean  = _smooth(src_ch)
-        edit_mean = _smooth(edit_ch)
-
-        src_struct  = src_ch  - src_mean   # color-removed structural residual
-        edit_struct = edit_ch - edit_mean
-
-        # Local std: smooth the squared residuals, then sqrt
-        src_std  = np.sqrt(np.maximum(_smooth(src_struct  ** 2), 0.0)) + eps
-        edit_std = np.sqrt(np.maximum(_smooth(edit_struct ** 2), 0.0)) + eps
-
-        # Recolor: edit's local color field + source structure at edit's contrast
-        out[0, c] = edit_mean + src_struct * np.clip(edit_std / src_std, 0.1, 10.0)
-
-    return _pack(
-        torch.from_numpy(out).to(dtype=src_latent.dtype, device=src_latent.device)
-    )
-
+# ───────────────────────── Colour editing: generate + img2img ─────────────────
 
 @torch.no_grad()
 def generate_p2p(
     pipe: FluxPipeline,
     source_prompt: str,
     edit_prompt: str,
-    inject_layers: List[int],
+    inject_layers: List[int],          # unused; kept for API compatibility
     seed: int = 0,
     num_steps: int = 28,
     guidance_scale: float = 3.5,
@@ -462,98 +311,59 @@ def generate_p2p(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
-    anchor_end_frac: float = 0.25,
-    freq_sigma: float = 0.08,
+    anchor_end_frac: float = 0.25,     # unused; kept for API compatibility
+    freq_sigma: float = 0.0,           # unused; kept for API compatibility
+    img2img_strength: float = 0.6,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Prompt-to-Prompt two-pass colour editing with two-phase injection
-    and optional frequency-domain identity restoration.
+    Colour editing via source generation + img2img.
 
-    Pass 1: generate source image (image_a), recording K,V at inject_layers.
+    Pass 1: generate the source image from source_prompt + seed.
+    Pass 2: FluxImg2ImgPipeline from source image, steered by edit_prompt.
 
-    Pass 2: regenerate from the same z_T with the edit prompt.
-        Phase 1 (steps 0 .. anchor_end_frac × n_steps, default 0-6):
-            K+V injection → aligns edit branch to source (Q_edit → Q_src).
-        Phase 2 (remaining steps, default 7-27):
-            K-only → K from source keeps spatial attention; V from edit carries colour.
+    The img2img starting latent already encodes the source structure, so the
+    denoising process changes colour from the text prompt without any attention
+    injection — no K/V manipulation, no post-processing, no bleeding.
 
-    freq_sigma (Gaussian σ as fraction of image size):
-        After generation, low-freq from edit (colour) + high-freq from source
-        (edges, license plates, facial structure) are blended in the frequency domain.
-        0.06–0.10 is the effective range for colour edits; 0.0 disables blending.
-
-    anchor_end_frac tunes the attention phase boundary:
-        0.15 → more colour change | 0.25 → balanced (default) | 0.50 → more identity
+    img2img_strength
+        0.4 → subtle colour shift, very strong identity
+        0.6 → balanced colour change + identity  (default)
+        0.8 → strong colour change, some identity drift
 
     Returns (src_img, edit_img).
     """
-    exec_device = getattr(pipe, '_execution_device', device)
-    num_ch = pipe.transformer.config.in_channels // 4
-    lat_h  = height // 8
-    lat_w  = width  // 8
+    from diffusers import FluxImg2ImgPipeline
 
-    _g  = torch.Generator(device=exec_device).manual_seed(seed)
-    _one = randn_tensor(
-        (1, num_ch, lat_h, lat_w),
-        generator=_g, device=exec_device, dtype=torch.bfloat16,
-    )
-    latent = (
-        _one.view(1, num_ch, lat_h // 2, 2, lat_w // 2, 2)
-            .permute(0, 2, 4, 1, 3, 5)
-            .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4)
-    )
+    exec_device = getattr(pipe, "_execution_device", device)
 
-    def _run_single(prompt: str, policy: BasePolicy) -> torch.Tensor:
-        """Returns denoised packed latent (1, seq_len, C) — no decoding yet."""
-        proc = UltimateFluxAttnProcessor(
-            policy=policy, total_layers=N_LAYERS, total_steps=num_steps
-        )
-        proc.reset()
-        pipe.transformer.set_attn_processor(proc)
-        return pipe(
-            prompt=prompt,
-            latents=latent.clone(),
-            num_inference_steps=num_steps,
-            guidance_scale=guidance_scale,
-            height=height,
-            width=width,
-            max_sequence_length=max_sequence_length,
-            output_type="latent",
-        ).images  # tensor (1, seq_len, C) when output_type="latent"
+    # Pass 1 — generate source image
+    print("[UltimateFlux P2P] Pass 1: generating source image…")
+    src_img = pipe(
+        prompt=source_prompt,
+        num_inference_steps=num_steps,
+        guidance_scale=guidance_scale,
+        height=height,
+        width=width,
+        max_sequence_length=max_sequence_length,
+        generator=torch.Generator(device=exec_device).manual_seed(seed),
+        output_type="pil",
+    ).images[0]
 
-    def _decode(packed: torch.Tensor) -> Image.Image:
-        """Unpack, unscale, VAE-decode packed FLUX latent to PIL."""
-        lat = pipe._unpack_latents(packed, height, width, pipe.vae_scale_factor)
-        lat = (lat / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
-        img = pipe.vae.decode(lat, return_dict=False)[0]
-        return pipe.image_processor.postprocess(img, output_type="pil")[0]
+    # Pass 2 — img2img colour edit from source
+    print(f"[UltimateFlux P2P] Pass 2: img2img colour edit "
+          f"(strength={img2img_strength}, steps={num_steps})…")
+    img2img = FluxImg2ImgPipeline.from_pipe(pipe)
+    edit_img = img2img(
+        prompt=edit_prompt,
+        image=src_img,
+        strength=img2img_strength,
+        num_inference_steps=num_steps,
+        guidance_scale=guidance_scale,
+        height=height,
+        width=width,
+        max_sequence_length=max_sequence_length,
+        generator=torch.Generator(device=exec_device).manual_seed(seed),
+        output_type="pil",
+    ).images[0]
 
-    # Pass 1 — generate source latent and record attention K,V
-    print("[UltimateFlux P2P] Pass 1: generating source latent…")
-    rec = _KVRecordPolicy(inject_layers, max_sequence_length)
-    src_latent = _run_single(source_prompt, rec)
-
-    # Pass 2 — two-phase injection: K+V to align (phase 1), K-only for colour (phase 2)
-    anchor_steps = int(anchor_end_frac * num_steps)
-    print(f"[UltimateFlux P2P] Pass 2: steps 0-{anchor_steps-1} K+V align, "
-          f"steps {anchor_steps}-{num_steps-1} K-only colour ({len(inject_layers)} layers)…")
-    inj = _KVInjectPolicy(
-        rec.stored,
-        max_seq_len=max_sequence_length,
-        anchor_end_frac=anchor_end_frac,
-    )
-    edit_latent = _run_single(edit_prompt, inj)
-
-    # Local color transfer in latent space:
-    # Removes old color from source, blends edit's color with source's structure.
-    # Variance rescaling kills old-color bleeding at edges.
-    if freq_sigma > 0.0:
-        print(f"[UltimateFlux P2P] Latent color transfer: σ_frac={freq_sigma} "
-              f"(remove source color, recolor with edit statistics)…")
-        edit_latent = _color_transfer_latent(
-            src_latent, edit_latent, lat_h, lat_w, sigma_frac=freq_sigma
-        )
-
-    src_img  = _decode(src_latent)
-    edit_img = _decode(edit_latent)
     return src_img, edit_img

@@ -5,12 +5,12 @@
 #   (default / omit)      → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
 #                            Tightest identity lock — for ADDING an attribute
 #                            (glasses, hat, beard).
-#   --inject_layers color → P2P K+V at 9 critical double-stream layers
-#                            [0,1,2,4,7,8,9,10,18] (TIER_A∩DS ∪ HOTSPOT∩DS).
-#                            Identity anchored; 10 freed DS + 38 SS layers carry
-#                            the new colour from the edit text. If colour is still
-#                            weak add --inject_steps_frac 0.0 0.5 (limit anchoring
-#                            to first half; second half fully free for colour).
+#   --inject_layers color → img2img colour edit: generates source first, then
+#                            FluxImg2ImgPipeline from source with edit prompt.
+#                            No attention injection needed — starting latent
+#                            carries structure; edit prompt drives colour cleanly.
+#                            Tune img2img_strength in JSON (default 0.6):
+#                            0.4=subtle/strong-identity, 0.6=balanced, 0.8=strong.
 #   --inject_layers tier_a  → TIER_A only (13 layers)
 #                            Appearance preserved, position flexible —
 #                            for shape-linked edits (breed change).
