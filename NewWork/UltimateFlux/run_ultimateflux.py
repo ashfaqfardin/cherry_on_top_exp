@@ -155,12 +155,14 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  edit_prompt:   {edit_prompt}")
 
     if policy is None:
-        # Colour editing: two-pass P2P from same z_T.
-        # Double-stream layers: K+V align phase → K-only colour phase.
-        # Single-stream TIER_A layers: K-only all steps → fine detail locked.
-        # V always free in single-stream → colour from edit text flows through.
+        # Colour editing: two-pass P2P from same z_T, K-only at 20 layers.
+        # Layer set = TIER_A ∪ ALL_HOTSPOT (DS + SS), no V injection by default.
+        # No V injection → no old-colour contamination → clean new colour.
+        # HOTSPOT∩SS {26,30,54,55} locks position-dependent detail (plates, faces).
         # Tune anchor_end_frac in JSON:
-        #   0.15 → more colour | 0.25 → balanced (default) | 0.40 → more identity
+        #   0.0  → K-only always; clean colour (default)
+        #   0.05 → 1 step K+V for Q-alignment boost; stronger identity
+        #   0.15 → more identity, may show residual old colour
         src_img, edit_img = generate_p2p(
             pipe=pipe,
             source_prompt=source_prompt,

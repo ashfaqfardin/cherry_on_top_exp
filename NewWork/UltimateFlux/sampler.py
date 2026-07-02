@@ -318,31 +318,45 @@ class _KVRecordPolicy(BasePolicy):
 
 class _P2PColorPolicy(BasePolicy):
     """
-    Two-phase P2P injection for colour editing with single-stream structure lock.
+    P2P injection for colour editing: K-only at 20 layers, no V injection.
 
-    Double-stream layers [0,1,2,4,7,8,9,10,18]:
-        Phase 1 (step < anchor_end_frac × n_steps): K+V → aligns Q_edit ≈ Q_src
-        Phase 2 (remaining steps):                  K-only → coarse identity held
+    Layer set = TIER_A ∪ ALL_HOTSPOT (same as FineGrainedAttrPolicy._PRESERVE_LAYERS):
+        TIER_A∩DS  + HOTSPOT∩DS  = [0,1,2,4,7,8,9,10,18]       — 9 DS layers
+        TIER_A∩SS  + HOTSPOT∩SS  = [25,26,28,30,37,42,45,50,54,55,56] — 11 SS layers
 
-    Single-stream TIER_A layers [25,28,37,42,45,50,56]:
-        All steps: K-only → fine-detail rendering locked (plates, facial edges)
-        V is never injected here → V from the edit branch carries the new colour
+    Two layer types (from FreeFlux RoPE analysis):
+        TIER_A  (low RoPE freq) = content-similarity layers → control appearance/texture
+        HOTSPOT (high RoPE freq) = position-dependent layers → control spatial LAYOUT
 
-    Why single-stream K injection is needed:
-        Single-stream blocks do the final fine-detail rendering pass.  Without K
-        injection there, spatial structure at that level (license-plate text, fine
-        face contours) drifts freely even when coarse composition is held by the
-        double-stream blocks.  K-only keeps WHERE those blocks attend without
-        freezing WHAT colour they render.
+    Why HOTSPOT∩SS {26,30,54,55} is critical for license plates:
+        License-plate text lives at SPECIFIC POSITIONS (position-dependent).
+        TIER_A∩SS alone (content-similarity) could not preserve it because plates
+        are a layout feature.  HOTSPOT∩SS layers encode where-in-space each token
+        attends → locking K there freezes the spatial grid of fine detail.
+
+    Why anchor_end_frac=0.0 (no V injection) eliminates "reddish blue":
+        Phase-1 K+V injects source V (red car) into the edit branch for several
+        steps, contaminating the hidden state with old colour.  The subsequent
+        K-only phase struggles to overwrite that red.  With anchor_end_frac=0.0
+        V is NEVER injected — only K is used — so no old colour enters the edit
+        branch.  Both branches start from the same z_T, so Q_edit ≈ Q_src at
+        step 0 already; 20-layer K injection keeps Q close enough over 28 steps.
+
+    anchor_end_frac (tune in JSON):
+        0.0  → K-only always; clean colour, slight identity risk  (default)
+        0.05 → 1 step K+V for minimal Q alignment boost; safer identity
+        0.15 → 4 steps K+V; strong identity, may show residual source colour
     """
-    # 9 double-stream layers: TIER_A∩DS ∪ {1,2,4}
+    # 9 double-stream: TIER_A∩DS ∪ HOTSPOT∩DS
     _DOUBLE_INJECT: List[int] = sorted(
         {l for l in TIER_A if l < N_DOUBLE} | {1, 2, 4}
     )
-    # 7 single-stream layers: TIER_A∩SS
-    _SINGLE_INJECT: frozenset = frozenset(l for l in TIER_A if l >= N_DOUBLE)
-    # 16 layers to record in Pass 1
-    _RECORD_LAYERS: List[int] = sorted(set(TIER_A) | {1, 2, 4})
+    # 11 single-stream: TIER_A∩SS ∪ HOTSPOT∩SS — HOTSPOT∩SS = {26,30,54,55}
+    _SINGLE_INJECT: frozenset = frozenset(
+        {l for l in TIER_A if l >= N_DOUBLE} | {26, 30, 54, 55}
+    )
+    # 20 layers total — identical to FineGrainedAttrPolicy._PRESERVE_LAYERS
+    _RECORD_LAYERS: List[int] = sorted(set(TIER_A) | {1, 2, 4, 26, 30, 54, 55})
 
     def __init__(
         self,
