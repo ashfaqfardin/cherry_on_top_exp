@@ -25,17 +25,6 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Add an accessory (strong identity preservation) ───────────────────────────
-python NewWork/UltimateFlux/run_ultimateflux.py \
-    --hf_token "$HF_TOKEN" --model_path "$MODEL" \
-    --device cuda --cache_dir ./models --save_images \
-    --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
-    --task attr_edit \
-    --name man_add_glasses \
-    --source_prompt "a portrait photo of a man" \
-    --edit_prompt   "a portrait photo of a man wearing eyeglasses" \
-    --seed 30
-
 # ── Change colour / texture (hotspot only — frees appearance) ─────────────────
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
@@ -58,6 +47,17 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
     --seed 40
+
+# ── Add an accessory (strong identity preservation) ───────────────────────────
+python NewWork/UltimateFlux/run_ultimateflux.py \
+    --hf_token "$HF_TOKEN" --model_path "$MODEL" \
+    --device cuda --cache_dir ./models --save_images \
+    --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
+    --task attr_edit \
+    --name man_add_glasses \
+    --source_prompt "a portrait photo of a man" \
+    --edit_prompt   "a portrait photo of a man wearing eyeglasses" \
+    --seed 30
 
 # ── Shape-linked edit (tier_a — preserves appearance, loosens layout) ─────────
 python NewWork/UltimateFlux/run_ultimateflux.py \
