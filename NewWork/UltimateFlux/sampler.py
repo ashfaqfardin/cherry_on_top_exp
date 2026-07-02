@@ -14,6 +14,7 @@ Layer index convention (combined 0-based across all 57 blocks):
 
 import os
 import sys
+import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import FluxPipeline
@@ -363,6 +364,49 @@ class _KVInjectPolicy(BasePolicy):
         return q, k, v
 
 
+def _freq_blend(
+    src_img: Image.Image,
+    edit_img: Image.Image,
+    sigma_frac: float = 0.08,
+) -> Image.Image:
+    """
+    Frequency-domain blending: low-freq from edit (new colour), high-freq from source
+    (edges, fine structure, license plates, facial topology).
+
+    A Gaussian mask in the 2-D DFT domain provides a smooth, artifact-free
+    transition between the two frequency bands.  sigma_frac is the Gaussian σ
+    expressed as a fraction of min(H, W):
+
+        small sigma (0.03) → nearly all from source; colour barely changes
+        medium sigma (0.08) → body colour from edit, fine detail from source  ← default
+        large sigma (0.15) → more colour, less structural detail preserved
+
+    For colour editing (red car → blue, black hair → blonde) 0.06–0.10 is the
+    effective range: it captures the large-area colour patches from the edit image
+    while recovering edges, text, and face geometry from the source.
+    """
+    src  = np.array(src_img.convert("RGB")).astype(np.float32) / 255.0
+    edit = np.array(edit_img.convert("RGB").resize(src_img.size, Image.LANCZOS)).astype(np.float32) / 255.0
+    H, W, _ = src.shape
+    sigma = min(H, W) * sigma_frac
+
+    # Pre-compute Gaussian low-pass mask (centred at DC after fftshift)
+    cy, cx = H / 2.0, W / 2.0
+    Y, X   = np.mgrid[:H, :W].astype(np.float32)
+    dist2  = (Y - cy) ** 2 + (X - cx) ** 2
+    low_mask  = np.exp(-0.5 * dist2 / (sigma ** 2))   # peaks at 1 (DC), falls off
+    high_mask = 1.0 - low_mask
+
+    out = np.empty_like(src)
+    for c in range(3):
+        src_f  = np.fft.fftshift(np.fft.fft2(src[:, :, c]))
+        edit_f = np.fft.fftshift(np.fft.fft2(edit[:, :, c]))
+        blended = low_mask * edit_f + high_mask * src_f   # colour from edit, detail from src
+        out[:, :, c] = np.clip(np.fft.ifft2(np.fft.ifftshift(blended)).real, 0.0, 1.0)
+
+    return Image.fromarray((out * 255).astype(np.uint8))
+
+
 @torch.no_grad()
 def generate_p2p(
     pipe: FluxPipeline,
@@ -377,30 +421,27 @@ def generate_p2p(
     max_sequence_length: int = 512,
     device: str = "cuda",
     anchor_end_frac: float = 0.25,
+    freq_sigma: float = 0.08,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Prompt-to-Prompt two-pass colour editing with two-phase injection.
+    Prompt-to-Prompt two-pass colour editing with two-phase injection
+    and optional frequency-domain identity restoration.
 
-    Pass 1: generate source image, recording K,V at inject_layers at every step.
+    Pass 1: generate source image (image_a), recording K,V at inject_layers.
 
     Pass 2: regenerate from the same z_T with the edit prompt.
-        Phase 1 (step < anchor_end_frac × n_steps, default steps 0-6):
-            K+V injection → aligns edit branch to source, establishing identity.
-            By the end of phase 1, Q_edit ≈ Q_src (branches have converged).
-        Phase 2 (remaining steps, default steps 7-27):
-            K-only injection → K from source keeps spatial attention anchored
-            (identity / composition stays); V from edit branch carries new colour.
-            Because phase 1 aligned the branches, Q_edit @ K_src^T is a valid
-            attention pattern — not broken like raw K-only from step 0.
+        Phase 1 (steps 0 .. anchor_end_frac × n_steps, default 0-6):
+            K+V injection → aligns edit branch to source (Q_edit → Q_src).
+        Phase 2 (remaining steps, default 7-27):
+            K-only → K from source keeps spatial attention; V from edit carries colour.
 
-    anchor_end_frac controls the phase boundary:
-        0.25 (default) → 7 steps align, 21 steps K-only colour  ← balanced
-        0.15           → 4 steps align, 24 steps K-only colour  ← more colour
-        0.50           → 14 steps align, 14 steps K-only colour ← more identity
+    freq_sigma (Gaussian σ as fraction of image size):
+        After generation, low-freq from edit (colour) + high-freq from source
+        (edges, license plates, facial structure) are blended in the frequency domain.
+        0.06–0.10 is the effective range for colour edits; 0.0 disables blending.
 
-    inject_layers should be the 9 critical double-stream layers
-    [0,1,2,4,7,8,9,10,18] (TIER_A∩DS ∪ HOTSPOT∩DS).  Single-stream blocks
-    (19-56) always respond freely to the edit text.
+    anchor_end_frac tunes the attention phase boundary:
+        0.15 → more colour change | 0.25 → balanced (default) | 0.50 → more identity
 
     Returns (src_img, edit_img).
     """
@@ -452,5 +493,12 @@ def generate_p2p(
         anchor_end_frac=anchor_end_frac,
     )
     edit_img = _run_single(edit_prompt, inj)
+
+    # Frequency-domain identity restoration:
+    # low-freq from edit (new colour) + high-freq from source (edges, fine structure).
+    if freq_sigma > 0.0:
+        print(f"[UltimateFlux P2P] Frequency blending: σ={freq_sigma} "
+              f"(low-freq=edit colour, high-freq=source structure)…")
+        edit_img = _freq_blend(src_img, edit_img, sigma_frac=freq_sigma)
 
     return src_img, edit_img

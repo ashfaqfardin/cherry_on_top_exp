@@ -103,13 +103,14 @@
       "seed": 30
     },
     {
-      "comment": "Two-phase P2P colour: steps 0-6 K+V align (identity), steps 7-27 K-only (colour). anchor_end_frac=0.15 for more colour, 0.50 for more identity.",
+      "comment": "Two-phase P2P + freq blend: attention gives colour change, freq blend restores face structure/edges from source. freq_sigma: 0.06=sharper identity, 0.10=more colour.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
       "anchor_end_frac": 0.25,
+      "freq_sigma": 0.08,
       "seed": 35
     },
     {
@@ -119,6 +120,7 @@
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
       "anchor_end_frac": 0.25,
+      "freq_sigma": 0.08,
       "seed": 40
     },
     {

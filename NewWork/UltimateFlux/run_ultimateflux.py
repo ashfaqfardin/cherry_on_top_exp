@@ -190,6 +190,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             max_sequence_length=max_seq_len,
             device=device,
             anchor_end_frac=cfg.get("anchor_end_frac", 0.25),
+            freq_sigma=cfg.get("freq_sigma", 0.08),
         )
     else:
         src_img, edit_img = generate_dual_branch(
