@@ -400,7 +400,19 @@ def generate_p2p(
     )                                                                 # (1, N, 3)
 
     # -- Timesteps: match pipe()'s schedule -----------------------------------
-    pipe.scheduler.set_timesteps(num_steps, device=exec_device)
+    # FLUX uses dynamic shifting: mu scales the schedule to image resolution.
+    image_seq_len = (lat_h // 2) * (lat_w // 2)
+    sched_cfg     = pipe.scheduler.config
+    if getattr(sched_cfg, "use_dynamic_shifting", False):
+        base_seq  = getattr(sched_cfg, "base_image_seq_len", 256)
+        max_seq   = getattr(sched_cfg, "max_image_seq_len",  4096)
+        base_shft = getattr(sched_cfg, "base_shift",         0.5)
+        max_shft  = getattr(sched_cfg, "max_shift",          1.15)
+        m   = (max_shft - base_shft) / (max_seq - base_seq)
+        mu  = image_seq_len * m + (base_shft - m * base_seq)
+        pipe.scheduler.set_timesteps(num_steps, device=exec_device, mu=mu)
+    else:
+        pipe.scheduler.set_timesteps(num_steps, device=exec_device)
     timesteps = pipe.scheduler.timesteps                              # length = num_steps
 
     has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
