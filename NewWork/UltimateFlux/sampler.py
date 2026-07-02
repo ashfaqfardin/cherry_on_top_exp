@@ -397,7 +397,9 @@ def generate_p2p(
     z_T     = pipe._pack_latents(raw_z, 1, num_ch, lat_h, lat_w)   # (1, N, 64)
     img_ids = pipe._prepare_latent_image_ids(
         1, lat_h // 2, lat_w // 2, exec_device, src_pe.dtype,
-    )                                                                 # (1, N, 3)
+    )                                                                 # (1, N, 3) or (N, 3)
+    if img_ids.ndim == 3:
+        img_ids = img_ids.squeeze(0)                                  # → (N, 3) new 2d API
 
     # -- Timesteps: match pipe()'s schedule -----------------------------------
     # FLUX uses dynamic shifting: mu scales the schedule to image resolution.
@@ -435,7 +437,7 @@ def generate_p2p(
             pooled_projections=pp,
             encoder_hidden_states=pe,
             txt_ids=txt,
-            img_ids=img_ids.expand(B, -1, -1),
+            img_ids=img_ids,
             return_dict=False,
         )[0]
         return pipe.scheduler.step(noise, t, lat, return_dict=False)[0]
@@ -458,9 +460,11 @@ def generate_p2p(
     for t in timesteps[split_step:]:
         # Concatenate both branches -- one forward pass handles both.
         lat_b  = torch.cat([lat_src, lat_edit])                  # (2, N, 64)
-        pe_b   = torch.cat([src_pe,  edit_pe])
-        pp_b   = torch.cat([src_pp,  edit_pp])
-        txt_b  = torch.cat([src_txt, edit_txt])
+        pe_b   = torch.cat([src_pe,  edit_pe])                   # (2, T, C)
+        pp_b   = torch.cat([src_pp,  edit_pp])                   # (2, C)
+        # txt_ids are all-zero position IDs from encode_prompt — shape (T, 3),
+        # NOT batched. Concatenating them would double the sequence length and
+        # break RoPE. Pass src_txt (== edit_txt) as the shared 2d position IDs.
         ts     = t.expand(2)
         g      = (torch.full([2], guidance_scale, device=exec_device, dtype=lat_b.dtype)
                   if has_guidance else None)
@@ -471,8 +475,8 @@ def generate_p2p(
             guidance=g,
             pooled_projections=pp_b,
             encoder_hidden_states=pe_b,
-            txt_ids=txt_b,
-            img_ids=img_ids.expand(2, -1, -1),
+            txt_ids=src_txt,
+            img_ids=img_ids,
             return_dict=False,
         )[0]
 
