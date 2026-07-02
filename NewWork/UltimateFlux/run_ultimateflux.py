@@ -159,19 +159,20 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         # Pass 1 → image_a (source_prompt + seed), recording K,V at all double-stream layers.
         # Pass 2 → edit image (edit_prompt + same z_T), injecting stored K,V.
         # Single-stream blocks (19-56) are free → edit text drives colour there.
-        # Colour mode: P2P with K+V at 9 critical double-stream layers.
+        # Colour mode: two-phase P2P.
         #
-        # All 19 double-stream → colour was mostly locked (V_src carries source colour).
-        # 0 layers (no injection) → whole car/person changes (no identity anchor).
+        # Phase 1 (first inject_steps_frac end fraction of steps, default 25% = 7 steps):
+        #   K+V at 9 critical DS layers [0,1,2,4,7,8,9,10,18].
+        #   Anchors WHO/WHAT/WHERE (coarse layout is established by step 7).
         #
-        # 9 layers = TIER_A∩DS ∪ HOTSPOT∩DS = [0,1,2,4,7,8,9,10,18]:
-        #   - Anchors identity at the most semantically important layers.
-        #   - Frees 10 other double-stream + 38 single-stream (48 total) to carry
-        #     the edit colour from the text ("blue car", "blonde hair").
+        # Phase 2 (remaining 75% = 21 steps): NO injection at any layer.
+        #   All 57 layers free → text "blue car" / "blonde hair" drives colour
+        #   with nothing competing.  21 free steps is enough to fully realise
+        #   the new colour.
         #
-        # Fallback tuning: add "inject_steps_frac":[0.0,0.5] to the JSON run to
-        # limit anchoring to the first half of steps, freeing the second half
-        # completely (stronger colour change, slight identity risk).
+        # Tune via inject_steps_frac in JSON:
+        #   [0.0, 0.15] → 4 steps anchor, 24 free  (more colour, less identity)
+        #   [0.0, 0.50] → 14 steps anchor, 14 free  (less colour, more identity)
         _DS_TIER_A   = [l for l in TIER_A if l < N_DOUBLE]  # [0,7,8,9,10,18]
         _DS_HOTSPOT  = [1, 2, 4]
         _color_layers = sorted(set(_DS_TIER_A) | set(_DS_HOTSPOT))  # 9 layers
@@ -188,7 +189,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             max_sequence_length=max_seq_len,
             device=device,
             k_only=False,
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 0.25])),
         )
     else:
         src_img, edit_img = generate_dual_branch(
