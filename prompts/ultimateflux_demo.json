@@ -103,9 +103,10 @@
       "seed": 30
     },
     {
+      "comment": "P2P colour: K-only injection at double-stream keeps structure, V from edit carries blonde. Reduce inject_steps_frac end (e.g. 0.5) if colour still won't change.",
       "name": "woman_hair_color",
       "task": "attr_edit",
-      "source_prompt": "a woman with brown hair",
+      "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
       "inject_steps_frac": [0.0, 1.0],

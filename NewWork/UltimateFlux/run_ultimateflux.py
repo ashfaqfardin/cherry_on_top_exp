@@ -171,6 +171,8 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
+            k_only=True,
+            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
         )
     else:
         src_img, edit_img = generate_dual_branch(

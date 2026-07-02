@@ -318,22 +318,44 @@ class _KVRecordPolicy(BasePolicy):
 
 
 class _KVInjectPolicy(BasePolicy):
-    """Pass-2 helper: replaces K,V at target layers from a pre-recorded store."""
+    """
+    Pass-2 helper: replaces K (and optionally V) at target layers from a stored dict.
 
-    def __init__(self, stored: Dict[tuple, tuple], max_seq_len: int = 512):
+    k_only=True  → inject K from source, keep V from edit branch.
+        K controls WHERE to attend (structure/composition).
+        V from the edit branch carries new colour ("blue car", "blonde hair").
+        Use for colour / texture changes — colour is free to change via V.
+
+    k_only=False → inject both K and V (strong appearance lock, original behaviour).
+        Use when you want maximum identity preservation (e.g. pose editing).
+    """
+
+    def __init__(
+        self,
+        stored: Dict[tuple, tuple],
+        max_seq_len: int = 512,
+        k_only: bool = False,
+        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+    ):
         self._stored = stored
         self._max_seq_len = max_seq_len
+        self._k_only = k_only
+        self._frac = inject_steps_frac
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
+        lo, hi = self._frac
+        if not (int(lo * n_steps) <= step < int(hi * n_steps)):
+            return q, k, v
         entry = self._stored.get((step, layer))
         if entry is None:
             return q, k, v
         stored_k, stored_v, stored_offset = entry
         offset = txt_len if txt_len > 0 else self._max_seq_len
         k = k.clone()
-        v = v.clone()
-        k[:, :, offset:, :] = stored_k
-        v[:, :, offset:, :] = stored_v
+        k[:, :, offset:, :] = stored_k            # K from source → structure
+        if not self._k_only:
+            v = v.clone()
+            v[:, :, offset:, :] = stored_v        # V from source → appearance lock
         return q, k, v
 
 
@@ -350,24 +372,33 @@ def generate_p2p(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
+    k_only: bool = True,
+    inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Prompt-to-Prompt two-pass editing for colour / texture changes.
 
     Pass 1 — source pass (source_prompt, seed → image_a):
-        Run standard FLUX generation, recording K,V at inject_layers at every step.
+        Standard FLUX generation; records K,V at every (step, layer) in inject_layers.
 
-    Pass 2 — edit pass (edit_prompt, same starting noise):
-        Regenerate from the identical z_T with the edit prompt.
-        At every (step, layer) in inject_layers, the stored K,V from pass 1 are
-        injected, anchoring spatial structure and identity.  Layers NOT in
-        inject_layers respond freely to the edit prompt — colour information encoded
-        by the text ("blue car", "blonde hair") can emerge there.
+    Pass 2 — edit pass (edit_prompt, same z_T):
+        Regenerates from the identical starting noise with the edit prompt.
+        At (step, layer) pairs within inject_steps_frac, stored values are injected.
 
-    inject_layers = list(range(N_DOUBLE)) (all 19 double-stream blocks) is the
-    recommended choice for colour changes:
-        - Double-stream blocks anchor semantic identity (who, what, composition).
-        - 38 single-stream blocks are free → edit text drives colour there.
+    k_only=True  (default for colour) — inject K from source, keep V from edit.
+        K controls WHERE to attend  → preserves spatial structure and identity.
+        V stays from the edit branch → carries new colour ("blue car", "blonde hair").
+        38 free single-stream blocks further reinforce the colour change.
+
+    k_only=False — inject both K and V (strong appearance lock).
+        Use for pose / shape edits where colour must not drift.
+
+    inject_steps_frac — (start, end) fraction of denoising steps to inject.
+        Default (0.0, 1.0) = all steps.  Try (0.0, 0.5) if colour still won't change
+        (injection only anchors structure in the first half; second half is free).
+
+    inject_layers = list(range(N_DOUBLE)) anchors semantic identity without
+    touching the 38 single-stream refinement blocks.
 
     Returns (src_img, edit_img).
     """
@@ -409,9 +440,15 @@ def generate_p2p(
     rec = _KVRecordPolicy(inject_layers, max_sequence_length)
     src_img = _run_single(source_prompt, rec)
 
-    # Pass 2 — edit from same noise, injecting stored K,V
-    print("[UltimateFlux P2P] Pass 2: applying edit prompt with K,V structure injection…")
-    inj = _KVInjectPolicy(rec.stored, max_sequence_length)
+    # Pass 2 — edit from same noise, injecting stored K (and optionally V)
+    mode_str = "K-only" if k_only else "K+V"
+    print(f"[UltimateFlux P2P] Pass 2: edit with {mode_str} injection at {len(inject_layers)} layers…")
+    inj = _KVInjectPolicy(
+        rec.stored,
+        max_seq_len=max_sequence_length,
+        k_only=k_only,
+        inject_steps_frac=inject_steps_frac,
+    )
     edit_img = _run_single(edit_prompt, inj)
 
     return src_img, edit_img
