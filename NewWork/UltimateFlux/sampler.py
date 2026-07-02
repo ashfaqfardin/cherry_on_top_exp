@@ -14,7 +14,6 @@ Layer index convention (combined 0-based across all 57 blocks):
 
 import os
 import sys
-import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import FluxPipeline
@@ -297,159 +296,68 @@ def generate_dual_branch(
     return src_img, edit_img
 
 
-# ──────────────────── Classical-CV colour editing ─────────────────────────────
+# ──────────────────── Latent-space colour editing ─────────────────────────────
 
-def _rgb_to_hsv_np(rgb: np.ndarray) -> np.ndarray:
-    """Vectorised RGB [0,1] → HSV [0,1].  Input: (..., 3) float32."""
-    r, g, b  = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    maxc     = np.maximum(np.maximum(r, g), b)
-    minc     = np.minimum(np.minimum(r, g), b)
-    delta    = maxc - minc
-    v        = maxc
-    s        = np.where(maxc > 1e-7, delta / maxc, 0.0)
-    h        = np.zeros_like(r)
-    m_r      = (maxc == r) & (delta > 1e-7)
-    m_g      = (maxc == g) & (delta > 1e-7)
-    m_b      = (maxc == b) & (delta > 1e-7)
-    h        = np.where(m_r, ((g - b) / delta) % 6.0, h)
-    h        = np.where(m_g, (b - r) / delta + 2.0,   h)
-    h        = np.where(m_b, (r - g) / delta + 4.0,   h)
-    return np.stack([h / 6.0, s, v], axis=-1)
+def _latent_blend(
+    z_src: torch.Tensor,
+    z_edit: torch.Tensor,
+    top_k: int = 0,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """
+    Colour replacement in FLUX packed latent space — no pixel-space ops.
 
+    Both z_src and z_edit are generated from the same seed (same z_T), so
+    composition is nearly identical.  The colour prompt drives most of the
+    latent delta.
 
-def _hsv_to_rgb_np(hsv: np.ndarray) -> np.ndarray:
-    """Vectorised HSV [0,1] → RGB [0,1].  Input: (..., 3) float32."""
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    h6 = (h % 1.0) * 6.0
-    i  = np.floor(h6).astype(np.int32) % 6
-    f  = h6 - np.floor(h6)
-    p  = v * (1.0 - s)
-    q  = v * (1.0 - f * s)
-    t  = v * (1.0 - (1.0 - f) * s)
-    r  = np.select([i==0, i==1, i==2, i==3, i==4, i==5], [v, q, p, p, t, v], 0.0)
-    g  = np.select([i==0, i==1, i==2, i==3, i==4, i==5], [t, v, v, q, p, p], 0.0)
-    b  = np.select([i==0, i==1, i==2, i==3, i==4, i==5], [p, p, t, v, v, q], 0.0)
-    return np.clip(np.stack([r, g, b], axis=-1), 0.0, 1.0)
+    Soft per-token mask (the key insight):
+        w[i] = ‖delta[i]‖₂ / p95(‖delta‖₂)   clipped to [0, 1]
+        Tokens in the coloured region (car body, hair) changed the most
+        between source and edit → w ≈ 1 → new colour applied fully.
+        Tokens that barely changed (plates, background, face) → w ≈ 0
+        → z_src preserved → structure intact.
 
+    Optional SVD low-rank filter (top_k > 0):
+        Replace delta with its rank-k approximation before masking.
+        Top-k singular vectors capture the dominant GLOBAL colour shift
+        in channel space; local structural drift (which is lower-rank)
+        is discarded.  Start with top_k=0; increase if colour is weak.
 
-def _sobel_edges(gray: np.ndarray) -> np.ndarray:
-    """Sobel magnitude, normalised [0, 1].  Input: (H, W) float32."""
-    gx = (-gray[:-2, :-2] + gray[:-2, 2:]
-          - 2 * gray[1:-1, :-2] + 2 * gray[1:-1, 2:]
-          - gray[2:,  :-2] + gray[2:,  2:])
-    gy = ( gray[2:,  :-2] + 2 * gray[2:,  1:-1] + gray[2:,  2:]
-          - gray[:-2, :-2] - 2 * gray[:-2, 1:-1] - gray[:-2, 2:])
-    mag      = np.sqrt(gx ** 2 + gy ** 2)
-    mag_full = np.pad(mag, ((1, 1), (1, 1)), mode="edge")
-    return mag_full / (mag_full.max() + 1e-8)
+    z_src, z_edit : (1, N, C) FLUX packed latents  (bfloat16 or float16)
+    top_k         : 0 = no SVD  |  1–8 = keep top-k singular vectors
+    alpha         : delta scale (1.0 = full swap | >1 = amplify colour)
+    """
+    delta = z_edit.float() - z_src.float()    # (1, N, C)
 
+    if top_k > 0:
+        d        = delta[0]                                       # (N, C)
+        U, S, Vh = torch.linalg.svd(d, full_matrices=False)
+        k        = min(top_k, S.shape[0])
+        delta    = ((U[:, :k] * S[:k]) @ Vh[:k, :]).unsqueeze(0) # (1, N, C)
 
-# Colour vocabulary ─────────────────────────────────────────────────────────
-# Source masks: which pixels match this colour (h, s, v all ∈ [0, 1])
-_SRC_MASK: Dict[str, Callable] = {
-    "red":    lambda h, s, v: ((h < 0.05) | (h > 0.95)) & (s > 0.30) & (v > 0.15),
-    "orange": lambda h, s, v: (h > 0.04) & (h < 0.10)   & (s > 0.40) & (v > 0.20),
-    "yellow": lambda h, s, v: (h > 0.09) & (h < 0.17)   & (s > 0.35) & (v > 0.20),
-    "green":  lambda h, s, v: (h > 0.25) & (h < 0.45)   & (s > 0.25) & (v > 0.10),
-    "blue":   lambda h, s, v: (h > 0.55) & (h < 0.72)   & (s > 0.25) & (v > 0.10),
-    "purple": lambda h, s, v: (h > 0.72) & (h < 0.86)   & (s > 0.25) & (v > 0.10),
-    "cyan":   lambda h, s, v: (h > 0.45) & (h < 0.56)   & (s > 0.25) & (v > 0.10),
-    "black":  lambda h, s, v: v < 0.28,
-    "brown":  lambda h, s, v: (h > 0.03) & (h < 0.09)   & (s > 0.30) & (v < 0.55),
-    "blonde": lambda h, s, v: (h > 0.08) & (h < 0.17)   & (s > 0.25) & (v > 0.50),
-    "white":  lambda h, s, v: (v > 0.85) & (s < 0.20),
-    "gray":   lambda h, s, v: (s < 0.18) & (v > 0.20)   & (v < 0.85),
-}
+    # Robust per-token mask: use 95th-percentile as scale so one outlier
+    # token doesn't compress all others to near-zero weight.
+    norms = delta[0].norm(dim=-1)                                 # (N,)
+    scale = torch.quantile(norms, 0.95).clamp(min=1e-6)
+    w     = (norms / scale).clamp(max=1.0)                       # (N,) ∈ [0, 1]
 
-# Target HSV parameters: (target_h, s_scale, s_floor, v_scale, v_offset)
-#   target_h: new hue in [0, 1]
-#   s_scale : multiply source S (preserves saturation variation in the region)
-#   s_floor : minimum S to enforce (lifts achromatic sources like black hair)
-#   v_scale : multiply source V (brightens / darkens)
-#   v_offset: add after scaling   (ensures minimum brightness for dark→light)
-_TGT_HSV: Dict[str, tuple] = {
-    "red":    (0.00, 1.0, 0.65, 1.0, 0.00),
-    "orange": (0.07, 1.0, 0.65, 1.0, 0.00),
-    "yellow": (0.14, 1.0, 0.65, 1.0, 0.00),
-    "green":  (0.35, 1.0, 0.65, 1.0, 0.00),
-    "blue":   (0.63, 1.0, 0.65, 1.0, 0.00),
-    "purple": (0.78, 1.0, 0.65, 1.0, 0.00),
-    "cyan":   (0.50, 1.0, 0.65, 1.0, 0.00),
-    "black":  (0.00, 0.0, 0.00, 0.12, 0.00),
-    "brown":  (0.07, 0.8, 0.55, 2.0,  0.05),
-    "blonde": (0.11, 0.7, 0.50, 3.5,  0.18),  # dark→blonde: set hue, brighten
-    "white":  (0.00, 0.0, 0.00, 1.0,  0.85),
-    "gray":   (0.00, 0.0, 0.00, 1.0,  0.00),
-}
+    z_out = z_src.float() + alpha * w.unsqueeze(-1).unsqueeze(0) * delta
+    return z_out.to(z_src.dtype)
 
 
-def _cv_color_replace(
-    src_img: Image.Image,
-    source_color: str,
-    target_color: str,
-    edge_strength: float = 0.7,
+def _decode_latents(
+    pipe: FluxPipeline,
+    packed_latents: torch.Tensor,
+    height: int,
+    width: int,
 ) -> Image.Image:
-    """
-    HSV colour replacement with Sobel edge preservation.
-
-    Steps:
-    1. Convert source PIL image to HSV (numpy, no external deps).
-    2. Segment pixels matching *source_color* by HSV thresholding → mask.
-       License plates / face outlines are typically NOT the car / hair colour,
-       so they fall outside the mask and are untouched automatically.
-    3. Compute Sobel edge magnitude on grayscale source.  Strong edges (plate
-       text characters, face contours, fine structural borders) get high values.
-    4. Blend weight = mask × clamp(1 − edge_mag / edge_threshold, 0, 1).
-       → 1 in flat coloured regions  (full colour change)
-       → 0 at strong edges           (pixel taken from source, unchanged)
-    5. Build target HSV: shift H to new hue; apply s_scale + s_floor (so that
-       achromatic black hair gains saturation when going blonde); rescale V
-       (so dark hair brightens to blonde luminance while keeping shadow detail).
-    6. Lerp source and target RGB using the weight map → PIL image.
-
-    source_color / target_color: any key in _SRC_MASK / _TGT_HSV, e.g.
-        "red"/"blue", "black"/"blonde", "green"/"purple" …
-    edge_strength: [0, 1].  Higher = more pixels locked to source at edges.
-        0.0 → no edge suppression  |  0.7 → freeze Sobel > 0.3 (default)
-    """
-    if source_color not in _SRC_MASK:
-        raise ValueError(
-            f"Unknown source_color '{source_color}'. "
-            f"Choose from: {sorted(_SRC_MASK)}"
-        )
-    if target_color not in _TGT_HSV:
-        raise ValueError(
-            f"Unknown target_color '{target_color}'. "
-            f"Choose from: {sorted(_TGT_HSV)}"
-        )
-
-    src  = np.array(src_img.convert("RGB")).astype(np.float32) / 255.0   # (H,W,3)
-    hsv  = _rgb_to_hsv_np(src)
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-
-    # 1. Colour segmentation mask
-    mask = _SRC_MASK[source_color](h, s, v).astype(np.float32)           # (H,W)
-
-    # 2. Sobel edge map — high values at structural boundaries in pixel space
-    gray     = 0.299 * src[..., 0] + 0.587 * src[..., 1] + 0.114 * src[..., 2]
-    edge_mag = _sobel_edges(gray)                                          # (H,W) ∈ [0,1]
-
-    # 3. Blend weight: edge_threshold = 1 − edge_strength
-    #    pixels with edge_mag > edge_threshold → alpha → 0 (lock to source)
-    edge_thr = max(1.0 - edge_strength, 0.02)
-    alpha    = mask * np.clip(1.0 - edge_mag / edge_thr, 0.0, 1.0)       # (H,W)
-
-    # 4. Build target HSV
-    tgt_h, s_scale, s_floor, v_scale, v_offset = _TGT_HSV[target_color]
-    new_h   = np.full_like(h, tgt_h)
-    new_s   = np.clip(np.maximum(s * s_scale, s_floor), 0.0, 1.0)
-    new_v   = np.clip(v * v_scale + v_offset, 0.0, 1.0)
-    new_rgb = _hsv_to_rgb_np(np.stack([new_h, new_s, new_v], axis=-1))   # (H,W,3)
-
-    # 5. Blend source and target RGB
-    a3     = alpha[..., np.newaxis]
-    result = a3 * new_rgb + (1.0 - a3) * src
-    return Image.fromarray((np.clip(result, 0.0, 1.0) * 255.0).astype(np.uint8))
+    """Unpack FLUX packed latents and decode via the VAE → PIL image."""
+    vae_scale = getattr(pipe, "vae_scale_factor", 8)
+    latents   = pipe._unpack_latents(packed_latents, height, width, vae_scale)
+    latents   = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+    raw       = pipe.vae.decode(latents, return_dict=False)[0]
+    return pipe.image_processor.postprocess(raw, output_type="pil")[0]
 
 
 @torch.no_grad()
@@ -457,7 +365,7 @@ def generate_p2p(
     pipe: FluxPipeline,
     source_prompt: str,
     edit_prompt: str,
-    inject_layers: List[int],           # unused; kept for API compat
+    inject_layers: List[int],          # unused; kept for API compat
     seed: int = 0,
     num_steps: int = 28,
     guidance_scale: float = 3.5,
@@ -465,55 +373,71 @@ def generate_p2p(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
-    anchor_end_frac: float = 0.0,       # unused; kept for API compat
-    freq_sigma: float = 0.0,            # unused; kept for API compat
-    img2img_strength: float = 0.6,      # unused; kept for API compat
-    source_color: str = "",
-    target_color: str = "",
-    edge_strength: float = 0.7,
+    anchor_end_frac: float = 0.0,      # unused; kept for API compat
+    freq_sigma: float = 0.0,           # unused; kept for API compat
+    img2img_strength: float = 0.6,     # unused; kept for API compat
+    source_color: str = "",            # unused; kept for API compat
+    target_color: str = "",            # unused; kept for API compat
+    edge_strength: float = 0.7,        # unused; kept for API compat
+    latent_top_k: int = 0,
+    latent_alpha: float = 1.0,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Colour editing via single FLUX generation + classical-CV colour replacement.
+    Colour editing via latent-space delta blending — two FLUX passes, no CV.
 
-    Pass 1 — FLUX generates the source image from *source_prompt* + *seed*.
-    Pass 2 — _cv_color_replace rewrites colour in pixel space (no second FLUX call):
-        • HSV segmentation: isolate pixels matching *source_color*
-          (license plates / face skin are typically NOT the edited colour
-          → outside the mask → untouched automatically)
-        • Hue / saturation shift to *target_color*, V (brightness) preserved
-          → structure and shadows intact; no colour bleeding
-        • Sobel edge mask: suppress change at strong gradients (plate text,
-          facial contours) → exact pixel-level structure preservation
-        • Blend: flat coloured regions → new colour | edges → source unchanged
+    Pass 1 — pipe(source_prompt, seed) → z_src  (packed latent, skip VAE decode)
+    Pass 2 — pipe(edit_prompt,   seed) → z_edit (packed latent, same z_T)
 
-    source_color / target_color: colour name, e.g. "red"/"blue", "black"/"blonde"
-    edge_strength: 0 = no edge lock | 0.7 = freeze Sobel > 0.3 (default)
+    Both passes start from the same noise z_T (same generator seed), so the
+    scene composition is nearly identical.  The colour change in the edit
+    prompt drives a large, spatially concentrated delta in the latent.
+
+    Blend (pure latent arithmetic):
+        delta    = z_edit − z_src
+        [SVD]    delta ← rank-k(delta)       if latent_top_k > 0
+        w[i]     = ‖delta[i]‖ / p95‖delta‖  per-token soft mask
+        z_result = z_src + alpha × w × delta
+
+    Why license plates / face are preserved:
+        Those regions are the same colour in both passes (they're not the
+        car body / hair) → delta ≈ 0 there → w ≈ 0 → z_src preserved.
+
+    latent_top_k (default 0 — try 4 if colour is weak):
+        SVD extracts the dominant global colour direction in channel space.
+        Discards local structural drift that crept in from prompt wording.
+
+    latent_alpha (default 1.0 — try 1.2 to amplify):
+        Scales the colour delta.  >1 overshoots slightly, giving a stronger
+        colour impression (useful when the delta is subtle).
 
     Returns (src_img, edit_img).
     """
     exec_device = getattr(pipe, "_execution_device", device)
 
-    print("[UltimateFlux P2P] Pass 1: generating source image…")
-    src_img = pipe(
-        prompt=source_prompt,
-        num_inference_steps=num_steps,
-        guidance_scale=guidance_scale,
-        height=height,
-        width=width,
-        max_sequence_length=max_sequence_length,
-        generator=torch.Generator(device=exec_device).manual_seed(seed),
-        output_type="pil",
-    ).images[0]
+    def _run_latent(prompt: str) -> torch.Tensor:
+        return pipe(
+            prompt=prompt,
+            num_inference_steps=num_steps,
+            guidance_scale=guidance_scale,
+            height=height,
+            width=width,
+            max_sequence_length=max_sequence_length,
+            generator=torch.Generator(device=exec_device).manual_seed(seed),
+            output_type="latent",
+        ).images                              # (1, N, C) packed latent tensor
 
-    if source_color and target_color:
-        print(
-            f"[UltimateFlux P2P] Pass 2 (CV): "
-            f"{source_color!r} → {target_color!r}  "
-            f"edge_strength={edge_strength}"
-        )
-        edit_img = _cv_color_replace(src_img, source_color, target_color, edge_strength)
-    else:
-        print("[UltimateFlux P2P] No source_color/target_color — returning source unchanged.")
-        edit_img = src_img
+    print("[UltimateFlux P2P] Pass 1: generating source latent…")
+    z_src = _run_latent(source_prompt)
 
+    print("[UltimateFlux P2P] Pass 2: generating edit latent (same seed)…")
+    z_edit = _run_latent(edit_prompt)
+
+    print(
+        f"[UltimateFlux P2P] Blending in latent space "
+        f"(top_k={latent_top_k}, alpha={latent_alpha})…"
+    )
+    z_blend = _latent_blend(z_src, z_edit, top_k=latent_top_k, alpha=latent_alpha)
+
+    src_img  = _decode_latents(pipe, z_src,   height, width)
+    edit_img = _decode_latents(pipe, z_blend, height, width)
     return src_img, edit_img

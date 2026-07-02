@@ -155,10 +155,12 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  edit_prompt:   {edit_prompt}")
 
     if policy is None:
-        # Colour editing: FLUX generates source; classical CV replaces colour.
-        # source_color / target_color come from JSON (e.g. "red"/"blue").
-        # edge_strength controls how aggressively Sobel edges lock to source
-        # (0=no lock, 0.7=freeze strong edges like plate text, default).
+        # Colour editing: two FLUX passes (same seed) → latent-space delta blend.
+        # No pixel-space CV.  The soft per-token mask (delta norm) identifies
+        # which latent tokens changed most (= the coloured region) and applies
+        # the colour shift there while leaving everything else at z_src.
+        # latent_top_k: 0=soft mask only | 4=+SVD for dominant colour direction
+        # latent_alpha: 1.0=full swap | 1.2=amplify if colour looks weak
         src_img, edit_img = generate_p2p(
             pipe=pipe,
             source_prompt=source_prompt,
@@ -171,9 +173,8 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
-            source_color=cfg.get("source_color", ""),
-            target_color=cfg.get("target_color", ""),
-            edge_strength=cfg.get("edge_strength", 0.7),
+            latent_top_k=cfg.get("latent_top_k", 0),
+            latent_alpha=cfg.get("latent_alpha", 1.0),
         )
     else:
         src_img, edit_img = generate_dual_branch(
@@ -260,13 +261,11 @@ def parse_args():
                    help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "tier_a"],
-                   help="attr_edit mode: color=CV colour replace (requires --source_color/--target_color), tier_a=breed/shape change")
-    p.add_argument("--source_color",  default="",
-                   help="Colour to replace, e.g. 'red', 'black' (used when --inject_layers color)")
-    p.add_argument("--target_color",  default="",
-                   help="Replacement colour, e.g. 'blue', 'blonde' (used when --inject_layers color)")
-    p.add_argument("--edge_strength", type=float, default=0.7,
-                   help="0=change even at edges | 0.7=freeze Sobel>0.3 | 1=max edge lock (default 0.7)")
+                   help="attr_edit mode: color=latent delta blend (2 FLUX passes), tier_a=breed/shape change")
+    p.add_argument("--latent_top_k",  type=int,   default=0,
+                   help="SVD rank for latent delta (0=soft mask only | 4=+SVD global colour; default 0)")
+    p.add_argument("--latent_alpha",  type=float, default=1.0,
+                   help="Colour delta scale (1.0=full swap | 1.2=amplify; default 1.0)")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
@@ -324,9 +323,8 @@ def main():
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
         "inject_layers":  args.inject_layers,
-        "source_color":   args.source_color,
-        "target_color":   args.target_color,
-        "edge_strength":  args.edge_strength,
+        "latent_top_k":   args.latent_top_k,
+        "latent_alpha":   args.latent_alpha,
         "pfb_alpha":     args.pfb_alpha,
         "seed":          args.seed,
         "num_steps":     args.num_steps,

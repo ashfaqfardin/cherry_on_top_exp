@@ -5,11 +5,14 @@
 #   (default / omit)        → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
 #                              Tightest identity lock — for ADDING an attribute
 #                              (glasses, hat, beard).
-#   --inject_layers color   → CV colour replace: FLUX generates source once;
-#                              _cv_color_replace rewrites colour in pixel space
-#                              via HSV segmentation + Sobel edge mask.
-#                              Requires --source_color and --target_color.
-#                              Tune --edge_strength (0=no lock, 0.7=default).
+#   --inject_layers color   → Latent delta blend: two FLUX passes (same seed),
+#                              soft per-token mask from delta norm identifies the
+#                              coloured region in latent space; structure preserved
+#                              because non-coloured tokens have near-zero delta.
+#                              --latent_top_k 0  → soft mask only (default)
+#                              --latent_top_k 4  → +SVD for global colour direction
+#                              --latent_alpha 1.0 → full swap (default)
+#                              --latent_alpha 1.2 → amplify if colour is weak
 #   --inject_layers tier_a  → TIER_A only (13 layers)
 #                              Appearance preserved, position flexible —
 #                              for shape-linked edits (breed change).
@@ -24,7 +27,7 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Change colour (CV: HSV segmentation + Sobel edge preservation) ─────────────
+# ── Change colour (latent delta blend — no CV, pure latent arithmetic) ─────────
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -34,8 +37,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
-    --source_color black --target_color blonde \
-    --edge_strength 0.7 \
+    --latent_top_k 0 --latent_alpha 1.0 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -47,8 +49,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
-    --source_color red --target_color blue \
-    --edge_strength 0.7 \
+    --latent_top_k 0 --latent_alpha 1.0 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────

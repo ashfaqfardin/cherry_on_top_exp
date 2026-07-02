@@ -103,27 +103,24 @@
       "seed": 30
     },
     {
-      "comment": "CV colour edit: FLUX generates source; HSV segmentation replaces black hair with blonde. Sobel edge mask freezes face contours and fine structure. Increase edge_strength (0→1) to lock more edge pixels to source.",
+      "comment": "Latent delta blend: two FLUX passes (same seed) → soft per-token mask from delta norm selects the coloured region in latent space; no CV. latent_top_k=0 uses mask only; try 4 to add SVD global-colour filter. latent_alpha>1 amplifies if change is weak.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
-      "source_color": "black",
-      "target_color": "blonde",
-      "edge_strength": 0.7,
+      "latent_top_k": 0,
+      "latent_alpha": 1.0,
       "seed": 35
     },
     {
-      "comment": "CV colour edit: FLUX generates red car; HSV segments red pixels, shifts hue to blue. License plate is not red → outside mask → preserved automatically. Sobel edge lock reinforces plate text boundaries.",
       "name": "car_color_change",
       "task": "attr_edit",
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
-      "source_color": "red",
-      "target_color": "blue",
-      "edge_strength": 0.7,
+      "latent_top_k": 0,
+      "latent_alpha": 1.0,
       "seed": 40
     },
     {
