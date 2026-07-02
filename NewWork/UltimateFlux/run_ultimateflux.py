@@ -50,7 +50,9 @@ _REPO_ROOT = os.path.normpath(
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from NewWork.UltimateFlux.sampler import load_pipeline, generate_dual_branch, TIER_A, TIER_B
+from NewWork.UltimateFlux.sampler import (
+    load_pipeline, generate_dual_branch, generate_p2p, TIER_A, TIER_B, N_DOUBLE,
+)
 from NewWork.UltimateFlux.policies import (
     NonRigidPolicy,
     ObjectAdditionPolicy,
@@ -106,11 +108,7 @@ def build_policy(cfg: dict):
     if task == "attr_edit":
         inject_layers_raw = cfg.get("inject_layers", None)
         if inject_layers_raw in ("color", "colour"):
-            # Double-stream-only K+V: locks semantic identity in the 19 joint
-            # text-image blocks; the 38 single-stream blocks remain free so the
-            # edit-prompt colour ("blonde hair", "blue car") can render there.
-            from NewWork.UltimateFlux.sampler import N_DOUBLE as _ND
-            inject_layers = list(range(_ND))
+            return None  # colour mode uses generate_p2p — no dual-branch policy needed
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
         else:
@@ -156,19 +154,38 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  source_prompt: {source_prompt}")
     print(f"  edit_prompt:   {edit_prompt}")
 
-    src_img, edit_img = generate_dual_branch(
-        pipe=pipe,
-        policy=policy,
-        source_prompt=source_prompt,
-        edit_prompt=edit_prompt,
-        seed=seed,
-        num_steps=num_steps,
-        guidance_scale=guidance,
-        height=height,
-        width=width,
-        max_sequence_length=max_seq_len,
-        device=device,
-    )
+    if policy is None:
+        # Colour / texture change: Prompt-to-Prompt two-pass approach.
+        # Pass 1 → image_a (source_prompt + seed), recording K,V at all double-stream layers.
+        # Pass 2 → edit image (edit_prompt + same z_T), injecting stored K,V.
+        # Single-stream blocks (19-56) are free → edit text drives colour there.
+        src_img, edit_img = generate_p2p(
+            pipe=pipe,
+            source_prompt=source_prompt,
+            edit_prompt=edit_prompt,
+            inject_layers=list(range(N_DOUBLE)),
+            seed=seed,
+            num_steps=num_steps,
+            guidance_scale=guidance,
+            height=height,
+            width=width,
+            max_sequence_length=max_seq_len,
+            device=device,
+        )
+    else:
+        src_img, edit_img = generate_dual_branch(
+            pipe=pipe,
+            policy=policy,
+            source_prompt=source_prompt,
+            edit_prompt=edit_prompt,
+            seed=seed,
+            num_steps=num_steps,
+            guidance_scale=guidance,
+            height=height,
+            width=width,
+            max_sequence_length=max_seq_len,
+            device=device,
+        )
 
     if save_images:
         run_dir = os.path.join(out_dir, name)

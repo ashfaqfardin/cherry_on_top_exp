@@ -294,3 +294,124 @@ def generate_dual_branch(
     src_img  = result.images[0]
     edit_img = policy.post_process(src_img, result.images[1])
     return src_img, edit_img
+
+
+# ──────────────────── Prompt-to-Prompt two-pass editing ───────────────────────
+
+class _KVRecordPolicy(BasePolicy):
+    """Pass-1 helper: records image-token K,V at target layers, no injection."""
+
+    def __init__(self, record_layers: List[int], max_seq_len: int = 512):
+        self._layers = set(record_layers)
+        self._max_seq_len = max_seq_len
+        self.stored: Dict[tuple, tuple] = {}  # (step, layer) → (k, v, offset)
+
+    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
+        if layer in self._layers:
+            offset = txt_len if txt_len > 0 else self._max_seq_len
+            self.stored[(step, layer)] = (
+                k[:, :, offset:, :].detach().clone(),
+                v[:, :, offset:, :].detach().clone(),
+                offset,
+            )
+        return q, k, v
+
+
+class _KVInjectPolicy(BasePolicy):
+    """Pass-2 helper: replaces K,V at target layers from a pre-recorded store."""
+
+    def __init__(self, stored: Dict[tuple, tuple], max_seq_len: int = 512):
+        self._stored = stored
+        self._max_seq_len = max_seq_len
+
+    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
+        entry = self._stored.get((step, layer))
+        if entry is None:
+            return q, k, v
+        stored_k, stored_v, stored_offset = entry
+        offset = txt_len if txt_len > 0 else self._max_seq_len
+        k = k.clone()
+        v = v.clone()
+        k[:, :, offset:, :] = stored_k
+        v[:, :, offset:, :] = stored_v
+        return q, k, v
+
+
+@torch.no_grad()
+def generate_p2p(
+    pipe: FluxPipeline,
+    source_prompt: str,
+    edit_prompt: str,
+    inject_layers: List[int],
+    seed: int = 0,
+    num_steps: int = 28,
+    guidance_scale: float = 3.5,
+    height: int = 1024,
+    width: int = 1024,
+    max_sequence_length: int = 512,
+    device: str = "cuda",
+) -> Tuple[Image.Image, Image.Image]:
+    """
+    Prompt-to-Prompt two-pass editing for colour / texture changes.
+
+    Pass 1 — source pass (source_prompt, seed → image_a):
+        Run standard FLUX generation, recording K,V at inject_layers at every step.
+
+    Pass 2 — edit pass (edit_prompt, same starting noise):
+        Regenerate from the identical z_T with the edit prompt.
+        At every (step, layer) in inject_layers, the stored K,V from pass 1 are
+        injected, anchoring spatial structure and identity.  Layers NOT in
+        inject_layers respond freely to the edit prompt — colour information encoded
+        by the text ("blue car", "blonde hair") can emerge there.
+
+    inject_layers = list(range(N_DOUBLE)) (all 19 double-stream blocks) is the
+    recommended choice for colour changes:
+        - Double-stream blocks anchor semantic identity (who, what, composition).
+        - 38 single-stream blocks are free → edit text drives colour there.
+
+    Returns (src_img, edit_img).
+    """
+    exec_device = getattr(pipe, '_execution_device', device)
+    num_ch = pipe.transformer.config.in_channels // 4
+    lat_h  = height // 8
+    lat_w  = width  // 8
+
+    _g  = torch.Generator(device=exec_device).manual_seed(seed)
+    _one = randn_tensor(
+        (1, num_ch, lat_h, lat_w),
+        generator=_g, device=exec_device, dtype=torch.bfloat16,
+    )
+    latent = (
+        _one.view(1, num_ch, lat_h // 2, 2, lat_w // 2, 2)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4)
+    )
+
+    def _run_single(prompt: str, policy: BasePolicy) -> Image.Image:
+        proc = UltimateFluxAttnProcessor(
+            policy=policy, total_layers=N_LAYERS, total_steps=num_steps
+        )
+        proc.reset()
+        pipe.transformer.set_attn_processor(proc)
+        return pipe(
+            prompt=prompt,
+            latents=latent.clone(),
+            num_inference_steps=num_steps,
+            guidance_scale=guidance_scale,
+            height=height,
+            width=width,
+            max_sequence_length=max_sequence_length,
+            output_type="pil",
+        ).images[0]
+
+    # Pass 1 — generate image_a and record attention K,V
+    print("[UltimateFlux P2P] Pass 1: generating source image (image_a)…")
+    rec = _KVRecordPolicy(inject_layers, max_sequence_length)
+    src_img = _run_single(source_prompt, rec)
+
+    # Pass 2 — edit from same noise, injecting stored K,V
+    print("[UltimateFlux P2P] Pass 2: applying edit prompt with K,V structure injection…")
+    inj = _KVInjectPolicy(rec.stored, max_sequence_length)
+    edit_img = _run_single(edit_prompt, inj)
+
+    return src_img, edit_img
