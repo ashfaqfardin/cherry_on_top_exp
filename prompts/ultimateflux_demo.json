@@ -1,0 +1,182 @@
+{
+  "comment": "UltimateFlux demo runs covering all 5 implemented tasks on FLUX.1-schnell. Layer tiers are empirically derived (§5-6 of Pipeline_Plan.md). Hyperparameters are starting hypotheses — schnell-specific validation needed.",
+
+  "global": {
+    "model_path": "black-forest-labs/FLUX.1-schnell",
+    "num_steps": 4,
+    "guidance_scale": 0.0,
+    "height": 1024,
+    "width": 1024,
+    "max_sequence_length": 256,
+    "seed": 42
+  },
+
+  "runs": [
+
+    {
+      "comment": "── Task 1: Non-rigid editing ──────────────────────────────────────────",
+      "name": "bird_perch_to_fly",
+      "task": "non_rigid",
+      "source_prompt": "a bird perched on a branch",
+      "edit_prompt":   "a bird flying away from the branch",
+      "inject_steps_frac": [0.0, 0.8]
+    },
+    {
+      "name": "cat_sit_to_lie",
+      "task": "non_rigid",
+      "source_prompt": "a cat sitting on a wooden floor",
+      "edit_prompt":   "a cat lying down on a wooden floor",
+      "inject_steps_frac": [0.0, 0.8]
+    },
+    {
+      "name": "dog_standing_to_jumping",
+      "task": "non_rigid",
+      "source_prompt": "a golden retriever standing in a park",
+      "edit_prompt":   "a golden retriever jumping in a park",
+      "inject_steps_frac": [0.0, 0.75],
+      "seed": 7
+    },
+
+    {
+      "comment": "── Task 2: Object addition ────────────────────────────────────────────",
+      "name": "table_add_vase",
+      "task": "object_add",
+      "source_prompt": "a wooden dining table in a bright room",
+      "edit_prompt":   "a wooden dining table with a vase of flowers in a bright room",
+      "inject_steps_frac": [0.0, 0.75],
+      "seed": 50
+    },
+    {
+      "name": "park_bench_add_dog",
+      "task": "object_add",
+      "source_prompt": "a park bench surrounded by trees",
+      "edit_prompt":   "a park bench with a dog sitting next to it surrounded by trees",
+      "inject_steps_frac": [0.0, 0.75],
+      "seed": 55
+    },
+
+    {
+      "comment": "── Task 3: Object replacement ─────────────────────────────────────────",
+      "name": "apple_to_orange",
+      "task": "object_replace",
+      "source_prompt": "a red apple on a wooden table",
+      "edit_prompt":   "an orange on a wooden table",
+      "inject_steps_frac": [0.0, 0.9],
+      "seed": 10
+    },
+    {
+      "name": "wooden_chair_to_metal",
+      "task": "object_replace",
+      "source_prompt": "a wooden chair in a bright room",
+      "edit_prompt":   "a metal chair in a bright room",
+      "inject_steps_frac": [0.0, 0.9],
+      "seed": 15
+    },
+
+    {
+      "comment": "── Task 4: Background replacement ─────────────────────────────────────",
+      "name": "cat_forest_to_beach",
+      "task": "bg_replace",
+      "source_prompt": "a cat sitting in a forest",
+      "edit_prompt":   "a cat sitting on a sunny beach",
+      "seed": 20
+    },
+    {
+      "name": "dog_park_to_city",
+      "task": "bg_replace",
+      "source_prompt": "a dog standing in a park",
+      "edit_prompt":   "a dog standing on a city street",
+      "seed": 25
+    },
+
+    {
+      "comment": "── Task 5: Fine-grained attribute editing ──────────────────────────────",
+      "name": "man_add_glasses",
+      "task": "attr_edit",
+      "source_prompt": "a portrait photo of a man",
+      "edit_prompt":   "a portrait photo of a man wearing eyeglasses",
+      "edit_scale": 5.0,
+      "inject_steps_frac": [0.0, 1.0],
+      "seed": 30
+    },
+    {
+      "name": "woman_hair_color",
+      "task": "attr_edit",
+      "source_prompt": "a woman with brown hair",
+      "edit_prompt":   "a woman with blonde hair",
+      "edit_scale": 4.0,
+      "inject_steps_frac": [0.0, 0.8],
+      "seed": 35
+    },
+    {
+      "name": "car_color_change",
+      "task": "attr_edit",
+      "source_prompt": "a red sports car on a road",
+      "edit_prompt":   "a blue sports car on a road",
+      "edit_scale": 4.5,
+      "inject_steps_frac": [0.0, 0.9],
+      "seed": 40
+    },
+    {
+      "name": "dog_breed_shape",
+      "task": "attr_edit",
+      "source_prompt": "a labrador sitting on grass",
+      "edit_prompt":   "a husky sitting on grass",
+      "edit_scale": 6.0,
+      "inject_layers": "tier_b",
+      "inject_steps_frac": [0.0, 0.9],
+      "seed": 45
+    },
+
+    {
+      "comment": "── Task 7: Style personalization ───────────────────────────────────────",
+      "name": "cat_watercolor",
+      "task": "style",
+      "prompt": "A cat, watercolor painting",
+      "style_image": "inputs/watercolor_ref.png",
+      "pfb_alpha": 1.0,
+      "seed": 42
+    },
+    {
+      "name": "flower_watercolor",
+      "task": "style",
+      "prompt": "A flower, watercolor painting",
+      "style_image": "inputs/watercolor_ref.png",
+      "pfb_alpha": 1.0,
+      "seed": 42
+    },
+    {
+      "name": "castle_oilpainting",
+      "task": "style",
+      "prompt": "A castle, oil painting",
+      "style_image": "inputs/oilpainting_ref.jpg",
+      "pfb_alpha": 1.0,
+      "seed": 42
+    },
+    {
+      "name": "robot_3d",
+      "task": "style",
+      "prompt": "A robot, 3D render",
+      "style_image": "inputs/cartoon3d_ref.png",
+      "pfb_alpha": 1.0,
+      "seed": 42
+    },
+    {
+      "name": "fox_cartoon",
+      "task": "style",
+      "prompt": "A fox, cartoon illustration",
+      "style_image": "inputs/cartoon3d_ref.png",
+      "pfb_alpha": 1.0,
+      "seed": 42
+    },
+    {
+      "name": "cat_crayon_drawing",
+      "task": "style",
+      "prompt": "A cat, kid crayon drawing",
+      "style_image": "inputs/drawing_ref.png",
+      "pfb_alpha": 1.0,
+      "seed": 42
+    }
+
+  ]
+}
