@@ -364,31 +364,39 @@ class _KVInjectPolicy(BasePolicy):
         return q, k, v
 
 
-def _freq_blend_latent(
+def _color_transfer_latent(
     src_latent: torch.Tensor,
     edit_latent: torch.Tensor,
     lat_h: int,
     lat_w: int,
-    sigma_frac: float = 0.08,
+    sigma_frac: float = 0.15,
 ) -> torch.Tensor:
     """
-    Frequency-domain blending in FLUX latent space.
+    Local color transfer in FLUX latent space.
 
-    Operates on packed latents (1, (lat_h//2)*(lat_w//2), num_ch*4).
-    Unpacks to (1, num_ch, lat_h, lat_w), blends each of the 16 channels
-    in the 2-D DFT domain, then repacks.
+    Removes the old color from the source and blends the new color with the
+    source's structural residual.  Per channel:
 
-    Low-freq from edit  → carries the new colour (large-area patches).
-    High-freq from source → preserves spatial structure (edges, license plates,
-                            facial topology, fine texture).
+        local_mean_src  = Gaussian-smoothed source latent  (source "color field")
+        local_mean_edit = Gaussian-smoothed edit latent    (edit "color field")
+        src_structure   = src  - local_mean_src            (color-removed structural residual)
+        edit_structure  = edit - local_mean_edit
 
-    sigma_frac is the Gaussian σ as a fraction of min(lat_h, lat_w).
-    Because sigma_frac scales with image size (pixel σ = latent σ × 8),
-    the same value (e.g. 0.08) works identically in pixel and latent space.
+        result = local_mean_edit
+               + src_structure × clip(local_std_edit / local_std_src, 0.1, 10)
 
-        0.03 → almost all from source; colour barely changes
-        0.08 → body colour from edit, fine detail from source  ← default
-        0.15 → more colour, less structural detail preserved
+    The variance rescaling re-expresses the source's structural contrast at the
+    edit's local contrast level.  This is what kills bleeding: a red car edge has
+    high amplitude in the source residual; after scaling it down to match the blue
+    car's (typically lower) local std, the old-color amplitude disappears and the
+    edge is expressed purely through the edit's color field.
+
+    sigma_frac: Gaussian σ as a fraction of min(lat_h, lat_w).
+        0.10 → fine-grained local color estimation
+        0.15 → balanced (default)
+        0.25 → coarse / global color estimation
+
+    Operates on packed FLUX latents: (1, (lat_h//2)*(lat_w//2), num_ch*4).
     """
     num_ch = src_latent.shape[-1] // 4   # 16 for FLUX
 
@@ -408,18 +416,33 @@ def _freq_blend_latent(
     H, W = lat_h, lat_w
     sigma = min(H, W) * sigma_frac
     cy, cx = H / 2.0, W / 2.0
-    Y, X  = np.mgrid[:H, :W].astype(np.float32)
-    low_mask  = np.exp(-0.5 * ((Y - cy) ** 2 + (X - cx) ** 2) / (sigma ** 2))
-    high_mask = 1.0 - low_mask
+    Y, X   = np.mgrid[:H, :W].astype(np.float32)
+    low_mask = np.exp(-0.5 * ((Y - cy) ** 2 + (X - cx) ** 2) / (sigma ** 2))
 
+    def _smooth(x: np.ndarray) -> np.ndarray:
+        """Gaussian low-pass via FFT — same mask for every channel."""
+        return np.fft.ifft2(
+            np.fft.ifftshift(np.fft.fftshift(np.fft.fft2(x)) * low_mask)
+        ).real
+
+    eps = 1e-4
     out = np.empty_like(src_np)
     for c in range(num_ch):
-        src_f  = np.fft.fftshift(np.fft.fft2(src_np[0, c]))
-        edit_f = np.fft.fftshift(np.fft.fft2(edit_np[0, c]))
-        # No clip: latent values are unbounded, unlike pixel [0,1]
-        out[0, c] = np.fft.ifft2(np.fft.ifftshift(
-            low_mask * edit_f + high_mask * src_f
-        )).real
+        src_ch  = src_np[0, c]
+        edit_ch = edit_np[0, c]
+
+        src_mean  = _smooth(src_ch)
+        edit_mean = _smooth(edit_ch)
+
+        src_struct  = src_ch  - src_mean   # color-removed structural residual
+        edit_struct = edit_ch - edit_mean
+
+        # Local std: smooth the squared residuals, then sqrt
+        src_std  = np.sqrt(np.maximum(_smooth(src_struct  ** 2), 0.0)) + eps
+        edit_std = np.sqrt(np.maximum(_smooth(edit_struct ** 2), 0.0)) + eps
+
+        # Recolor: edit's local color field + source structure at edit's contrast
+        out[0, c] = edit_mean + src_struct * np.clip(edit_std / src_std, 0.1, 10.0)
 
     return _pack(
         torch.from_numpy(out).to(dtype=src_latent.dtype, device=src_latent.device)
@@ -521,13 +544,13 @@ def generate_p2p(
     )
     edit_latent = _run_single(edit_prompt, inj)
 
-    # Frequency-domain blend in latent space:
-    # low-freq from edit (new colour) + high-freq from source (structure, edges).
-    # Operates on 16-channel 128×128 latents — no intermediate pixel decode.
+    # Local color transfer in latent space:
+    # Removes old color from source, blends edit's color with source's structure.
+    # Variance rescaling kills old-color bleeding at edges.
     if freq_sigma > 0.0:
-        print(f"[UltimateFlux P2P] Latent frequency blend: σ_frac={freq_sigma} "
-              f"(low-freq=edit colour, high-freq=source structure)…")
-        edit_latent = _freq_blend_latent(
+        print(f"[UltimateFlux P2P] Latent color transfer: σ_frac={freq_sigma} "
+              f"(remove source color, recolor with edit statistics)…")
+        edit_latent = _color_transfer_latent(
             src_latent, edit_latent, lat_h, lat_w, sigma_frac=freq_sigma
         )
 
