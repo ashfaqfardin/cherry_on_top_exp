@@ -364,47 +364,66 @@ class _KVInjectPolicy(BasePolicy):
         return q, k, v
 
 
-def _freq_blend(
-    src_img: Image.Image,
-    edit_img: Image.Image,
+def _freq_blend_latent(
+    src_latent: torch.Tensor,
+    edit_latent: torch.Tensor,
+    lat_h: int,
+    lat_w: int,
     sigma_frac: float = 0.08,
-) -> Image.Image:
+) -> torch.Tensor:
     """
-    Frequency-domain blending: low-freq from edit (new colour), high-freq from source
-    (edges, fine structure, license plates, facial topology).
+    Frequency-domain blending in FLUX latent space.
 
-    A Gaussian mask in the 2-D DFT domain provides a smooth, artifact-free
-    transition between the two frequency bands.  sigma_frac is the Gaussian σ
-    expressed as a fraction of min(H, W):
+    Operates on packed latents (1, (lat_h//2)*(lat_w//2), num_ch*4).
+    Unpacks to (1, num_ch, lat_h, lat_w), blends each of the 16 channels
+    in the 2-D DFT domain, then repacks.
 
-        small sigma (0.03) → nearly all from source; colour barely changes
-        medium sigma (0.08) → body colour from edit, fine detail from source  ← default
-        large sigma (0.15) → more colour, less structural detail preserved
+    Low-freq from edit  → carries the new colour (large-area patches).
+    High-freq from source → preserves spatial structure (edges, license plates,
+                            facial topology, fine texture).
 
-    For colour editing (red car → blue, black hair → blonde) 0.06–0.10 is the
-    effective range: it captures the large-area colour patches from the edit image
-    while recovering edges, text, and face geometry from the source.
+    sigma_frac is the Gaussian σ as a fraction of min(lat_h, lat_w).
+    Because sigma_frac scales with image size (pixel σ = latent σ × 8),
+    the same value (e.g. 0.08) works identically in pixel and latent space.
+
+        0.03 → almost all from source; colour barely changes
+        0.08 → body colour from edit, fine detail from source  ← default
+        0.15 → more colour, less structural detail preserved
     """
-    src  = np.array(src_img.convert("RGB")).astype(np.float32) / 255.0
-    edit = np.array(edit_img.convert("RGB").resize(src_img.size, Image.LANCZOS)).astype(np.float32) / 255.0
-    H, W, _ = src.shape
+    num_ch = src_latent.shape[-1] // 4   # 16 for FLUX
+
+    def _unpack(x):
+        return (x.reshape(1, lat_h // 2, lat_w // 2, num_ch, 2, 2)
+                  .permute(0, 3, 1, 4, 2, 5)
+                  .reshape(1, num_ch, lat_h, lat_w))
+
+    def _pack(x):
+        return (x.view(1, num_ch, lat_h // 2, 2, lat_w // 2, 2)
+                  .permute(0, 2, 4, 1, 3, 5)
+                  .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4))
+
+    src_np  = _unpack(src_latent).float().cpu().numpy()    # (1, 16, lat_h, lat_w)
+    edit_np = _unpack(edit_latent).float().cpu().numpy()
+
+    H, W = lat_h, lat_w
     sigma = min(H, W) * sigma_frac
-
-    # Pre-compute Gaussian low-pass mask (centred at DC after fftshift)
     cy, cx = H / 2.0, W / 2.0
-    Y, X   = np.mgrid[:H, :W].astype(np.float32)
-    dist2  = (Y - cy) ** 2 + (X - cx) ** 2
-    low_mask  = np.exp(-0.5 * dist2 / (sigma ** 2))   # peaks at 1 (DC), falls off
+    Y, X  = np.mgrid[:H, :W].astype(np.float32)
+    low_mask  = np.exp(-0.5 * ((Y - cy) ** 2 + (X - cx) ** 2) / (sigma ** 2))
     high_mask = 1.0 - low_mask
 
-    out = np.empty_like(src)
-    for c in range(3):
-        src_f  = np.fft.fftshift(np.fft.fft2(src[:, :, c]))
-        edit_f = np.fft.fftshift(np.fft.fft2(edit[:, :, c]))
-        blended = low_mask * edit_f + high_mask * src_f   # colour from edit, detail from src
-        out[:, :, c] = np.clip(np.fft.ifft2(np.fft.ifftshift(blended)).real, 0.0, 1.0)
+    out = np.empty_like(src_np)
+    for c in range(num_ch):
+        src_f  = np.fft.fftshift(np.fft.fft2(src_np[0, c]))
+        edit_f = np.fft.fftshift(np.fft.fft2(edit_np[0, c]))
+        # No clip: latent values are unbounded, unlike pixel [0,1]
+        out[0, c] = np.fft.ifft2(np.fft.ifftshift(
+            low_mask * edit_f + high_mask * src_f
+        )).real
 
-    return Image.fromarray((out * 255).astype(np.uint8))
+    return _pack(
+        torch.from_numpy(out).to(dtype=src_latent.dtype, device=src_latent.device)
+    )
 
 
 @torch.no_grad()
@@ -461,7 +480,8 @@ def generate_p2p(
             .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4)
     )
 
-    def _run_single(prompt: str, policy: BasePolicy) -> Image.Image:
+    def _run_single(prompt: str, policy: BasePolicy) -> torch.Tensor:
+        """Returns denoised packed latent (1, seq_len, C) — no decoding yet."""
         proc = UltimateFluxAttnProcessor(
             policy=policy, total_layers=N_LAYERS, total_steps=num_steps
         )
@@ -475,13 +495,20 @@ def generate_p2p(
             height=height,
             width=width,
             max_sequence_length=max_sequence_length,
-            output_type="pil",
-        ).images[0]
+            output_type="latent",
+        ).images  # tensor (1, seq_len, C) when output_type="latent"
 
-    # Pass 1 — generate image_a and record attention K,V
-    print("[UltimateFlux P2P] Pass 1: generating source image (image_a)…")
+    def _decode(packed: torch.Tensor) -> Image.Image:
+        """Unpack, unscale, VAE-decode packed FLUX latent to PIL."""
+        lat = pipe._unpack_latents(packed, height, width, pipe.vae_scale_factor)
+        lat = (lat / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+        img = pipe.vae.decode(lat, return_dict=False)[0]
+        return pipe.image_processor.postprocess(img, output_type="pil")[0]
+
+    # Pass 1 — generate source latent and record attention K,V
+    print("[UltimateFlux P2P] Pass 1: generating source latent…")
     rec = _KVRecordPolicy(inject_layers, max_sequence_length)
-    src_img = _run_single(source_prompt, rec)
+    src_latent = _run_single(source_prompt, rec)
 
     # Pass 2 — two-phase injection: K+V to align (phase 1), K-only for colour (phase 2)
     anchor_steps = int(anchor_end_frac * num_steps)
@@ -492,13 +519,18 @@ def generate_p2p(
         max_seq_len=max_sequence_length,
         anchor_end_frac=anchor_end_frac,
     )
-    edit_img = _run_single(edit_prompt, inj)
+    edit_latent = _run_single(edit_prompt, inj)
 
-    # Frequency-domain identity restoration:
-    # low-freq from edit (new colour) + high-freq from source (edges, fine structure).
+    # Frequency-domain blend in latent space:
+    # low-freq from edit (new colour) + high-freq from source (structure, edges).
+    # Operates on 16-channel 128×128 latents — no intermediate pixel decode.
     if freq_sigma > 0.0:
-        print(f"[UltimateFlux P2P] Frequency blending: σ={freq_sigma} "
+        print(f"[UltimateFlux P2P] Latent frequency blend: σ_frac={freq_sigma} "
               f"(low-freq=edit colour, high-freq=source structure)…")
-        edit_img = _freq_blend(src_img, edit_img, sigma_frac=freq_sigma)
+        edit_latent = _freq_blend_latent(
+            src_latent, edit_latent, lat_h, lat_w, sigma_frac=freq_sigma
+        )
 
+    src_img  = _decode(src_latent)
+    edit_img = _decode(edit_latent)
     return src_img, edit_img
