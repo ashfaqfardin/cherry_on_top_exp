@@ -105,15 +105,20 @@ def build_policy(cfg: dict):
 
     if task == "attr_edit":
         _HOTSPOT = [1, 2, 4, 26, 30, 54, 55]
-        inject_layers = cfg.get("inject_layers", None)
-        if inject_layers == "hotspot":
-            inject_layers = _HOTSPOT        # colour/texture change: structure only
-        elif inject_layers == "tier_a":
-            inject_layers = TIER_A          # breed/shape change: appearance lock
-        elif inject_layers is not None:
-            inject_layers = None            # unrecognised → default _PRESERVE_LAYERS
+        inject_layers_raw = cfg.get("inject_layers", None)
+        qk_only = False
+        if inject_layers_raw == "hotspot":
+            inject_layers = _HOTSPOT        # Q+K only — colour/texture change
+            qk_only = True
+        elif inject_layers_raw == "tier_a":
+            inject_layers = TIER_A          # K+V — breed/shape change
+        elif inject_layers_raw is None:
+            inject_layers = None            # default → _PRESERVE_LAYERS, K+V
+        else:
+            inject_layers = None
         return FineGrainedAttrPolicy(
             inject_layers=inject_layers,
+            qk_only=qk_only,
             inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
         )
 

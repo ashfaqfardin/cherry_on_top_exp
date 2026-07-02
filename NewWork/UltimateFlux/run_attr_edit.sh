@@ -40,7 +40,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task attr_edit \
     --name woman_hair_color \
-    --source_prompt "a woman with brown hair" \
+    --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers hotspot \
     --seed 35

@@ -719,28 +719,38 @@ class BackgroundReplacePolicy(BasePolicy):
 
 class FineGrainedAttrPolicy(BasePolicy):
     """
-    Identity-preserving attribute editing.
+    Identity-preserving attribute editing.  Three modes via inject_layers:
 
-    Injects K,V from source at _PRESERVE_LAYERS (TIER_A ∪ HOTSPOT_LAYERS, 20
-    layers) to lock the subject's appearance and spatial layout.  The attribute
-    change (glasses, hair colour, …) emerges in the remaining 37 free layers,
-    driven purely by the edit-prompt text conditioning.
+    None (default) → _PRESERVE_LAYERS (TIER_A ∪ HOTSPOT, 20 layers), K+V injection.
+        Tightest identity lock — use for ADDING an attribute (glasses, hat, beard).
+        K+V from source freezes both the subject's appearance AND spatial layout.
 
-    inject_layers override:
-      - None (default) → _PRESERVE_LAYERS: tightest lock, for subtle adds
-        (glasses, colour shift, accessory)
-      - TIER_A: looser lock, for edits that also affect shape (breed change)
+    TIER_A (13 layers), K+V injection.
+        Appearance locked, position flexible — use for SHAPE/BREED changes where
+        the subject's texture should carry over but structure can shift.
+
+    HOTSPOT (7 layers), Q+K injection only (no V).
+        Spatial attention PATTERN preserved without injecting appearance values.
+        V stays from the edit branch → colour and texture change freely.
+        Use for COLOUR / TEXTURE edits (hair colour, car colour, material swap).
+
+    The Q+K-only approach is adapted from FreeFlux's SAC (Structural Attention
+    Correction): copying Q and K across branches aligns the attention matrix
+    (Q·Kᵀ) so the edit branch attends to the same spatial positions as the source,
+    preserving composition without locking down what those positions look like.
     """
     _PRESERVE_LAYERS = sorted(set(TIER_A) | {1, 2, 4, 26, 30, 54, 55})  # 20 layers
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
+        qk_only: bool = False,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
         self._inject_layers = (
             inject_layers if inject_layers is not None else self._PRESERVE_LAYERS
         )
+        self._qk_only = qk_only   # True → Q+K only (colour change); False → K+V (appearance lock)
         self.inject_steps_frac = inject_steps_frac
         self._txt_len_single = 512
 
@@ -754,8 +764,22 @@ class FineGrainedAttrPolicy(BasePolicy):
             return q, k, v
 
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-        k, v = _kv_full_inject(k, v, img_offset)
-        return q, k, v
+
+        if self._qk_only:
+            # Q+K injection (SAC-style): aligns spatial attention pattern from
+            # source so composition is preserved, but V stays from the edit branch
+            # (conditioned on the new colour/material) → colour changes freely.
+            q_src, q_edit = q.chunk(2)
+            k_src, k_edit = k.chunk(2)
+            q_new = q_edit.clone()
+            k_new = k_edit.clone()
+            q_new[:, :, img_offset:, :] = q_src[:, :, img_offset:, :]
+            k_new[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
+            return torch.cat([q_src, q_new]), torch.cat([k_src, k_new]), v
+        else:
+            # Full K+V injection: freezes both appearance and layout.
+            k, v = _kv_full_inject(k, v, img_offset)
+            return q, k, v
 
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────
