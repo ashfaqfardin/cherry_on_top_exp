@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # Task 5 — Fine-grained attribute editing
 #
-# inject_layers controls how strongly the source is preserved:
-#   (default / omit)      → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
-#                            Tightest identity lock — for ADDING an attribute
-#                            (glasses, hat, beard).
-#   --inject_layers color → img2img colour edit: generates source first, then
-#                            FluxImg2ImgPipeline from source with edit prompt.
-#                            No attention injection needed — starting latent
-#                            carries structure; edit prompt drives colour cleanly.
-#                            Tune img2img_strength in JSON (default 0.6):
-#                            0.4=subtle/strong-identity, 0.6=balanced, 0.8=strong.
+# inject_layers controls the editing mode:
+#   (default / omit)        → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
+#                              Tightest identity lock — for ADDING an attribute
+#                              (glasses, hat, beard).
+#   --inject_layers color   → CV colour replace: FLUX generates source once;
+#                              _cv_color_replace rewrites colour in pixel space
+#                              via HSV segmentation + Sobel edge mask.
+#                              Requires --source_color and --target_color.
+#                              Tune --edge_strength (0=no lock, 0.7=default).
 #   --inject_layers tier_a  → TIER_A only (13 layers)
-#                            Appearance preserved, position flexible —
-#                            for shape-linked edits (breed change).
+#                              Appearance preserved, position flexible —
+#                              for shape-linked edits (breed change).
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -25,7 +24,7 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Change colour / texture (hotspot only — frees appearance) ─────────────────
+# ── Change colour (CV: HSV segmentation + Sobel edge preservation) ─────────────
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -35,6 +34,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
+    --source_color black --target_color blonde \
+    --edge_strength 0.7 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -46,6 +47,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
+    --source_color red --target_color blue \
+    --edge_strength 0.7 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────

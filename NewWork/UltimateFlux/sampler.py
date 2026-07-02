@@ -14,6 +14,7 @@ Layer index convention (combined 0-based across all 57 blocks):
 
 import os
 import sys
+import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import FluxPipeline
@@ -296,101 +297,159 @@ def generate_dual_branch(
     return src_img, edit_img
 
 
-# ──────────────────── Prompt-to-Prompt colour editing ─────────────────────────
+# ──────────────────── Classical-CV colour editing ─────────────────────────────
 
-class _KVRecordPolicy(BasePolicy):
-    """Pass-1: records K,V at target layers without modifying them."""
+def _rgb_to_hsv_np(rgb: np.ndarray) -> np.ndarray:
+    """Vectorised RGB [0,1] → HSV [0,1].  Input: (..., 3) float32."""
+    r, g, b  = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    maxc     = np.maximum(np.maximum(r, g), b)
+    minc     = np.minimum(np.minimum(r, g), b)
+    delta    = maxc - minc
+    v        = maxc
+    s        = np.where(maxc > 1e-7, delta / maxc, 0.0)
+    h        = np.zeros_like(r)
+    m_r      = (maxc == r) & (delta > 1e-7)
+    m_g      = (maxc == g) & (delta > 1e-7)
+    m_b      = (maxc == b) & (delta > 1e-7)
+    h        = np.where(m_r, ((g - b) / delta) % 6.0, h)
+    h        = np.where(m_g, (b - r) / delta + 2.0,   h)
+    h        = np.where(m_b, (r - g) / delta + 4.0,   h)
+    return np.stack([h / 6.0, s, v], axis=-1)
 
-    def __init__(self, record_layers: List[int], max_seq_len: int = 512):
-        self._layers = set(record_layers)
-        self._max_seq_len = max_seq_len
-        self.stored: Dict[tuple, tuple] = {}   # (step, layer) → (k, v)
 
-    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        if layer in self._layers:
-            offset = txt_len if txt_len > 0 else self._max_seq_len
-            self.stored[(step, layer)] = (
-                k[:, :, offset:, :].detach().clone(),
-                v[:, :, offset:, :].detach().clone(),
-            )
-        return q, k, v
+def _hsv_to_rgb_np(hsv: np.ndarray) -> np.ndarray:
+    """Vectorised HSV [0,1] → RGB [0,1].  Input: (..., 3) float32."""
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    h6 = (h % 1.0) * 6.0
+    i  = np.floor(h6).astype(np.int32) % 6
+    f  = h6 - np.floor(h6)
+    p  = v * (1.0 - s)
+    q  = v * (1.0 - f * s)
+    t  = v * (1.0 - (1.0 - f) * s)
+    r  = np.select([i==0, i==1, i==2, i==3, i==4, i==5], [v, q, p, p, t, v], 0.0)
+    g  = np.select([i==0, i==1, i==2, i==3, i==4, i==5], [t, v, v, q, p, p], 0.0)
+    b  = np.select([i==0, i==1, i==2, i==3, i==4, i==5], [p, p, t, v, v, q], 0.0)
+    return np.clip(np.stack([r, g, b], axis=-1), 0.0, 1.0)
 
 
-class _P2PColorPolicy(BasePolicy):
+def _sobel_edges(gray: np.ndarray) -> np.ndarray:
+    """Sobel magnitude, normalised [0, 1].  Input: (H, W) float32."""
+    gx = (-gray[:-2, :-2] + gray[:-2, 2:]
+          - 2 * gray[1:-1, :-2] + 2 * gray[1:-1, 2:]
+          - gray[2:,  :-2] + gray[2:,  2:])
+    gy = ( gray[2:,  :-2] + 2 * gray[2:,  1:-1] + gray[2:,  2:]
+          - gray[:-2, :-2] - 2 * gray[:-2, 1:-1] - gray[:-2, 2:])
+    mag      = np.sqrt(gx ** 2 + gy ** 2)
+    mag_full = np.pad(mag, ((1, 1), (1, 1)), mode="edge")
+    return mag_full / (mag_full.max() + 1e-8)
+
+
+# Colour vocabulary ─────────────────────────────────────────────────────────
+# Source masks: which pixels match this colour (h, s, v all ∈ [0, 1])
+_SRC_MASK: Dict[str, Callable] = {
+    "red":    lambda h, s, v: ((h < 0.05) | (h > 0.95)) & (s > 0.30) & (v > 0.15),
+    "orange": lambda h, s, v: (h > 0.04) & (h < 0.10)   & (s > 0.40) & (v > 0.20),
+    "yellow": lambda h, s, v: (h > 0.09) & (h < 0.17)   & (s > 0.35) & (v > 0.20),
+    "green":  lambda h, s, v: (h > 0.25) & (h < 0.45)   & (s > 0.25) & (v > 0.10),
+    "blue":   lambda h, s, v: (h > 0.55) & (h < 0.72)   & (s > 0.25) & (v > 0.10),
+    "purple": lambda h, s, v: (h > 0.72) & (h < 0.86)   & (s > 0.25) & (v > 0.10),
+    "cyan":   lambda h, s, v: (h > 0.45) & (h < 0.56)   & (s > 0.25) & (v > 0.10),
+    "black":  lambda h, s, v: v < 0.28,
+    "brown":  lambda h, s, v: (h > 0.03) & (h < 0.09)   & (s > 0.30) & (v < 0.55),
+    "blonde": lambda h, s, v: (h > 0.08) & (h < 0.17)   & (s > 0.25) & (v > 0.50),
+    "white":  lambda h, s, v: (v > 0.85) & (s < 0.20),
+    "gray":   lambda h, s, v: (s < 0.18) & (v > 0.20)   & (v < 0.85),
+}
+
+# Target HSV parameters: (target_h, s_scale, s_floor, v_scale, v_offset)
+#   target_h: new hue in [0, 1]
+#   s_scale : multiply source S (preserves saturation variation in the region)
+#   s_floor : minimum S to enforce (lifts achromatic sources like black hair)
+#   v_scale : multiply source V (brightens / darkens)
+#   v_offset: add after scaling   (ensures minimum brightness for dark→light)
+_TGT_HSV: Dict[str, tuple] = {
+    "red":    (0.00, 1.0, 0.65, 1.0, 0.00),
+    "orange": (0.07, 1.0, 0.65, 1.0, 0.00),
+    "yellow": (0.14, 1.0, 0.65, 1.0, 0.00),
+    "green":  (0.35, 1.0, 0.65, 1.0, 0.00),
+    "blue":   (0.63, 1.0, 0.65, 1.0, 0.00),
+    "purple": (0.78, 1.0, 0.65, 1.0, 0.00),
+    "cyan":   (0.50, 1.0, 0.65, 1.0, 0.00),
+    "black":  (0.00, 0.0, 0.00, 0.12, 0.00),
+    "brown":  (0.07, 0.8, 0.55, 2.0,  0.05),
+    "blonde": (0.11, 0.7, 0.50, 3.5,  0.18),  # dark→blonde: set hue, brighten
+    "white":  (0.00, 0.0, 0.00, 1.0,  0.85),
+    "gray":   (0.00, 0.0, 0.00, 1.0,  0.00),
+}
+
+
+def _cv_color_replace(
+    src_img: Image.Image,
+    source_color: str,
+    target_color: str,
+    edge_strength: float = 0.7,
+) -> Image.Image:
     """
-    P2P injection for colour editing: K-only at 20 layers, no V injection.
+    HSV colour replacement with Sobel edge preservation.
 
-    Layer set = TIER_A ∪ ALL_HOTSPOT (same as FineGrainedAttrPolicy._PRESERVE_LAYERS):
-        TIER_A∩DS  + HOTSPOT∩DS  = [0,1,2,4,7,8,9,10,18]       — 9 DS layers
-        TIER_A∩SS  + HOTSPOT∩SS  = [25,26,28,30,37,42,45,50,54,55,56] — 11 SS layers
+    Steps:
+    1. Convert source PIL image to HSV (numpy, no external deps).
+    2. Segment pixels matching *source_color* by HSV thresholding → mask.
+       License plates / face outlines are typically NOT the car / hair colour,
+       so they fall outside the mask and are untouched automatically.
+    3. Compute Sobel edge magnitude on grayscale source.  Strong edges (plate
+       text characters, face contours, fine structural borders) get high values.
+    4. Blend weight = mask × clamp(1 − edge_mag / edge_threshold, 0, 1).
+       → 1 in flat coloured regions  (full colour change)
+       → 0 at strong edges           (pixel taken from source, unchanged)
+    5. Build target HSV: shift H to new hue; apply s_scale + s_floor (so that
+       achromatic black hair gains saturation when going blonde); rescale V
+       (so dark hair brightens to blonde luminance while keeping shadow detail).
+    6. Lerp source and target RGB using the weight map → PIL image.
 
-    Two layer types (from FreeFlux RoPE analysis):
-        TIER_A  (low RoPE freq) = content-similarity layers → control appearance/texture
-        HOTSPOT (high RoPE freq) = position-dependent layers → control spatial LAYOUT
-
-    Why HOTSPOT∩SS {26,30,54,55} is critical for license plates:
-        License-plate text lives at SPECIFIC POSITIONS (position-dependent).
-        TIER_A∩SS alone (content-similarity) could not preserve it because plates
-        are a layout feature.  HOTSPOT∩SS layers encode where-in-space each token
-        attends → locking K there freezes the spatial grid of fine detail.
-
-    Why anchor_end_frac=0.0 (no V injection) eliminates "reddish blue":
-        Phase-1 K+V injects source V (red car) into the edit branch for several
-        steps, contaminating the hidden state with old colour.  The subsequent
-        K-only phase struggles to overwrite that red.  With anchor_end_frac=0.0
-        V is NEVER injected — only K is used — so no old colour enters the edit
-        branch.  Both branches start from the same z_T, so Q_edit ≈ Q_src at
-        step 0 already; 20-layer K injection keeps Q close enough over 28 steps.
-
-    anchor_end_frac (tune in JSON):
-        0.0  → K-only always; clean colour, slight identity risk  (default)
-        0.05 → 1 step K+V for minimal Q alignment boost; safer identity
-        0.15 → 4 steps K+V; strong identity, may show residual source colour
+    source_color / target_color: any key in _SRC_MASK / _TGT_HSV, e.g.
+        "red"/"blue", "black"/"blonde", "green"/"purple" …
+    edge_strength: [0, 1].  Higher = more pixels locked to source at edges.
+        0.0 → no edge suppression  |  0.7 → freeze Sobel > 0.3 (default)
     """
-    # 9 double-stream: TIER_A∩DS ∪ HOTSPOT∩DS
-    _DOUBLE_INJECT: List[int] = sorted(
-        {l for l in TIER_A if l < N_DOUBLE} | {1, 2, 4}
-    )
-    # 11 single-stream: TIER_A∩SS ∪ HOTSPOT∩SS — HOTSPOT∩SS = {26,30,54,55}
-    _SINGLE_INJECT: frozenset = frozenset(
-        {l for l in TIER_A if l >= N_DOUBLE} | {26, 30, 54, 55}
-    )
-    # 20 layers total — identical to FineGrainedAttrPolicy._PRESERVE_LAYERS
-    _RECORD_LAYERS: List[int] = sorted(set(TIER_A) | {1, 2, 4, 26, 30, 54, 55})
+    if source_color not in _SRC_MASK:
+        raise ValueError(
+            f"Unknown source_color '{source_color}'. "
+            f"Choose from: {sorted(_SRC_MASK)}"
+        )
+    if target_color not in _TGT_HSV:
+        raise ValueError(
+            f"Unknown target_color '{target_color}'. "
+            f"Choose from: {sorted(_TGT_HSV)}"
+        )
 
-    def __init__(
-        self,
-        stored: Dict[tuple, tuple],
-        max_seq_len: int = 512,
-        anchor_end_frac: float = 0.25,
-    ):
-        self._stored = stored
-        self._max_seq_len = max_seq_len
-        self._anchor = anchor_end_frac
-        self._double_set = frozenset(self._DOUBLE_INJECT)
+    src  = np.array(src_img.convert("RGB")).astype(np.float32) / 255.0   # (H,W,3)
+    hsv  = _rgb_to_hsv_np(src)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
-    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        is_double = layer in self._double_set
-        is_single = layer in self._SINGLE_INJECT
-        if not is_double and not is_single:
-            return q, k, v
+    # 1. Colour segmentation mask
+    mask = _SRC_MASK[source_color](h, s, v).astype(np.float32)           # (H,W)
 
-        entry = self._stored.get((step, layer))
-        if entry is None:
-            return q, k, v
-        stored_k, stored_v = entry
+    # 2. Sobel edge map — high values at structural boundaries in pixel space
+    gray     = 0.299 * src[..., 0] + 0.587 * src[..., 1] + 0.114 * src[..., 2]
+    edge_mag = _sobel_edges(gray)                                          # (H,W) ∈ [0,1]
 
-        offset = txt_len if txt_len > 0 else self._max_seq_len
-        k = k.clone()
-        k[:, :, offset:, :] = stored_k          # always: K locks WHERE to attend
+    # 3. Blend weight: edge_threshold = 1 − edge_strength
+    #    pixels with edge_mag > edge_threshold → alpha → 0 (lock to source)
+    edge_thr = max(1.0 - edge_strength, 0.02)
+    alpha    = mask * np.clip(1.0 - edge_mag / edge_thr, 0.0, 1.0)       # (H,W)
 
-        if is_double and step < int(self._anchor * n_steps):
-            # Phase 1 (double-stream only): K+V aligns edit branch to source
-            v = v.clone()
-            v[:, :, offset:, :] = stored_v
+    # 4. Build target HSV
+    tgt_h, s_scale, s_floor, v_scale, v_offset = _TGT_HSV[target_color]
+    new_h   = np.full_like(h, tgt_h)
+    new_s   = np.clip(np.maximum(s * s_scale, s_floor), 0.0, 1.0)
+    new_v   = np.clip(v * v_scale + v_offset, 0.0, 1.0)
+    new_rgb = _hsv_to_rgb_np(np.stack([new_h, new_s, new_v], axis=-1))   # (H,W,3)
 
-        # Phase 2 / single-stream: V from edit branch → carries new colour
-        return q, k, v
+    # 5. Blend source and target RGB
+    a3     = alpha[..., np.newaxis]
+    result = a3 * new_rgb + (1.0 - a3) * src
+    return Image.fromarray((np.clip(result, 0.0, 1.0) * 255.0).astype(np.uint8))
 
 
 @torch.no_grad()
@@ -398,7 +457,7 @@ def generate_p2p(
     pipe: FluxPipeline,
     source_prompt: str,
     edit_prompt: str,
-    inject_layers: List[int],          # ignored; kept for API compat
+    inject_layers: List[int],           # unused; kept for API compat
     seed: int = 0,
     num_steps: int = 28,
     guidance_scale: float = 3.5,
@@ -406,81 +465,55 @@ def generate_p2p(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
-    anchor_end_frac: float = 0.25,
-    freq_sigma: float = 0.0,           # ignored; kept for API compat
-    img2img_strength: float = 0.6,     # ignored; kept for API compat
+    anchor_end_frac: float = 0.0,       # unused; kept for API compat
+    freq_sigma: float = 0.0,            # unused; kept for API compat
+    img2img_strength: float = 0.6,      # unused; kept for API compat
+    source_color: str = "",
+    target_color: str = "",
+    edge_strength: float = 0.7,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Prompt-to-Prompt colour editing: same z_T, two-phase DS injection + SS K-lock.
+    Colour editing via single FLUX generation + classical-CV colour replacement.
 
-    Pass 1: generate source from source_prompt + seed, record K,V at 16 layers
-            (9 double-stream TIER_A+HOTSPOT + 7 single-stream TIER_A).
-    Pass 2: denoise from the same z_T with edit_prompt:
-        Double-stream (9 layers):
-            Phase 1 (steps 0 .. anchor_end_frac×n): K+V → Q_edit → Q_src
-            Phase 2 (remaining steps):               K-only → coarse identity
-        Single-stream (7 layers):
-            All steps: K-only → fine-detail structure locked (plates, faces)
-            V always from edit → colour flows through unimpeded
+    Pass 1 — FLUX generates the source image from *source_prompt* + *seed*.
+    Pass 2 — _cv_color_replace rewrites colour in pixel space (no second FLUX call):
+        • HSV segmentation: isolate pixels matching *source_color*
+          (license plates / face skin are typically NOT the edited colour
+          → outside the mask → untouched automatically)
+        • Hue / saturation shift to *target_color*, V (brightness) preserved
+          → structure and shadows intact; no colour bleeding
+        • Sobel edge mask: suppress change at strong gradients (plate text,
+          facial contours) → exact pixel-level structure preservation
+        • Blend: flat coloured regions → new colour | edges → source unchanged
 
-    anchor_end_frac
-        0.15 → more colour change | 0.25 → balanced (default) | 0.40 → more identity
+    source_color / target_color: colour name, e.g. "red"/"blue", "black"/"blonde"
+    edge_strength: 0 = no edge lock | 0.7 = freeze Sobel > 0.3 (default)
 
     Returns (src_img, edit_img).
     """
     exec_device = getattr(pipe, "_execution_device", device)
-    num_ch = pipe.transformer.config.in_channels // 4
-    lat_h  = height // 8
-    lat_w  = width  // 8
 
-    _g   = torch.Generator(device=exec_device).manual_seed(seed)
-    _one = randn_tensor(
-        (1, num_ch, lat_h, lat_w),
-        generator=_g, device=exec_device, dtype=torch.bfloat16,
-    )
-    latent = (
-        _one.view(1, num_ch, lat_h // 2, 2, lat_w // 2, 2)
-            .permute(0, 2, 4, 1, 3, 5)
-            .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4)
-    )
+    print("[UltimateFlux P2P] Pass 1: generating source image…")
+    src_img = pipe(
+        prompt=source_prompt,
+        num_inference_steps=num_steps,
+        guidance_scale=guidance_scale,
+        height=height,
+        width=width,
+        max_sequence_length=max_sequence_length,
+        generator=torch.Generator(device=exec_device).manual_seed(seed),
+        output_type="pil",
+    ).images[0]
 
-    def _run(prompt: str, policy: BasePolicy) -> Image.Image:
-        proc = UltimateFluxAttnProcessor(
-            policy=policy, total_layers=N_LAYERS, total_steps=num_steps
+    if source_color and target_color:
+        print(
+            f"[UltimateFlux P2P] Pass 2 (CV): "
+            f"{source_color!r} → {target_color!r}  "
+            f"edge_strength={edge_strength}"
         )
-        proc.reset()
-        pipe.transformer.set_attn_processor(proc)
-        return pipe(
-            prompt=prompt,
-            latents=latent.clone(),
-            num_inference_steps=num_steps,
-            guidance_scale=guidance_scale,
-            height=height,
-            width=width,
-            max_sequence_length=max_sequence_length,
-            output_type="pil",
-        ).images[0]
-
-    # Pass 1 — source image + record K,V at 16 layers (9 DS + 7 SS)
-    print("[UltimateFlux P2P] Pass 1: generating source, recording K,V at "
-          f"{len(_P2PColorPolicy._RECORD_LAYERS)} layers…")
-    rec = _KVRecordPolicy(_P2PColorPolicy._RECORD_LAYERS, max_sequence_length)
-    src_img = _run(source_prompt, rec)
-
-    # Pass 2 — colour edit: DS two-phase + SS K-only
-    anchor_steps = int(anchor_end_frac * num_steps)
-    n_ds = len(_P2PColorPolicy._DOUBLE_INJECT)
-    n_ss = len(_P2PColorPolicy._SINGLE_INJECT)
-    print(
-        f"[UltimateFlux P2P] Pass 2: "
-        f"DS 0-{anchor_steps-1} K+V | DS {anchor_steps}-{num_steps-1} K-only | "
-        f"SS all-steps K-only | ({n_ds} DS + {n_ss} SS layers)…"
-    )
-    inj = _P2PColorPolicy(
-        rec.stored,
-        max_seq_len=max_sequence_length,
-        anchor_end_frac=anchor_end_frac,
-    )
-    edit_img = _run(edit_prompt, inj)
+        edit_img = _cv_color_replace(src_img, source_color, target_color, edge_strength)
+    else:
+        print("[UltimateFlux P2P] No source_color/target_color — returning source unchanged.")
+        edit_img = src_img
 
     return src_img, edit_img

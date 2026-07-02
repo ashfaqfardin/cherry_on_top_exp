@@ -103,22 +103,27 @@
       "seed": 30
     },
     {
-      "comment": "P2P colour edit: K-only at 20 layers (TIER_A∪HOTSPOT, DS+SS). No V injection → no old-colour contamination → clean new colour. HOTSPOT∩SS {26,30,54,55} locks license-plate/face positions. anchor_end_frac: 0.0=K-only(default), 0.05=1-step Q-align, 0.15=stronger identity.",
+      "comment": "CV colour edit: FLUX generates source; HSV segmentation replaces black hair with blonde. Sobel edge mask freezes face contours and fine structure. Increase edge_strength (0→1) to lock more edge pixels to source.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
-      "anchor_end_frac": 0.0,
+      "source_color": "black",
+      "target_color": "blonde",
+      "edge_strength": 0.7,
       "seed": 35
     },
     {
+      "comment": "CV colour edit: FLUX generates red car; HSV segments red pixels, shifts hue to blue. License plate is not red → outside mask → preserved automatically. Sobel edge lock reinforces plate text boundaries.",
       "name": "car_color_change",
       "task": "attr_edit",
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
-      "anchor_end_frac": 0.0,
+      "source_color": "red",
+      "target_color": "blue",
+      "edge_strength": 0.7,
       "seed": 40
     },
     {
