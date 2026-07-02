@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from diffusers import FluxPipeline
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import apply_rotary_emb
+from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 from typing import Optional, List, Tuple, Dict, Callable
 
@@ -229,14 +230,39 @@ def generate_dual_branch(
         guidance_scale=guidance_scale,
     )
 
-    # 2. Install custom attention processor
+    # 2. Shared initial latent — both branches MUST start from identical noise.
+    #    Without this, pipe(prompt=[A, B]) generates different noise for A and B
+    #    (sequential samples from the same generator), so K,V injection between
+    #    branches fights completely different initial conditions and produces garbage.
+    #    FreeFlux's run_non_rigid.py does exactly this: generate one latent, expand.
+    exec_device = getattr(pipe, '_execution_device', device)
+    num_ch  = pipe.transformer.config.in_channels // 4   # 16 for FLUX
+    lat_h   = height // 8
+    lat_w   = width  // 8
+    _g      = torch.Generator(device=exec_device).manual_seed(seed)
+    _one    = randn_tensor(
+        (1, num_ch, lat_h, lat_w),
+        generator=_g,
+        device=exec_device,
+        dtype=torch.bfloat16,
+    )
+    # Pack: (B, C, lat_h, lat_w) → (B, lat_h//2 * lat_w//2, C*4)
+    # This is the standard FLUX packing used inside prepare_latents.
+    shared_latents = (
+        _one.expand(2, -1, -1, -1).clone()
+        .view(2, num_ch, lat_h // 2, 2, lat_w // 2, 2)
+        .permute(0, 2, 4, 1, 3, 5)
+        .reshape(2, (lat_h // 2) * (lat_w // 2), num_ch * 4)
+    )
+
+    # 3. Install custom attention processor
     proc = UltimateFluxAttnProcessor(
         policy=policy, total_layers=N_LAYERS, total_steps=num_steps
     )
     proc.reset()
     pipe.transformer.set_attn_processor(proc)
 
-    # 3. Register block-level forward hooks
+    # 4. Register block-level forward hooks
     handles: List = []
     for block_idx, hook_fn in policy.get_block_hooks().items():
         if block_idx < N_DOUBLE:
@@ -245,11 +271,10 @@ def generate_dual_branch(
             block = pipe.transformer.single_transformer_blocks[block_idx - N_DOUBLE]
         handles.append(block.register_forward_hook(hook_fn))
 
-    generator = torch.Generator(device=device).manual_seed(seed)
     try:
         result = pipe(
             prompt=[source_prompt, edit_prompt],
-            generator=generator,
+            latents=shared_latents,        # pre-packed, shared across both branches
             num_inference_steps=num_steps,
             guidance_scale=guidance_scale,
             height=height,

@@ -557,13 +557,15 @@ def _extract_style_hidden_states(
     Returns h_sty: (1, L_img, C) float32, or None on failure.
     """
     try:
-        # Encode style image with VAE
+        exec_device = getattr(pipe, '_execution_device', device)
+
+        # ── Encode style image with VAE ──────────────────────────────────────
         img_t = to_tensor(style_image.resize((width, height))).unsqueeze(0)
-        img_t = (img_t * 2.0 - 1.0).to(device, dtype=pipe.vae.dtype)
+        img_t = (img_t * 2.0 - 1.0).to(exec_device, dtype=pipe.vae.dtype)
         latents = pipe.vae.encode(img_t).latent_dist.mean
         latents = (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
 
-        # Pack latents: (B, C, H, W) → (B, H/2*W/2, C*4)
+        # Pack latents: (B, C, lat_h, lat_w) → (B, lat_h//2 * lat_w//2, C*4)
         B, C, H, W = latents.shape
         latents = (
             latents.view(B, C, H // 2, 2, W // 2, 2)
@@ -572,51 +574,59 @@ def _extract_style_hidden_states(
         )
 
         # Add noise at t=0.5 (mid-trajectory for flow matching)
-        generator = torch.Generator(device=device).manual_seed(seed)
-        noise = torch.randn_like(latents, generator=generator)
+        noise = torch.randn_like(latents)
         latents_noisy = 0.5 * latents + 0.5 * noise
 
-        # Encode empty prompt
-        if hasattr(pipe, "encode_prompt"):
-            pemb, ppooled, _ = pipe.encode_prompt(
-                prompt="",
-                prompt_2=None,
-                device=device,
-                num_images_per_prompt=1,
-            )
-        else:
-            raise RuntimeError("pipe.encode_prompt not found")
+        # ── Encode empty prompt ──────────────────────────────────────────────
+        enc_result = pipe.encode_prompt(
+            prompt="",
+            prompt_2=None,
+            device=exec_device,
+            num_images_per_prompt=1,
+        )
+        # encode_prompt returns (pemb, ppooled) in newer diffusers,
+        # or (pemb, ppooled, text_ids) in some older versions.
+        pemb, ppooled = enc_result[0], enc_result[1]
 
-        # Build RoPE image ids
+        # ── Build RoPE ids ───────────────────────────────────────────────────
         lh, lw = height // 8, width // 8
-        img_ids = torch.zeros(lh // 2, lw // 2, 3, device=device, dtype=latents.dtype)
-        img_ids[..., 1] = torch.arange(lh // 2, device=device)[:, None]
-        img_ids[..., 2] = torch.arange(lw // 2, device=device)[None, :]
-        img_ids = img_ids.reshape(1, (lh // 2) * (lw // 2), 3)
-        txt_ids = torch.zeros(1, pemb.shape[1], 3, device=device, dtype=latents.dtype)
+        img_ids = torch.zeros(lh // 2, lw // 2, 3, device=exec_device, dtype=latents.dtype)
+        img_ids[..., 1] = torch.arange(lh // 2, device=exec_device)[:, None]
+        img_ids[..., 2] = torch.arange(lw // 2, device=exec_device)[None, :]
+        img_ids = img_ids.reshape((lh // 2) * (lw // 2), 3)  # (L_img, 3) — no batch dim
+        txt_ids = torch.zeros(pemb.shape[1], 3, device=exec_device, dtype=latents.dtype)
 
+        # ── Guidance tensor (FLUX.1-dev requires it; schnell ignores it) ─────
+        guidance = None
+        if getattr(pipe.transformer.config, 'guidance_embeds', False):
+            guidance = torch.full([1], 3.5, device=exec_device, dtype=latents.dtype)
+
+        # ── Forward hook on pivotal block ────────────────────────────────────
         captured: Dict = {}
 
         def _hook(module, inp, out):
             # FluxTransformerBlock returns (encoder_hidden_states, hidden_states).
             # Index 1 = image hidden states — the tensor that carries visual/style info.
-            h = out[1] if (isinstance(out, tuple) and len(out) > 1) else (out[0] if isinstance(out, tuple) else out)
+            h = (out[1] if (isinstance(out, tuple) and len(out) > 1)
+                 else (out[0] if isinstance(out, tuple) else out))
             captured["h_sty"] = h.detach().float()
 
         handle = pipe.transformer.transformer_blocks[_PIVOTAL_LAYER].register_forward_hook(_hook)
 
-        pipe.scheduler.set_timesteps(num_steps, device=device)
-        t = pipe.scheduler.timesteps[0:1]  # use first timestep
+        # Use t=500 (mid-trajectory) directly — avoids scheduler.set_timesteps(mu=...)
+        # requirement introduced in newer diffusers for dev's dynamic timestep shifting.
+        # The transformer receives timestep / 1000 = 0.5, matching latents_noisy (50/50 mix).
+        t = torch.tensor([500.0], device=exec_device, dtype=latents.dtype)
 
         try:
             _ = pipe.transformer(
                 hidden_states=latents_noisy.to(pipe.transformer.dtype),
                 timestep=t / 1000.0,
-                guidance=None,
+                guidance=guidance,
                 pooled_projections=ppooled.to(pipe.transformer.dtype),
                 encoder_hidden_states=pemb.to(pipe.transformer.dtype),
-                txt_ids=txt_ids.squeeze(0),
-                img_ids=img_ids.squeeze(0),
+                txt_ids=txt_ids,
+                img_ids=img_ids,
                 return_dict=False,
             )
         finally:
@@ -626,6 +636,7 @@ def _extract_style_hidden_states(
 
     except Exception as exc:
         print(f"[UltimateFlux] Style extraction failed: {exc}")
+        import traceback; traceback.print_exc()
         return None
 
 
