@@ -104,21 +104,17 @@ def build_policy(cfg: dict):
         )
 
     if task == "attr_edit":
-        _HOTSPOT = [1, 2, 4, 26, 30, 54, 55]
         inject_layers_raw = cfg.get("inject_layers", None)
-        qk_only = False
-        if inject_layers_raw == "hotspot":
-            inject_layers = _HOTSPOT        # Q+K only — colour/texture change
-            qk_only = True
+        color_transfer = inject_layers_raw in ("color", "colour", "hotspot")
+        if color_transfer:
+            inject_layers = None            # not used in color_transfer mode
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
-        elif inject_layers_raw is None:
-            inject_layers = None            # default → _PRESERVE_LAYERS, K+V
         else:
-            inject_layers = None
+            inject_layers = None            # default → _PRESERVE_LAYERS, K+V
         return FineGrainedAttrPolicy(
             inject_layers=inject_layers,
-            qk_only=qk_only,
+            color_transfer=color_transfer,
             inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
         )
 
@@ -241,8 +237,8 @@ def parse_args():
     p.add_argument("--sam2_model_id", default="facebook/sam2-hiera-large",
                    help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--inject_layers", default=None,
-                   choices=["hotspot", "tier_a"],
-                   help="Layer set for attr_edit: hotspot=colour/texture change, tier_a=shape/breed change")
+                   choices=["color", "tier_a"],
+                   help="attr_edit mode: color=LAB colour transfer (hair/car), tier_a=shape/breed change")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)

@@ -28,7 +28,95 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from diffusers.models.embeddings import apply_rotary_emb
 
+from PIL import ImageFilter
+
 from .sampler import BasePolicy, TIER_A, TIER_B, N_DOUBLE, N_SINGLE, N_LAYERS
+
+
+# ────────────────────────── LAB colour helpers ────────────────────────────────
+
+def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """(H,W,3) float32 in [0,1] → CIE L*a*b* float32."""
+    lin = np.where(rgb > 0.04045,
+                   ((rgb + 0.055) / 1.055) ** 2.4,
+                   rgb / 12.92).astype(np.float32)
+    M = np.array([[0.4124564, 0.3575761, 0.1804375],
+                  [0.2126729, 0.7151522, 0.0721750],
+                  [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
+    xyz = lin @ M.T
+    xyz[:, :, 0] /= 0.95047
+    xyz[:, :, 2] /= 1.08883
+    eps = 0.008856
+    f = np.where(xyz > eps, xyz ** (1.0 / 3.0), (903.3 * xyz + 16.0) / 116.0)
+    L = 116.0 * f[:, :, 1] - 16.0
+    a = 500.0 * (f[:, :, 0] - f[:, :, 1])
+    b = 200.0 * (f[:, :, 1] - f[:, :, 2])
+    return np.stack([L, a, b], axis=-1).astype(np.float32)
+
+
+def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
+    """CIE L*a*b* float32 → (H,W,3) float32 in [0,1]."""
+    fy = (lab[:, :, 0] + 16.0) / 116.0
+    fx = lab[:, :, 1] / 500.0 + fy
+    fz = fy - lab[:, :, 2] / 200.0
+    eps = 0.206897
+    xyz = np.stack([
+        np.where(fx > eps, fx ** 3, (116.0 * fx - 16.0) / 903.3),
+        np.where(fy > eps, fy ** 3, (116.0 * fy - 16.0) / 903.3),
+        np.where(fz > eps, fz ** 3, (116.0 * fz - 16.0) / 903.3),
+    ], axis=-1).astype(np.float32)
+    xyz[:, :, 0] *= 0.95047
+    xyz[:, :, 2] *= 1.08883
+    M_inv = np.array([[ 3.2404542, -1.5371385, -0.4985314],
+                      [-0.9692660,  1.8760108,  0.0415560],
+                      [ 0.0556434, -0.2040259,  1.0572252]], dtype=np.float32)
+    lin = np.clip(xyz @ M_inv.T, 0.0, None)
+    rgb = np.where(lin > 0.0031308,
+                   1.055 * lin ** (1.0 / 2.4) - 0.055,
+                   12.92 * lin)
+    return np.clip(rgb, 0.0, 1.0).astype(np.float32)
+
+
+def _lab_color_transfer(
+    src_img: Image.Image,
+    ref_img: Image.Image,
+    blend_strength: float = 0.92,
+    blur_radius: int = 10,
+) -> Image.Image:
+    """
+    Colour-only transfer from ref_img onto src_img, luminance-preserving.
+
+    Both L (luminance) and AB (chromaticity) are transferred inside the
+    auto-detected changing region so that large lightness shifts (e.g. black→
+    blonde hair) are also captured — but the soft mask keeps the transfer
+    localised so surrounding structure is unaffected.
+
+    Region detection: pixels where the two images differ most in full LAB
+    distance (Delta-E).  No mask or segmentation required — the difference map
+    itself identifies the changing region.
+    """
+    src = np.array(src_img.convert("RGB")).astype(np.float32) / 255.0
+    if ref_img.size != src_img.size:
+        ref_img = ref_img.resize(src_img.size, Image.LANCZOS)
+    ref = np.array(ref_img.convert("RGB")).astype(np.float32) / 255.0
+
+    src_lab = _rgb_to_lab(src)
+    ref_lab = _rgb_to_lab(ref)
+
+    # Full Delta-E distance — captures both hue shifts AND lightness shifts
+    delta_e = np.sqrt(((src_lab - ref_lab) ** 2).sum(axis=-1))   # (H, W)
+    diff_norm = (delta_e / (delta_e.max() + 1e-8)).astype(np.float32)
+
+    # Smooth the mask (avoids hard colour boundaries at the transfer edge)
+    mask_pil = Image.fromarray((diff_norm * 255).astype(np.uint8))
+    mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    soft_mask = np.array(mask_pil).astype(np.float32) / 255.0
+    alpha = np.clip(soft_mask * blend_strength, 0.0, 1.0)[:, :, np.newaxis]  # (H,W,1)
+
+    # Blend all three LAB channels inside the mask (colour + lightness change)
+    result_lab = (1.0 - alpha) * src_lab + alpha * ref_lab
+    result = np.clip(_lab_to_rgb(result_lab) * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(result)
 
 
 # ─────────────────────────── Shared helpers ───────────────────────────────────
@@ -719,38 +807,34 @@ class BackgroundReplacePolicy(BasePolicy):
 
 class FineGrainedAttrPolicy(BasePolicy):
     """
-    Identity-preserving attribute editing.  Three modes via inject_layers:
+    Identity-preserving attribute editing.  Two injection modes:
 
-    None (default) → _PRESERVE_LAYERS (TIER_A ∪ HOTSPOT, 20 layers), K+V injection.
-        Tightest identity lock — use for ADDING an attribute (glasses, hat, beard).
-        K+V from source freezes both the subject's appearance AND spatial layout.
+    color_transfer=False (default) → K+V injection at inject_layers.
+      inject_layers=None  → _PRESERVE_LAYERS (TIER_A ∪ HOTSPOT, 20 layers).
+                            Tightest identity lock — ADDING an attribute (glasses).
+      inject_layers=TIER_A → Appearance locked, position flexible — BREED changes.
 
-    TIER_A (13 layers), K+V injection.
-        Appearance locked, position flexible — use for SHAPE/BREED changes where
-        the subject's texture should carry over but structure can shift.
-
-    HOTSPOT (7 layers), Q+K injection only (no V).
-        Spatial attention PATTERN preserved without injecting appearance values.
-        V stays from the edit branch → colour and texture change freely.
-        Use for COLOUR / TEXTURE edits (hair colour, car colour, material swap).
-
-    The Q+K-only approach is adapted from FreeFlux's SAC (Structural Attention
-    Correction): copying Q and K across branches aligns the attention matrix
-    (Q·Kᵀ) so the edit branch attends to the same spatial positions as the source,
-    preserving composition without locking down what those positions look like.
+    color_transfer=True → No attention injection at all.
+      Both branches generate freely from the same shared latent.
+      Because FLUX text-conditioning is strong, the source branch ("black hair")
+      and edit branch ("blonde hair") produce images with very similar composition
+      but different colour.  After decoding, _lab_color_transfer is applied as
+      post-processing: the Delta-E difference map auto-detects the changing region
+      and blends L*a*b* values from the edit image into the source image there.
+      This changes ONLY the colour-changed pixels — everything else is untouched.
     """
     _PRESERVE_LAYERS = sorted(set(TIER_A) | {1, 2, 4, 26, 30, 54, 55})  # 20 layers
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
-        qk_only: bool = False,
+        color_transfer: bool = False,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
         self._inject_layers = (
             inject_layers if inject_layers is not None else self._PRESERVE_LAYERS
         )
-        self._qk_only = qk_only   # True → Q+K only (colour change); False → K+V (appearance lock)
+        self._color_transfer = color_transfer
         self.inject_steps_frac = inject_steps_frac
         self._txt_len_single = 512
 
@@ -758,28 +842,23 @@ class FineGrainedAttrPolicy(BasePolicy):
         self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
+        if self._color_transfer:
+            return q, k, v  # no injection — post_process handles colour change
+
         if layer not in self._inject_layers:
             return q, k, v
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
+        k, v = _kv_full_inject(k, v, img_offset)
+        return q, k, v
 
-        if self._qk_only:
-            # Q+K injection (SAC-style): aligns spatial attention pattern from
-            # source so composition is preserved, but V stays from the edit branch
-            # (conditioned on the new colour/material) → colour changes freely.
-            q_src, q_edit = q.chunk(2)
-            k_src, k_edit = k.chunk(2)
-            q_new = q_edit.clone()
-            k_new = k_edit.clone()
-            q_new[:, :, img_offset:, :] = q_src[:, :, img_offset:, :]
-            k_new[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
-            return torch.cat([q_src, q_new]), torch.cat([k_src, k_new]), v
-        else:
-            # Full K+V injection: freezes both appearance and layout.
-            k, v = _kv_full_inject(k, v, img_offset)
-            return q, k, v
+    def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
+        if not self._color_transfer:
+            return edit_img
+        print("[UltimateFlux] Applying LAB colour transfer…")
+        return _lab_color_transfer(src_img, edit_img)
 
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────

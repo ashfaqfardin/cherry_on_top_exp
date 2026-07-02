@@ -68,6 +68,10 @@ class BasePolicy:
         """Called once before the denoising loop (style extraction, inversion, …)."""
         pass
 
+    def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
+        """Called after generation with the decoded PIL images.  Default: no-op."""
+        return edit_img
+
 
 # ─────────────────────────── Attention Processor ─────────────────────────────
 
@@ -287,4 +291,6 @@ def generate_dual_branch(
         for h in handles:
             h.remove()
 
-    return result.images[0], result.images[1]
+    src_img  = result.images[0]
+    edit_img = policy.post_process(src_img, result.images[1])
+    return src_img, edit_img

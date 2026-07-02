@@ -42,7 +42,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name woman_hair_color \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
-    --inject_layers hotspot \
+    --inject_layers color \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -53,7 +53,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name car_color_change \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
-    --inject_layers hotspot \
+    --inject_layers color \
     --seed 40
 
 # ── Shape-linked edit (tier_a — preserves appearance, loosens layout) ─────────
