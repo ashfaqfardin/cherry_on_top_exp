@@ -161,18 +161,19 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         # Single-stream blocks (19-56) are free → edit text drives colour there.
         # Colour mode: two-phase P2P.
         #
-        # Phase 1 (first inject_steps_frac end fraction of steps, default 25% = 7 steps):
-        #   K+V at 9 critical DS layers [0,1,2,4,7,8,9,10,18].
-        #   Anchors WHO/WHAT/WHERE (coarse layout is established by step 7).
+        # Phase 1 (first anchor_end_frac × steps, default 25% = 7/28 steps):
+        #   K+V at 9 critical DS layers → aligns edit branch to source.
+        #   By step 7, Q_edit ≈ Q_src (branches converged on same structure).
         #
-        # Phase 2 (remaining 75% = 21 steps): NO injection at any layer.
-        #   All 57 layers free → text "blue car" / "blonde hair" drives colour
-        #   with nothing competing.  21 free steps is enough to fully realise
-        #   the new colour.
+        # Phase 2 (remaining 75% = 21/28 steps):
+        #   K-only at same 9 layers → K anchors WHERE-to-attend (identity stays).
+        #   V from edit branch → carries new colour ("blue car", "blonde hair").
+        #   Phase 1 alignment makes Q_edit @ K_src^T valid — not broken.
         #
-        # Tune via inject_steps_frac in JSON:
-        #   [0.0, 0.15] → 4 steps anchor, 24 free  (more colour, less identity)
-        #   [0.0, 0.50] → 14 steps anchor, 14 free  (less colour, more identity)
+        # Tune via anchor_end_frac in JSON:
+        #   0.15 → 4 steps align, 24 steps K-only  (more colour, slight identity risk)
+        #   0.25 → 7 steps align, 21 steps K-only  (balanced, default)
+        #   0.50 → 14 steps align, 14 steps K-only (stronger identity, less colour)
         _DS_TIER_A   = [l for l in TIER_A if l < N_DOUBLE]  # [0,7,8,9,10,18]
         _DS_HOTSPOT  = [1, 2, 4]
         _color_layers = sorted(set(_DS_TIER_A) | set(_DS_HOTSPOT))  # 9 layers
@@ -188,8 +189,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
-            k_only=False,
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 0.25])),
+            anchor_end_frac=cfg.get("anchor_end_frac", 0.25),
         )
     else:
         src_img, edit_img = generate_dual_branch(

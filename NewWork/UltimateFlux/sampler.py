@@ -319,43 +319,47 @@ class _KVRecordPolicy(BasePolicy):
 
 class _KVInjectPolicy(BasePolicy):
     """
-    Pass-2 helper: replaces K (and optionally V) at target layers from a stored dict.
+    Pass-2 two-phase injection for colour editing.
 
-    k_only=True  → inject K from source, keep V from edit branch.
-        K controls WHERE to attend (structure/composition).
-        V from the edit branch carries new colour ("blue car", "blonde hair").
-        Use for colour / texture changes — colour is free to change via V.
+    Phase 1  (step < anchor_end = anchor_end_frac × n_steps):
+        K+V injection at target layers.
+        Forces edit branch attention to match source → aligns hidden states so that
+        Q_edit ≈ Q_src by the end of phase 1.  Establishes identity / composition.
 
-    k_only=False → inject both K and V (strong appearance lock, original behaviour).
-        Use when you want maximum identity preservation (e.g. pose editing).
+    Phase 2  (step >= anchor_end):
+        K-only injection at target layers.
+        K from source keeps WHERE-to-attend anchored → identity / spatial structure.
+        V stays from the edit branch → carries new colour ("blue car", "blonde hair").
+        Because phase 1 aligned Q_edit ≈ Q_src, Q_edit @ K_src^T is a valid
+        attention pattern — not broken like raw K-only from step 0.
+
+    anchor_end_frac=1.0 → K+V for all steps (full identity lock, colour won't change).
+    anchor_end_frac=0.0 → K-only for all steps (structure but identity may drift).
+    anchor_end_frac=0.25 → 7/28 steps K+V to align, 21/28 steps K-only for colour.
     """
 
     def __init__(
         self,
         stored: Dict[tuple, tuple],
         max_seq_len: int = 512,
-        k_only: bool = False,
-        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        anchor_end_frac: float = 0.25,
     ):
         self._stored = stored
         self._max_seq_len = max_seq_len
-        self._k_only = k_only
-        self._frac = inject_steps_frac
+        self._anchor = anchor_end_frac
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        lo, hi = self._frac
-        if not (int(lo * n_steps) <= step < int(hi * n_steps)):
-            return q, k, v
         entry = self._stored.get((step, layer))
         if entry is None:
             return q, k, v
-        stored_k, stored_v, stored_offset = entry
+        stored_k, stored_v, _ = entry
         offset = txt_len if txt_len > 0 else self._max_seq_len
         k = k.clone()
-        k[:, :, offset:, :] = stored_k            # K from source → structure
-        if not self._k_only:
+        k[:, :, offset:, :] = stored_k                    # always: K → structure
+        if step < int(self._anchor * n_steps):
             v = v.clone()
-            v[:, :, offset:, :] = stored_v        # V from source → appearance lock
+            v[:, :, offset:, :] = stored_v                # phase 1: V → align
+        # phase 2: V from edit → new colour
         return q, k, v
 
 
@@ -372,33 +376,31 @@ def generate_p2p(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
-    k_only: bool = True,
-    inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+    anchor_end_frac: float = 0.25,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Prompt-to-Prompt two-pass editing for colour / texture changes.
+    Prompt-to-Prompt two-pass colour editing with two-phase injection.
 
-    Pass 1 — source pass (source_prompt, seed → image_a):
-        Standard FLUX generation; records K,V at every (step, layer) in inject_layers.
+    Pass 1: generate source image, recording K,V at inject_layers at every step.
 
-    Pass 2 — edit pass (edit_prompt, same z_T):
-        Regenerates from the identical starting noise with the edit prompt.
-        At (step, layer) pairs within inject_steps_frac, stored values are injected.
+    Pass 2: regenerate from the same z_T with the edit prompt.
+        Phase 1 (step < anchor_end_frac × n_steps, default steps 0-6):
+            K+V injection → aligns edit branch to source, establishing identity.
+            By the end of phase 1, Q_edit ≈ Q_src (branches have converged).
+        Phase 2 (remaining steps, default steps 7-27):
+            K-only injection → K from source keeps spatial attention anchored
+            (identity / composition stays); V from edit branch carries new colour.
+            Because phase 1 aligned the branches, Q_edit @ K_src^T is a valid
+            attention pattern — not broken like raw K-only from step 0.
 
-    k_only=True  (default for colour) — inject K from source, keep V from edit.
-        K controls WHERE to attend  → preserves spatial structure and identity.
-        V stays from the edit branch → carries new colour ("blue car", "blonde hair").
-        38 free single-stream blocks further reinforce the colour change.
+    anchor_end_frac controls the phase boundary:
+        0.25 (default) → 7 steps align, 21 steps K-only colour  ← balanced
+        0.15           → 4 steps align, 24 steps K-only colour  ← more colour
+        0.50           → 14 steps align, 14 steps K-only colour ← more identity
 
-    k_only=False — inject both K and V (strong appearance lock).
-        Use for pose / shape edits where colour must not drift.
-
-    inject_steps_frac — (start, end) fraction of denoising steps to inject.
-        Default (0.0, 1.0) = all steps.  Try (0.0, 0.5) if colour still won't change
-        (injection only anchors structure in the first half; second half is free).
-
-    inject_layers = list(range(N_DOUBLE)) anchors semantic identity without
-    touching the 38 single-stream refinement blocks.
+    inject_layers should be the 9 critical double-stream layers
+    [0,1,2,4,7,8,9,10,18] (TIER_A∩DS ∪ HOTSPOT∩DS).  Single-stream blocks
+    (19-56) always respond freely to the edit text.
 
     Returns (src_img, edit_img).
     """
@@ -440,14 +442,14 @@ def generate_p2p(
     rec = _KVRecordPolicy(inject_layers, max_sequence_length)
     src_img = _run_single(source_prompt, rec)
 
-    # Pass 2 — edit from same noise, injecting stored K (and optionally V)
-    mode_str = "K-only" if k_only else "K+V"
-    print(f"[UltimateFlux P2P] Pass 2: edit with {mode_str} injection at {len(inject_layers)} layers…")
+    # Pass 2 — two-phase injection: K+V to align (phase 1), K-only for colour (phase 2)
+    anchor_steps = int(anchor_end_frac * num_steps)
+    print(f"[UltimateFlux P2P] Pass 2: steps 0-{anchor_steps-1} K+V align, "
+          f"steps {anchor_steps}-{num_steps-1} K-only colour ({len(inject_layers)} layers)…")
     inj = _KVInjectPolicy(
         rec.stored,
         max_seq_len=max_sequence_length,
-        k_only=k_only,
-        inject_steps_frac=inject_steps_frac,
+        anchor_end_frac=anchor_end_frac,
     )
     edit_img = _run_single(edit_prompt, inj)
 
