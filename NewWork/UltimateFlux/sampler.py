@@ -296,14 +296,95 @@ def generate_dual_branch(
     return src_img, edit_img
 
 
-# ───────────────────────── Colour editing: generate + img2img ─────────────────
+# ──────────────────── Prompt-to-Prompt colour editing ─────────────────────────
+
+class _KVRecordPolicy(BasePolicy):
+    """Pass-1: records K,V at target layers without modifying them."""
+
+    def __init__(self, record_layers: List[int], max_seq_len: int = 512):
+        self._layers = set(record_layers)
+        self._max_seq_len = max_seq_len
+        self.stored: Dict[tuple, tuple] = {}   # (step, layer) → (k, v)
+
+    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
+        if layer in self._layers:
+            offset = txt_len if txt_len > 0 else self._max_seq_len
+            self.stored[(step, layer)] = (
+                k[:, :, offset:, :].detach().clone(),
+                v[:, :, offset:, :].detach().clone(),
+            )
+        return q, k, v
+
+
+class _P2PColorPolicy(BasePolicy):
+    """
+    Two-phase P2P injection for colour editing with single-stream structure lock.
+
+    Double-stream layers [0,1,2,4,7,8,9,10,18]:
+        Phase 1 (step < anchor_end_frac × n_steps): K+V → aligns Q_edit ≈ Q_src
+        Phase 2 (remaining steps):                  K-only → coarse identity held
+
+    Single-stream TIER_A layers [25,28,37,42,45,50,56]:
+        All steps: K-only → fine-detail rendering locked (plates, facial edges)
+        V is never injected here → V from the edit branch carries the new colour
+
+    Why single-stream K injection is needed:
+        Single-stream blocks do the final fine-detail rendering pass.  Without K
+        injection there, spatial structure at that level (license-plate text, fine
+        face contours) drifts freely even when coarse composition is held by the
+        double-stream blocks.  K-only keeps WHERE those blocks attend without
+        freezing WHAT colour they render.
+    """
+    # 9 double-stream layers: TIER_A∩DS ∪ {1,2,4}
+    _DOUBLE_INJECT: List[int] = sorted(
+        {l for l in TIER_A if l < N_DOUBLE} | {1, 2, 4}
+    )
+    # 7 single-stream layers: TIER_A∩SS
+    _SINGLE_INJECT: frozenset = frozenset(l for l in TIER_A if l >= N_DOUBLE)
+    # 16 layers to record in Pass 1
+    _RECORD_LAYERS: List[int] = sorted(set(TIER_A) | {1, 2, 4})
+
+    def __init__(
+        self,
+        stored: Dict[tuple, tuple],
+        max_seq_len: int = 512,
+        anchor_end_frac: float = 0.25,
+    ):
+        self._stored = stored
+        self._max_seq_len = max_seq_len
+        self._anchor = anchor_end_frac
+        self._double_set = frozenset(self._DOUBLE_INJECT)
+
+    def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
+        is_double = layer in self._double_set
+        is_single = layer in self._SINGLE_INJECT
+        if not is_double and not is_single:
+            return q, k, v
+
+        entry = self._stored.get((step, layer))
+        if entry is None:
+            return q, k, v
+        stored_k, stored_v = entry
+
+        offset = txt_len if txt_len > 0 else self._max_seq_len
+        k = k.clone()
+        k[:, :, offset:, :] = stored_k          # always: K locks WHERE to attend
+
+        if is_double and step < int(self._anchor * n_steps):
+            # Phase 1 (double-stream only): K+V aligns edit branch to source
+            v = v.clone()
+            v[:, :, offset:, :] = stored_v
+
+        # Phase 2 / single-stream: V from edit branch → carries new colour
+        return q, k, v
+
 
 @torch.no_grad()
 def generate_p2p(
     pipe: FluxPipeline,
     source_prompt: str,
     edit_prompt: str,
-    inject_layers: List[int],          # unused; kept for API compatibility
+    inject_layers: List[int],          # ignored; kept for API compat
     seed: int = 0,
     num_steps: int = 28,
     guidance_scale: float = 3.5,
@@ -311,59 +392,81 @@ def generate_p2p(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
-    anchor_end_frac: float = 0.25,     # unused; kept for API compatibility
-    freq_sigma: float = 0.0,           # unused; kept for API compatibility
-    img2img_strength: float = 0.6,
+    anchor_end_frac: float = 0.25,
+    freq_sigma: float = 0.0,           # ignored; kept for API compat
+    img2img_strength: float = 0.6,     # ignored; kept for API compat
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Colour editing via source generation + img2img.
+    Prompt-to-Prompt colour editing: same z_T, two-phase DS injection + SS K-lock.
 
-    Pass 1: generate the source image from source_prompt + seed.
-    Pass 2: FluxImg2ImgPipeline from source image, steered by edit_prompt.
+    Pass 1: generate source from source_prompt + seed, record K,V at 16 layers
+            (9 double-stream TIER_A+HOTSPOT + 7 single-stream TIER_A).
+    Pass 2: denoise from the same z_T with edit_prompt:
+        Double-stream (9 layers):
+            Phase 1 (steps 0 .. anchor_end_frac×n): K+V → Q_edit → Q_src
+            Phase 2 (remaining steps):               K-only → coarse identity
+        Single-stream (7 layers):
+            All steps: K-only → fine-detail structure locked (plates, faces)
+            V always from edit → colour flows through unimpeded
 
-    The img2img starting latent already encodes the source structure, so the
-    denoising process changes colour from the text prompt without any attention
-    injection — no K/V manipulation, no post-processing, no bleeding.
-
-    img2img_strength
-        0.4 → subtle colour shift, very strong identity
-        0.6 → balanced colour change + identity  (default)
-        0.8 → strong colour change, some identity drift
+    anchor_end_frac
+        0.15 → more colour change | 0.25 → balanced (default) | 0.40 → more identity
 
     Returns (src_img, edit_img).
     """
-    from diffusers import FluxImg2ImgPipeline
-
     exec_device = getattr(pipe, "_execution_device", device)
+    num_ch = pipe.transformer.config.in_channels // 4
+    lat_h  = height // 8
+    lat_w  = width  // 8
 
-    # Pass 1 — generate source image
-    print("[UltimateFlux P2P] Pass 1: generating source image…")
-    src_img = pipe(
-        prompt=source_prompt,
-        num_inference_steps=num_steps,
-        guidance_scale=guidance_scale,
-        height=height,
-        width=width,
-        max_sequence_length=max_sequence_length,
-        generator=torch.Generator(device=exec_device).manual_seed(seed),
-        output_type="pil",
-    ).images[0]
+    _g   = torch.Generator(device=exec_device).manual_seed(seed)
+    _one = randn_tensor(
+        (1, num_ch, lat_h, lat_w),
+        generator=_g, device=exec_device, dtype=torch.bfloat16,
+    )
+    latent = (
+        _one.view(1, num_ch, lat_h // 2, 2, lat_w // 2, 2)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(1, (lat_h // 2) * (lat_w // 2), num_ch * 4)
+    )
 
-    # Pass 2 — img2img colour edit from source
-    print(f"[UltimateFlux P2P] Pass 2: img2img colour edit "
-          f"(strength={img2img_strength}, steps={num_steps})…")
-    img2img = FluxImg2ImgPipeline.from_pipe(pipe)
-    edit_img = img2img(
-        prompt=edit_prompt,
-        image=src_img,
-        strength=img2img_strength,
-        num_inference_steps=num_steps,
-        guidance_scale=guidance_scale,
-        height=height,
-        width=width,
-        max_sequence_length=max_sequence_length,
-        generator=torch.Generator(device=exec_device).manual_seed(seed),
-        output_type="pil",
-    ).images[0]
+    def _run(prompt: str, policy: BasePolicy) -> Image.Image:
+        proc = UltimateFluxAttnProcessor(
+            policy=policy, total_layers=N_LAYERS, total_steps=num_steps
+        )
+        proc.reset()
+        pipe.transformer.set_attn_processor(proc)
+        return pipe(
+            prompt=prompt,
+            latents=latent.clone(),
+            num_inference_steps=num_steps,
+            guidance_scale=guidance_scale,
+            height=height,
+            width=width,
+            max_sequence_length=max_sequence_length,
+            output_type="pil",
+        ).images[0]
+
+    # Pass 1 — source image + record K,V at 16 layers (9 DS + 7 SS)
+    print("[UltimateFlux P2P] Pass 1: generating source, recording K,V at "
+          f"{len(_P2PColorPolicy._RECORD_LAYERS)} layers…")
+    rec = _KVRecordPolicy(_P2PColorPolicy._RECORD_LAYERS, max_sequence_length)
+    src_img = _run(source_prompt, rec)
+
+    # Pass 2 — colour edit: DS two-phase + SS K-only
+    anchor_steps = int(anchor_end_frac * num_steps)
+    n_ds = len(_P2PColorPolicy._DOUBLE_INJECT)
+    n_ss = len(_P2PColorPolicy._SINGLE_INJECT)
+    print(
+        f"[UltimateFlux P2P] Pass 2: "
+        f"DS 0-{anchor_steps-1} K+V | DS {anchor_steps}-{num_steps-1} K-only | "
+        f"SS all-steps K-only | ({n_ds} DS + {n_ss} SS layers)…"
+    )
+    inj = _P2PColorPolicy(
+        rec.stored,
+        max_seq_len=max_sequence_length,
+        anchor_end_frac=anchor_end_frac,
+    )
+    edit_img = _run(edit_prompt, inj)
 
     return src_img, edit_img

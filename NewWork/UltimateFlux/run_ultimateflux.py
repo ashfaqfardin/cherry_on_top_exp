@@ -155,13 +155,12 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  edit_prompt:   {edit_prompt}")
 
     if policy is None:
-        # Colour editing: generate source, then img2img with edit prompt.
-        # No attention injection — the img2img starting latent carries source
-        # structure; the edit prompt drives colour change cleanly.
-        # Tune img2img_strength in JSON:
-        #   0.4 → subtle shift, very strong identity
-        #   0.6 → balanced colour change + identity  (default)
-        #   0.8 → strong colour change, some identity drift
+        # Colour editing: two-pass P2P from same z_T.
+        # Double-stream layers: K+V align phase → K-only colour phase.
+        # Single-stream TIER_A layers: K-only all steps → fine detail locked.
+        # V always free in single-stream → colour from edit text flows through.
+        # Tune anchor_end_frac in JSON:
+        #   0.15 → more colour | 0.25 → balanced (default) | 0.40 → more identity
         src_img, edit_img = generate_p2p(
             pipe=pipe,
             source_prompt=source_prompt,
@@ -174,7 +173,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
-            img2img_strength=cfg.get("img2img_strength", 0.6),
+            anchor_end_frac=cfg.get("anchor_end_frac", 0.25),
         )
     else:
         src_img, edit_img = generate_dual_branch(
