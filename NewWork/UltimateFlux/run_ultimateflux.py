@@ -1,9 +1,9 @@
 """
-UltimateFlux — unified training-free editing on FLUX.1-schnell.
+UltimateFlux — unified training-free editing on FLUX.1-dev.
 
 Synthesises StableFlow, FluxSpace, FreeFlux, and SVD-Style into a single
-dual-branch pipeline calibrated to schnell's empirically derived layer tiers
-(§5–7 of Pipeline_Plan.md).
+dual-branch pipeline with paper-validated layer sets for FLUX.1-dev
+(§6–7 of Pipeline_Plan.md).
 
 Supported tasks
 ---------------
@@ -130,11 +130,11 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     source_prompt = cfg.get("source_prompt", cfg.get("prompt", ""))
     edit_prompt   = cfg.get("edit_prompt",   cfg.get("prompt", ""))
     seed          = cfg.get("seed", 42)
-    num_steps     = cfg.get("num_steps", 4)
-    guidance      = cfg.get("guidance_scale", 0.0)
+    num_steps     = cfg.get("num_steps", 28)
+    guidance      = cfg.get("guidance_scale", 3.5)
     height        = cfg.get("height", 1024)
     width         = cfg.get("width",  1024)
-    max_seq_len   = cfg.get("max_sequence_length", 256)
+    max_seq_len   = cfg.get("max_sequence_length", 512)
 
     policy = build_policy(cfg)
 
@@ -185,7 +185,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="UltimateFlux unified editing pipeline")
 
     # Model / infra
-    p.add_argument("--model_path",  default="black-forest-labs/FLUX.1-schnell")
+    p.add_argument("--model_path",  default="black-forest-labs/FLUX.1-dev")
     p.add_argument("--hf_token",    default=os.environ.get("HF_TOKEN"))
     p.add_argument("--device",      default="cuda")
     p.add_argument("--cpu_offload", action="store_true")
@@ -210,8 +210,8 @@ def parse_args():
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--edit_scale",    type=float, default=5.0)
     p.add_argument("--seed",          type=int, default=42)
-    p.add_argument("--num_steps",     type=int, default=4)
-    p.add_argument("--guidance_scale",type=float, default=0.0)
+    p.add_argument("--num_steps",     type=int, default=28)
+    p.add_argument("--guidance_scale",type=float, default=3.5)
     p.add_argument("--height",        type=int, default=1024)
     p.add_argument("--width",         type=int, default=1024)
 

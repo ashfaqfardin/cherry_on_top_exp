@@ -1,13 +1,13 @@
 {
-  "comment": "UltimateFlux demo runs covering all 5 implemented tasks on FLUX.1-schnell. Layer tiers are empirically derived (§5-6 of Pipeline_Plan.md). Hyperparameters are starting hypotheses — schnell-specific validation needed.",
+  "comment": "UltimateFlux demo runs covering all 6 implemented tasks on FLUX.1-dev. Layer sets are paper-validated (FreeFlux ICCV 2025 for TIER_A and add_object hotspots; all papers validated on FLUX.1-dev).",
 
   "global": {
-    "model_path": "black-forest-labs/FLUX.1-schnell",
-    "num_steps": 4,
-    "guidance_scale": 0.0,
+    "model_path": "black-forest-labs/FLUX.1-dev",
+    "num_steps": 28,
+    "guidance_scale": 3.5,
     "height": 1024,
     "width": 1024,
-    "max_sequence_length": 256,
+    "max_sequence_length": 512,
     "seed": 42
   },
 

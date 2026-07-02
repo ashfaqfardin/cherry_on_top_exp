@@ -52,11 +52,22 @@ def _image_mask_to_token_mask(
     return torch.tensor(mask_binary, device=device).reshape(1, 1, th * tw)
 
 
-def _kv_full_inject(k, v):
-    """Copy source K,V into the edit branch (full sequence, no masking)."""
-    k_src, _ = k.chunk(2)
-    v_src, _ = v.chunk(2)
-    return torch.cat([k_src, k_src.clone()]), torch.cat([v_src, v_src.clone()])
+def _kv_full_inject(k, v, txt_len: int = 0):
+    """Copy source image-token K,V into the edit branch (positions txt_len: only).
+
+    txt_len is the number of text prefix tokens in the current block's sequence.
+    For double-stream blocks this equals encoder_hidden_states.shape[1] (e.g. 512).
+    For single-stream blocks pass max_sequence_length (the text prefix offset).
+    Text tokens are left untouched so each branch preserves its own prompt conditioning.
+    This matches FreeFlux's kc_tgt_modified[:,:,512:,:] = kc_src[:,:,512:,:] pattern.
+    """
+    k_src, k_edit = k.chunk(2)
+    v_src, v_edit = v.chunk(2)
+    k_edit = k_edit.clone()
+    v_edit = v_edit.clone()
+    k_edit[:, :, txt_len:, :] = k_src[:, :, txt_len:, :]
+    v_edit[:, :, txt_len:, :] = v_src[:, :, txt_len:, :]
+    return torch.cat([k_src, k_edit]), torch.cat([v_src, v_edit])
 
 
 def _masked_kv_inject(k, v, mask_1d: torch.Tensor, txt_len: int):
@@ -195,27 +206,27 @@ class _KVCaptureProcessor:
 
 class ObjectAdditionPolicy(BasePolicy):
     """
-    Two-phase object addition adapted for schnell's 4-step budget.
+    Two-phase object addition using FreeFlux's layout-aware K,V capture.
 
     Phase 1  (runs inside pre_generate):
-        A full 4-step denoising pass with the source prompt only.
-        K,V are captured at layout-hotspot layers (double-stream {0} and
-        single-stream {3}, combined indices {0, 22}) at every step.
-        Schnell's extreme front-loading means useful layout context crystallises
-        after even the first step — 4 steps gives the most developed map.
+        A full source-only denoising pass with _KVCaptureProcessor.
+        K,V are captured at FreeFlux's position-dependent layers
+        `{1,2,4,26,30,54,55}` (combined indices) at every step.
+        These layers encode spatial/positional layout information.
 
     Phase 2  (the main generate_dual_branch call):
         B=2 denoising with [source_prompt, edit_prompt].
         Phase 1 K,V are injected into the edit branch (index 1) at the same
-        layout-hotspot layers, but OUTSIDE the placement mask so the new object
-        can emerge freely inside the mask while background context is frozen.
+        hotspot layers, OUTSIDE the placement mask so the new object can emerge
+        freely inside the mask while background context is frozen.
 
     placement_mask: binary PIL Image — 1 (white) = region where the new object
                     should appear.  If None, Phase 1 K,V are injected globally.
     """
 
-    # Layout-hotspot combined layer indices (§7 of Pipeline_Plan.md)
-    HOTSPOT_LAYERS = [0, 19 + 3]  # double-stream 0 + single-stream 3
+    # FreeFlux dev position-dependent (layout-hotspot) combined layer indices.
+    # Source: run_add_object.py _PROCESSOR_ARGS["layer_idx"]
+    HOTSPOT_LAYERS = [1, 2, 4, 26, 30, 54, 55]
 
     def __init__(
         self,
@@ -226,7 +237,7 @@ class ObjectAdditionPolicy(BasePolicy):
         self.inject_steps_frac  = inject_steps_frac
         self._captured_kv: Dict[int, List] = {}
         self._token_mask: Optional[torch.Tensor] = None
-        self._txt_len_single: int = 256   # set in pre_generate from max_sequence_length
+        self._txt_len_single: int = 512   # set in pre_generate from max_sequence_length
         self._phase = 1
 
     def pre_generate(
@@ -235,10 +246,11 @@ class ObjectAdditionPolicy(BasePolicy):
         device: str = "cuda",
         height: int = 1024,
         width: int = 1024,
-        num_steps: int = 4,
+        num_steps: int = 28,
         seed: int = 0,
         source_prompt: str = "",
-        max_sequence_length: int = 256,
+        max_sequence_length: int = 512,
+        guidance_scale: float = 3.5,
         **kwargs,
     ):
         """Phase 1: capture layout K,V with source-only denoising."""
@@ -261,7 +273,7 @@ class ObjectAdditionPolicy(BasePolicy):
             prompt=source_prompt,
             generator=generator,
             num_inference_steps=num_steps,
-            guidance_scale=0.0,
+            guidance_scale=guidance_scale,         # must match Phase 2 for consistent K,V
             height=height,
             width=width,
             max_sequence_length=max_sequence_length,   # must match Phase 2
@@ -329,11 +341,10 @@ class ObjectAdditionPolicy(BasePolicy):
 
 class NonRigidPolicy(BasePolicy):
     """
-    Freeze Tier A appearance layers (colour/style/texture) via K,V injection.
-    Tier B (shape/pose) is left free, allowing the network to deform the subject.
+    Freeze appearance via image-token K,V injection at FreeFlux's content-similarity layers.
+    Structure layers (not in inject_layers) are left free, allowing pose/shape changes.
 
-    Derived from FreeFlux §4 content-similarity injection, re-targeted to
-    schnell's empirical Tier A (§6 of Pipeline_Plan.md).
+    Layer set defaults to TIER_A — FreeFlux's dev-validated content-similarity layers.
     """
 
     def __init__(
@@ -343,10 +354,18 @@ class NonRigidPolicy(BasePolicy):
     ):
         self.inject_layers = inject_layers if inject_layers is not None else TIER_A
         self.inject_steps_frac = inject_steps_frac
+        self._txt_len_single = 512  # updated in pre_generate
+
+    def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
+        self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         if layer in self.inject_layers and _step_active(step, n_steps, self.inject_steps_frac):
-            k, v = _kv_full_inject(k, v)
+            # txt_len > 0 for double-stream (sampler sets it from encoder_hidden_states).
+            # txt_len == 0 for single-stream (no separate encoder_hidden_states), but the
+            # hidden_states still carry a text prefix of length _txt_len_single.
+            img_offset = txt_len if txt_len > 0 else self._txt_len_single
+            k, v = _kv_full_inject(k, v, img_offset)
         return q, k, v
 
 
@@ -354,8 +373,8 @@ class NonRigidPolicy(BasePolicy):
 
 class ObjectReplacementPolicy(BasePolicy):
     """
-    Tier A: global K,V injection (freeze appearance everywhere).
-    Tier B: K,V injection only OUTSIDE the replacement mask (preserve context/background).
+    TIER_A layers: inject source image-token K,V globally (freeze appearance/context).
+    All other layers: inject outside the replacement mask only (background preservation).
 
     mask: binary PIL Image — 1 (white) = pixels where the object IS being replaced.
     """
@@ -368,21 +387,26 @@ class ObjectReplacementPolicy(BasePolicy):
         self.raw_mask = mask
         self.inject_steps_frac = inject_steps_frac
         self._token_mask: Optional[torch.Tensor] = None   # (1,1,L_img)
+        self._txt_len_single = 512  # updated in pre_generate
 
-    def pre_generate(self, pipe, device="cuda", height=1024, width=1024, **kwargs):
+    def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
+                     max_sequence_length=512, **kwargs):
         if self.raw_mask is not None:
             self._token_mask = _image_mask_to_token_mask(self.raw_mask, height, width, device)
+        self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
+        img_offset = txt_len if txt_len > 0 else self._txt_len_single
+
         if layer in TIER_A:
-            k, v = _kv_full_inject(k, v)
+            k, v = _kv_full_inject(k, v, img_offset)
         elif self._token_mask is not None:
             # Outside-mask injection: source K,V where mask=0, original where mask=1
             outside = (1.0 - self._token_mask.squeeze(0).squeeze(0))  # (L_img,)
-            k, v = _masked_kv_inject(k, v, outside, txt_len)
+            k, v = _masked_kv_inject(k, v, outside, img_offset)
 
         return q, k, v
 
@@ -391,8 +415,8 @@ class ObjectReplacementPolicy(BasePolicy):
 
 class BackgroundReplacePolicy(BasePolicy):
     """
-    Value-only injection at all 57 layers inside the foreground (SAM-2) mask.
-    V from source flows into the edit branch within the fg region → preserves subject.
+    Value-only injection at all 57 layers inside the foreground mask.
+    V from source flows into edit branch within the fg region → preserves subject.
     Background tokens (mask=0) are unrestricted → freely regenerated.
 
     fg_mask: binary PIL Image — 1 (white) = foreground object to preserve.
@@ -401,22 +425,28 @@ class BackgroundReplacePolicy(BasePolicy):
     def __init__(self, fg_mask: Optional[Image.Image] = None):
         self.raw_mask = fg_mask
         self._token_mask: Optional[torch.Tensor] = None
+        self._txt_len_single = 512  # updated in pre_generate
 
-    def pre_generate(self, pipe, device="cuda", height=1024, width=1024, **kwargs):
+    def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
+                     max_sequence_length=512, **kwargs):
         if self.raw_mask is not None:
             self._token_mask = _image_mask_to_token_mask(self.raw_mask, height, width, device)
+        self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         if self._token_mask is None:
             return q, k, v
+
+        # txt_len > 0 for double-stream; use _txt_len_single for single-stream
+        img_offset = txt_len if txt_len > 0 else self._txt_len_single
 
         v_src, v_edit = v.chunk(2)
         v_edit = v_edit.clone()
 
         fg = self._token_mask.squeeze(0).squeeze(0).to(v.device)  # (L_img,)
         fg4 = fg.view(1, 1, -1, 1)
-        v_edit[:, :, txt_len:, :] = (
-            v_src[:, :, txt_len:, :] * fg4 + v_edit[:, :, txt_len:, :] * (1 - fg4)
+        v_edit[:, :, img_offset:, :] = (
+            v_src[:, :, img_offset:, :] * fg4 + v_edit[:, :, img_offset:, :] * (1 - fg4)
         )
         v = torch.cat([v_src, v_edit])
         return q, k, v
@@ -426,15 +456,15 @@ class BackgroundReplacePolicy(BasePolicy):
 
 class FineGrainedAttrPolicy(BasePolicy):
     """
-    Orthogonal-projection edit concentrated on Tier A layers.
+    Orthogonal-projection edit on image-token keys at TIER_A layers.
 
-    Adapts FluxSpace §4: the edit vector (k_edit − k_src) is projected away
-    from the content direction k_src (Gram-Schmidt), isolating the attribute
-    direction while leaving identity intact.  Norm is preserved to avoid
-    contrast collapse.
+    Adapts FluxSpace §4: the edit vector (k_edit − k_src) for image tokens is
+    projected away from the content direction k_src (Gram-Schmidt), isolating
+    the attribute direction while leaving identity intact. Text tokens are always
+    left untouched so each branch preserves its own prompt conditioning.
+    Norm is preserved to avoid contrast collapse.
 
-    For shape-linked edits (e.g. "pointier ears") pass inject_layers=TIER_B
-    to broaden to the full network.
+    For shape-linked edits (e.g. breed change) pass inject_layers=TIER_B.
     """
 
     def __init__(
@@ -446,6 +476,10 @@ class FineGrainedAttrPolicy(BasePolicy):
         self.edit_scale = edit_scale
         self.inject_layers = inject_layers if inject_layers is not None else TIER_A
         self.inject_steps_frac = inject_steps_frac
+        self._txt_len_single = 512  # updated in pre_generate
+
+    def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
+        self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         if layer not in self.inject_layers:
@@ -453,30 +487,38 @@ class FineGrainedAttrPolicy(BasePolicy):
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
+        img_offset = txt_len if txt_len > 0 else self._txt_len_single
+
         k_src, k_edit = k.chunk(2)
 
-        # Edit direction in key space
-        edit_dir = k_edit - k_src
+        # Work on image tokens only (positions img_offset:)
+        k_src_img  = k_src[:, :, img_offset:, :]
+        k_edit_img = k_edit[:, :, img_offset:, :]
 
-        # Gram-Schmidt: project edit_dir away from content direction k_src
-        dot       = (edit_dir * k_src).sum(dim=-1, keepdim=True)
-        norm_sq   = (k_src * k_src).sum(dim=-1, keepdim=True) + 1e-8
-        orth_dir  = edit_dir - (dot / norm_sq) * k_src
+        # Gram-Schmidt: project edit direction away from content direction
+        edit_dir  = k_edit_img - k_src_img
+        dot       = (edit_dir * k_src_img).sum(dim=-1, keepdim=True)
+        norm_sq   = (k_src_img * k_src_img).sum(dim=-1, keepdim=True) + 1e-8
+        orth_dir  = edit_dir - (dot / norm_sq) * k_src_img
 
         # Norm-preserving application
-        orig_norm = torch.norm(k_edit, dim=-1, keepdim=True) + 1e-8
-        k_new     = k_src + self.edit_scale * orth_dir
-        k_new     = k_new / (torch.norm(k_new, dim=-1, keepdim=True) + 1e-8) * orig_norm
+        orig_norm = torch.norm(k_edit_img, dim=-1, keepdim=True) + 1e-8
+        k_new_img = k_src_img + self.edit_scale * orth_dir
+        k_new_img = k_new_img / (torch.norm(k_new_img, dim=-1, keepdim=True) + 1e-8) * orig_norm
 
+        # Rebuild: text tokens unchanged, image tokens replaced
+        k_new = k_edit.clone()
+        k_new[:, :, img_offset:, :] = k_new_img
         k = torch.cat([k_src, k_new])
         return q, k, v
 
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────
 
-# Pivotal layer for schnell (§7): double-stream block 1.
-# object (0.555), texture (0.51), style (0.50) all peak there simultaneously —
-# the same joint-encoding signature SVD-Style used to identify Infinity's F₃.
+# Pivotal layer for PFB+SAC: double-stream block 1.
+# From schnell ablation (§5 of Pipeline_Plan.md): object (0.555), texture (0.51),
+# style (0.50) all peak there simultaneously — the same signature SVD-Style used
+# to identify Infinity's F₃. Block 1 is a strong starting hypothesis for dev too.
 _PIVOTAL_LAYER = 1
 
 
@@ -503,7 +545,7 @@ def _extract_style_hidden_states(
     device: str = "cuda",
     height: int = 1024,
     width: int = 1024,
-    num_steps: int = 4,
+    num_steps: int = 28,
     seed: int = 0,
 ) -> Optional[torch.Tensor]:
     """
@@ -589,11 +631,11 @@ def _extract_style_hidden_states(
 
 class StylePersonalizationPolicy(BasePolicy):
     """
-    Reference-image style transfer on FLUX.1-schnell.
+    Reference-image style transfer on FLUX.1-dev.
 
     Adapts SVD-Style (Paper 4) to FLUX's continuous hidden-state space at
-    double-stream layer 1 — schnell's pivotal layer (highest joint object +
-    texture + style sensitivity, §7 of Pipeline_Plan.md).
+    double-stream layer 1 — the pivotal layer where object (0.555), texture
+    (0.51), and style (0.50) peak simultaneously (§5/§7 of Pipeline_Plan.md).
 
     PFB (Principal Feature Blending):
         Applied via forward hook on block 1 output.
@@ -620,7 +662,7 @@ class StylePersonalizationPolicy(BasePolicy):
         self._step_counter = [0]     # mutable ref shared with closure
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
-                     num_steps=4, seed=0, style_image=None, **kwargs):
+                     num_steps=28, seed=0, style_image=None, **kwargs):
         img = style_image if style_image is not None else self.style_image
         if img is not None:
             print("[UltimateFlux] Extracting style features from reference image…")
@@ -634,16 +676,25 @@ class StylePersonalizationPolicy(BasePolicy):
         self._step_counter[0] = 0
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        """SAC: copy Q, K from source branch to edit branch at the pivotal layer."""
+        """SAC: copy image-token Q, K from source branch to edit branch at pivotal layer.
+
+        Text tokens (0:txt_len) are left as-is — both branches share the same prompt
+        for style tasks, so text Q,K are already identical; the clone is just explicit.
+        Only image tokens (txt_len:) carry visual structure worth preserving.
+        """
         if layer != _PIVOTAL_LAYER:
             return q, k, v
         if not _step_active(step, n_steps, self.sac_steps_frac):
             return q, k, v
 
-        q_src, _    = q.chunk(2)
-        k_src, _    = k.chunk(2)
-        q = torch.cat([q_src, q_src.clone()])
-        k = torch.cat([k_src, k_src.clone()])
+        q_src, q_edit = q.chunk(2)
+        k_src, k_edit = k.chunk(2)
+        q_edit = q_edit.clone()
+        k_edit = k_edit.clone()
+        q_edit[:, :, txt_len:, :] = q_src[:, :, txt_len:, :]
+        k_edit[:, :, txt_len:, :] = k_src[:, :, txt_len:, :]
+        q = torch.cat([q_src, q_edit])
+        k = torch.cat([k_src, k_edit])
         return q, k, v
 
     def get_block_hooks(self) -> Dict[int, Callable]:

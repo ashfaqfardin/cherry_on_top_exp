@@ -1,9 +1,20 @@
-# FLUX.1-schnell Editing Pipeline — Plan & Reasoning
+# UltimateFlux — Unified Editing Pipeline (FLUX.1-dev primary target)
 
 Source papers: **StableFlow** (2411.14430, CVPR'25), **FluxSpace** (2412.09611, CVPR'25),
 **FreeFlux** (2503.16153, ICCV'25), **SVD-Style** (2507.04482, arXiv). First three are trained-free
 methods built and validated on **FLUX.1-dev**; SVD-Style is built on **Infinity** (autoregressive), not FLUX.
-Target deployment model for this dissertation: **FLUX.1-schnell**.
+**Primary deployment model: FLUX.1-dev** (all papers validated here; layer sets and hyperparameters are
+paper-confirmed). The schnell ablation study in §5 is preserved as a research contribution and can serve
+as a starting hypothesis for a fast-inference variant.
+
+> **Critical implementation note — text/image token boundary:**
+> In FLUX's attention sequence, the first `max_sequence_length` positions are text tokens (T5 encoding)
+> and the remainder are image tokens. K,V injection must target **only image token positions**
+> (`txt_len:` for double-stream blocks, `max_sequence_length:` for single-stream blocks where
+> `txt_len=0` is passed from the sampler). Injecting text token K,V from the source branch into the edit
+> branch overwrites the edit prompt's text conditioning — which is wrong for all tasks where
+> source_prompt ≠ edit_prompt. FreeFlux enforces this with `kc_tgt_modified[:,:,512:,:]` (512 = default
+> T5 length for dev). Our implementation uses a dynamic `txt_len` / `_txt_len_single` equivalent.
 
 ---
 
@@ -104,14 +115,28 @@ layout, object), across both double-stream (0–18) and single-stream (0–37) b
 
 The dev-derived layer sets from all three FLUX papers need to be **replaced, not reused**, for schnell.
 
-## 6. New organizing principle: two tiers instead of three papers' layer sets
+## 6. Layer tier assignments
 
-**Tier A — "Appearance" layers** (colour, style, material, texture, layout, object — everything that
-collapses after layer 2):
+### 6a. Dev-validated layer sets (primary — from paper implementations)
+
+**Tier A — content-similarity-dependent (FreeFlux ICCV 2025, RoPE frequency analysis):**
+Combined indices `[0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56]`
+Used for: non-rigid editing (freeze appearance), object replacement (global injection), attribute editing.
+
+**Object-addition hotspot layers (FreeFlux, position-dependent / layout):**
+Combined indices `[1, 2, 4, 26, 30, 54, 55]`
+Used for: Phase 1 K,V capture in ObjectAdditionPolicy.
+
+**Tier B — all 57 layers:**
+Used for: background replacement (value-only), shape-linked attribute edits.
+
+### 6b. Schnell-derived tiers (secondary — from §5 ablation study, kept as research data)
+
+**Schnell Tier A — "Appearance" layers** (schnell ablation):
 `double-stream {0, 1, 2}` + `single-stream {3, 9, 34}` (texture/layout secondary taps)
 
-**Tier B — "Structure" layers** (shape/pose — the one attribute that stays distributed):
-most/all layers in both streams — cannot be localized to a small set
+**Schnell Tier B — "Structure" layers** (shape/pose — smeared across all layers):
+most/all layers in both streams.
 
 Every task becomes a combination of which tiers get injected, where, and with what masking.
 
@@ -119,14 +144,14 @@ Every task becomes a combination of which tiers get injected, where, and with wh
 
 | Task | What to inject | Layers | Reasoning / what changed from the raw dev-paper recipe |
 |---|---|---|---|
-| **Non-rigid editing** | Tier A only (freeze appearance); leave Tier B untouched so shape/pose is free to change | `{0,1,2}` double + `{3,9,34}` single | FreeFlux's dev content-similarity set `{0,7,8,9,10,18,25,28,37,42,45,50,56}` mostly shows no independent signal on schnell. Injecting only Tier A freezes texture/material/colour while pose deforms through the untouched (naturally shape-carrying) rest of the network — a clean conceptual fit. |
-| **Object replacement** | Tier A everywhere + Tier B *outside* the target region only (masked) | `{0,1,2}` + `{3,9,34}` (global) + broad mask-restricted Tier B | Drop StableFlow's `{17,18,25,28,53,54,56}` — no elevation there on schnell. Masking Tier B is new: since shape is broad/undifferentiated, un-masked Tier B injection would fight the replacement object's new shape. |
-| **Object addition** | Tier A outside the placement mask (preserve background) + layout-hotspot layers for the two-phase reasoning-before-generation restart | `{0}` double (highest layout signal) + `{3}` single (second-highest layout spike, second overall) | FreeFlux's RoPE-position set `{1,2,4,26,30,54,55}` was derived from *positional* dependency, not semantic ablation, so it isn't directly comparable — layout channel is the closest available proxy. Treat as a hypothesis to validate, not a confirmed swap. The ≥7-step reasoning phase also needs checking against schnell's step budget (see §8). |
-| **Background replacement** | Value-only injection inside the foreground (SAM-2) mask, all layers — unchanged | all 57 | Policy is insensitive to this data (no layer subset is being chosen). Worth an efficiency ablation: layers 3–56 carry little independent semantic weight, so trimming value-injection there may lose nothing while being cheaper. |
-| **Fine-grained attribute editing** | Orthogonal-projection edit concentrated on Tier A for non-shape attributes; broadened to Tier A+B for shape-linked attributes (e.g. "pointier ears") | Tier A for colour/material/style edits; Tier A+B for pose/shape-linked edits | FluxSpace originally applies across "all joint-attention layers" (19 layers). Restricting most edits to 3 layers should be both cheaper and higher-leverage; shape-linked edits are the exception needing the broad footprint. |
-| **Global style edit** | Pooled-CLIP coarse conditioning (network-wide by construction) | unchanged mechanism | Style/colour channels peak hardest at layers 0–2, suggesting the effect locks in very early. Worth testing whether coarse style edits need to be present from the first denoising step to take effect, given how little the deeper layers independently contribute. |
-| **Style personalization (SVD-Style-inspired module)** | SVD decompose + Principal Feature Blending + Structural Attention Correction at the pivotal layer | **double-stream layer 1** | This sensitivity data doubles as the missing "pivotal-layer" probing SVD-Style performed on Infinity. Layer 1 is where object (0.555), texture (0.51), and style (0.50) all peak simultaneously — the same signature SVD-Style used to identify Infinity's F₃ as jointly encoding content+style. Layer 1 (or the 0–2 block) is FLUX/schnell's structural analogue of F₃: SVD-decompose its attention output, exponentially reweight singular values for style transfer (PFB), and use SAC to borrow Q/K from the content branch at that same layer to preserve structure. |
-| **Real-image inversion (latent nudging)** | unaffected by this data directly | — | This plot aggregates over the full trajectory, not per-timestep — it doesn't establish whether schnell also front-loads semantic content in *time* the way it does in *depth*. Needs its own experiment (§8) before nudging strength/scheduling can be finalized. |
+| **Non-rigid editing** | Image-token K,V injection at content-similarity layers | **Dev (primary):** `{0,7,8,9,10,18,25,28,37,42,45,50,56}` (FreeFlux RoPE analysis). **Schnell hypothesis:** `{0,1,2}` double + `{3,9,34}` single | FreeFlux's dev set is RoPE-validated. Injecting only appearance layers freezes texture/colour while pose deforms freely through the uninjected layers. |
+| **Object replacement** | Image-token K,V at appearance layers globally; outside-mask K,V at remaining layers | **Dev:** Tier A global + all-layers masked. **Schnell:** Drop StableFlow `{17,18,25,28,53,54,56}` — no elevation on schnell | Masking Tier B prevents the source object's shape from fighting the new object's replacement shape. |
+| **Object addition** | Two-phase: Phase 1 captures K,V at layout-hotspot layers with source-only generation; Phase 2 injects outside placement mask | **Dev (primary):** `{1,2,4,26,30,54,55}` (FreeFlux position-dependent layers). **Schnell hypothesis:** `{0}` double + `{3}` single | FreeFlux's `{1,2,4,26,30,54,55}` is from positional RoPE dependency analysis — paper-validated on dev. Phase 1 guidance_scale must match Phase 2. |
+| **Background replacement** | Value-only injection inside foreground mask, all layers | all 57 (both dev and schnell) | Task policy is layer-insensitive by design. Efficiency ablation: trimming to Tier A may lose nothing. |
+| **Fine-grained attribute editing** | Orthogonal-projection edit on image-token keys at Tier A | **Dev:** `{0,7,8,9,10,18,25,28,37,42,45,50,56}`. **Schnell:** `{0,1,2}` + `{3,9,34}`. For shape-linked edits use all 57 | FluxSpace uses all 19 joint-attention layers. Orthogonal projection applies to image tokens only — text tokens must be left unchanged. |
+| **Global style edit** | Pooled-CLIP coarse conditioning | unchanged mechanism | Style/colour channels peak hardest at early layers; effect likely locks in fast. |
+| **Style personalization (SVD-Style-inspired module)** | PFB at double-stream block 1 output (image tokens); SAC (image-token Q,K) at block 1 | **double-stream layer 1** (both dev and schnell) | Layer 1 is where object (0.555), texture (0.51), and style (0.50) all peak simultaneously — the same signature SVD-Style used to identify Infinity's F₃. SAC must only replace image-token Q,K (positions `txt_len:`), not text tokens. |
+| **Real-image inversion (latent nudging)** | unaffected by layer assignment | — | StableFlow's λ=1.15 nudging is a dev-derived value; needs validation on schnell. |
 
 ## 8. Open question / next experiment
 

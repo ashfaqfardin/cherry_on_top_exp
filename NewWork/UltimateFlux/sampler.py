@@ -1,5 +1,5 @@
 """
-Shared dual-branch FLUX.1-schnell sampler for UltimateFlux.
+Shared dual-branch FLUX.1-dev sampler for UltimateFlux.
 
 All tasks share a B=2 denoising loop:
   batch index 0 = source/content branch  (unmodified)
@@ -22,14 +22,12 @@ from diffusers.models.embeddings import apply_rotary_emb
 from PIL import Image
 from typing import Optional, List, Tuple, Dict, Callable
 
-# ── Layer tier constants (empirically derived for schnell, §6 of Pipeline_Plan.md) ──
-# Tier A — Appearance: peaks for colour, style, texture, object, layout
-TIER_A_DOUBLE = [0, 1, 2]
-TIER_A_SINGLE_REL = [3, 9, 34]                         # relative within single-stream
-TIER_A_SINGLE = [19 + r for r in TIER_A_SINGLE_REL]   # combined indices
-TIER_A = TIER_A_DOUBLE + TIER_A_SINGLE
+# ── Layer tier constants (from FreeFlux ICCV 2025, validated on FLUX.1-dev) ──
+# Tier A — Content-similarity-dependent layers: appearance, style, texture, object
+# Source: FreeFlux non_rigid_attn_utils.py layer_idx (RoPE frequency analysis)
+TIER_A = [0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56]
 
-# Tier B — Structure: shape/pose, smeared across all layers
+# Tier B — All layers: used when shape/pose deformation is needed
 TIER_B = list(range(57))
 
 N_DOUBLE = 19
@@ -179,7 +177,7 @@ class UltimateFluxAttnProcessor:
 # ────────────────────────── Pipeline helpers ──────────────────────────────────
 
 def load_pipeline(
-    model_path: str = "black-forest-labs/FLUX.1-schnell",
+    model_path: str = "black-forest-labs/FLUX.1-dev",
     hf_token: Optional[str] = None,
     device: str = "cuda",
     cpu_offload: bool = False,
@@ -205,11 +203,11 @@ def generate_dual_branch(
     source_prompt: str,
     edit_prompt: str,
     seed: int = 0,
-    num_steps: int = 4,
-    guidance_scale: float = 0.0,
+    num_steps: int = 28,
+    guidance_scale: float = 3.5,
     height: int = 1024,
     width: int = 1024,
-    max_sequence_length: int = 256,
+    max_sequence_length: int = 512,
     device: str = "cuda",
 ) -> Tuple[Image.Image, Image.Image]:
     """
@@ -228,6 +226,7 @@ def generate_dual_branch(
         seed=seed,
         source_prompt=source_prompt,
         max_sequence_length=max_sequence_length,
+        guidance_scale=guidance_scale,
     )
 
     # 2. Install custom attention processor
