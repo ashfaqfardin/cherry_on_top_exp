@@ -556,8 +556,9 @@ def _extract_style_hidden_states(
         captured: Dict = {}
 
         def _hook(module, inp, out):
-            # Double-stream block returns (hidden_states, encoder_hidden_states)
-            h = out[0] if isinstance(out, tuple) else out
+            # FluxTransformerBlock returns (encoder_hidden_states, hidden_states).
+            # Index 1 = image hidden states — the tensor that carries visual/style info.
+            h = out[1] if (isinstance(out, tuple) and len(out) > 1) else (out[0] if isinstance(out, tuple) else out)
             captured["h_sty"] = h.detach().float()
 
         handle = pipe.transformer.transformer_blocks[_PIVOTAL_LAYER].register_forward_hook(_hook)
@@ -653,24 +654,26 @@ class StylePersonalizationPolicy(BasePolicy):
         step_counter  = self._step_counter
 
         def _pfb_hook(module, inp, out):
+            # FluxTransformerBlock returns (encoder_hidden_states, hidden_states).
+            # out[0] = text hidden states (leave untouched).
+            # out[1] = image hidden states — apply PFB here.
             is_tuple = isinstance(out, tuple)
-            h = out[0] if is_tuple else out
+            has_two  = is_tuple and len(out) >= 2
 
-            step = step_counter[0]
-            # We don't have n_steps here; use pfb_frac as absolute [start, end] step fractions.
-            # Hook fires every forward pass; rely on the sampler's step count.
-            # Count steps by detecting batch transitions: increment after full step completes.
-            # Simple approach: always apply PFB if h_sty is available.
+            h = out[1] if has_two else (out[0] if is_tuple else out)
+
             if h_sty is None or h.shape[0] < 2:
                 return out
 
-            h_edit  = h[1:2]                                 # (1, L, C)
+            h_edit  = h[1:2]                                 # (1, L_img, C)
             h_style = h_sty.to(h.device, dtype=h.dtype)
             h_new   = _apply_pfb(h_edit, h_style, alpha)
             h_out   = torch.cat([h[0:1], h_new], dim=0)
 
-            step_counter[0] += 1                             # one hook call per denoising step
+            step_counter[0] += 1
 
+            if has_two:
+                return (out[0], h_out)   # keep text unchanged, replace image hidden states
             return (h_out,) + out[1:] if is_tuple else h_out
 
         return {_PIVOTAL_LAYER: _pfb_hook}
