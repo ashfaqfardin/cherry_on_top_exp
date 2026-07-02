@@ -807,34 +807,30 @@ class BackgroundReplacePolicy(BasePolicy):
 
 class FineGrainedAttrPolicy(BasePolicy):
     """
-    Identity-preserving attribute editing.  Two injection modes:
+    Identity-preserving attribute editing.  Three injection modes via inject_layers:
 
-    color_transfer=False (default) → K+V injection at inject_layers.
-      inject_layers=None  → _PRESERVE_LAYERS (TIER_A ∪ HOTSPOT, 20 layers).
-                            Tightest identity lock — ADDING an attribute (glasses).
-      inject_layers=TIER_A → Appearance locked, position flexible — BREED changes.
+    None (default) → _PRESERVE_LAYERS (TIER_A ∪ HOTSPOT, 20 layers).
+        Tightest identity lock — for ADDING an attribute (glasses).
 
-    color_transfer=True → No attention injection at all.
-      Both branches generate freely from the same shared latent.
-      Because FLUX text-conditioning is strong, the source branch ("black hair")
-      and edit branch ("blonde hair") produce images with very similar composition
-      but different colour.  After decoding, _lab_color_transfer is applied as
-      post-processing: the Delta-E difference map auto-detects the changing region
-      and blends L*a*b* values from the edit image into the source image there.
-      This changes ONLY the colour-changed pixels — everything else is untouched.
+    list(range(N_DOUBLE)) → double-stream blocks only (layers 0-18).
+        All 19 joint text-image blocks are locked (same identity, same scene).
+        All 38 single-stream blocks are FREE — text drives colour there.
+        Use for COLOUR changes (hair colour, car colour): identity stays,
+        colour is rendered freely in the single-stream refinement stage.
+
+    TIER_A → Appearance locked, position flexible — BREED / shape changes.
     """
     _PRESERVE_LAYERS = sorted(set(TIER_A) | {1, 2, 4, 26, 30, 54, 55})  # 20 layers
+    _DOUBLE_STREAM   = list(range(N_DOUBLE))                               # 0-18
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
-        color_transfer: bool = False,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
         self._inject_layers = (
             inject_layers if inject_layers is not None else self._PRESERVE_LAYERS
         )
-        self._color_transfer = color_transfer
         self.inject_steps_frac = inject_steps_frac
         self._txt_len_single = 512
 
@@ -842,9 +838,6 @@ class FineGrainedAttrPolicy(BasePolicy):
         self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        if self._color_transfer:
-            return q, k, v  # no injection — post_process handles colour change
-
         if layer not in self._inject_layers:
             return q, k, v
         if not _step_active(step, n_steps, self.inject_steps_frac):
@@ -853,12 +846,6 @@ class FineGrainedAttrPolicy(BasePolicy):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
         k, v = _kv_full_inject(k, v, img_offset)
         return q, k, v
-
-    def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
-        if not self._color_transfer:
-            return edit_img
-        print("[UltimateFlux] Applying LAB colour transfer…")
-        return _lab_color_transfer(src_img, edit_img)
 
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────

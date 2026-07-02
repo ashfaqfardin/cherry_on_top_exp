@@ -105,16 +105,18 @@ def build_policy(cfg: dict):
 
     if task == "attr_edit":
         inject_layers_raw = cfg.get("inject_layers", None)
-        color_transfer = inject_layers_raw in ("color", "colour", "hotspot")
-        if color_transfer:
-            inject_layers = None            # not used in color_transfer mode
+        if inject_layers_raw in ("color", "colour"):
+            # Double-stream-only K+V: locks semantic identity in the 19 joint
+            # text-image blocks; the 38 single-stream blocks remain free so the
+            # edit-prompt colour ("blonde hair", "blue car") can render there.
+            from NewWork.UltimateFlux.sampler import N_DOUBLE as _ND
+            inject_layers = list(range(_ND))
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
         else:
             inject_layers = None            # default → _PRESERVE_LAYERS, K+V
         return FineGrainedAttrPolicy(
             inject_layers=inject_layers,
-            color_transfer=color_transfer,
             inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
         )
 
@@ -238,7 +240,7 @@ def parse_args():
                    help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "tier_a"],
-                   help="attr_edit mode: color=LAB colour transfer (hair/car), tier_a=shape/breed change")
+                   help="attr_edit mode: color=double-stream K+V only (hair/car colour), tier_a=breed/shape change")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)

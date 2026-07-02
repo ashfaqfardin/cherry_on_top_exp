@@ -2,15 +2,16 @@
 # Task 5 — Fine-grained attribute editing
 #
 # inject_layers controls how strongly the source is preserved:
-#   (default / omit)  → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
-#                        Strong identity lock — for ADDING an attribute
-#                        (glasses, hat, beard).
-#   --inject_layers hotspot → HOTSPOT only (7 layers)
-#                        Spatial structure preserved, appearance FREE —
-#                        for CHANGING colour or texture (hair, car, coat).
+#   (default / omit)      → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
+#                            Tightest identity lock — for ADDING an attribute
+#                            (glasses, hat, beard).
+#   --inject_layers color → double-stream blocks only (layers 0-18, 19 layers)
+#                            Semantic identity locked in joint text-image blocks.
+#                            38 single-stream blocks FREE → edit prompt drives colour.
+#                            Use for hair colour, car colour, clothing colour changes.
 #   --inject_layers tier_a  → TIER_A only (13 layers)
-#                        Appearance preserved, position flexible —
-#                        for shape-linked edits (breed change).
+#                            Appearance preserved, position flexible —
+#                            for shape-linked edits (breed change).
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
