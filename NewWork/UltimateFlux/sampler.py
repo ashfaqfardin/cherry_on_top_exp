@@ -296,55 +296,9 @@ def generate_dual_branch(
     return src_img, edit_img
 
 
-# ──────────────────── Latent-space colour editing ─────────────────────────────
 
-def _latent_blend(
-    z_src: torch.Tensor,
-    z_edit: torch.Tensor,
-    top_k: int = 0,
-    alpha: float = 1.0,
-) -> torch.Tensor:
-    """
-    Colour replacement in FLUX packed latent space — no pixel-space ops.
 
-    Both z_src and z_edit are generated from the same seed (same z_T), so
-    composition is nearly identical.  The colour prompt drives most of the
-    latent delta.
-
-    Soft per-token mask (the key insight):
-        w[i] = ‖delta[i]‖₂ / p95(‖delta‖₂)   clipped to [0, 1]
-        Tokens in the coloured region (car body, hair) changed the most
-        between source and edit → w ≈ 1 → new colour applied fully.
-        Tokens that barely changed (plates, background, face) → w ≈ 0
-        → z_src preserved → structure intact.
-
-    Optional SVD low-rank filter (top_k > 0):
-        Replace delta with its rank-k approximation before masking.
-        Top-k singular vectors capture the dominant GLOBAL colour shift
-        in channel space; local structural drift (which is lower-rank)
-        is discarded.  Start with top_k=0; increase if colour is weak.
-
-    z_src, z_edit : (1, N, C) FLUX packed latents  (bfloat16 or float16)
-    top_k         : 0 = no SVD  |  1–8 = keep top-k singular vectors
-    alpha         : delta scale (1.0 = full swap | >1 = amplify colour)
-    """
-    delta = z_edit.float() - z_src.float()    # (1, N, C)
-
-    if top_k > 0:
-        d        = delta[0]                                       # (N, C)
-        U, S, Vh = torch.linalg.svd(d, full_matrices=False)
-        k        = min(top_k, S.shape[0])
-        delta    = ((U[:, :k] * S[:k]) @ Vh[:k, :]).unsqueeze(0) # (1, N, C)
-
-    # Robust per-token mask: use 95th-percentile as scale so one outlier
-    # token doesn't compress all others to near-zero weight.
-    norms = delta[0].norm(dim=-1)                                 # (N,)
-    scale = torch.quantile(norms, 0.95).clamp(min=1e-6)
-    w     = (norms / scale).clamp(max=1.0)                       # (N,) ∈ [0, 1]
-
-    z_out = z_src.float() + alpha * w.unsqueeze(-1).unsqueeze(0) * delta
-    return z_out.to(z_src.dtype)
-
+# ──────────────────── Split-denoising colour editing ──────────────────────────
 
 def _decode_latents(
     pipe: FluxPipeline,
@@ -352,7 +306,7 @@ def _decode_latents(
     height: int,
     width: int,
 ) -> Image.Image:
-    """Unpack FLUX packed latents and decode via the VAE → PIL image."""
+    """Unpack FLUX packed latents and decode via the VAE -> PIL image."""
     vae_scale = getattr(pipe, "vae_scale_factor", 8)
     latents   = pipe._unpack_latents(packed_latents, height, width, vae_scale)
     latents   = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
@@ -365,7 +319,7 @@ def generate_p2p(
     pipe: FluxPipeline,
     source_prompt: str,
     edit_prompt: str,
-    inject_layers: List[int],          # unused; kept for API compat
+    inject_layers: List[int],           # unused; kept for API compat
     seed: int = 0,
     num_steps: int = 28,
     guidance_scale: float = 3.5,
@@ -373,71 +327,147 @@ def generate_p2p(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
-    anchor_end_frac: float = 0.0,      # unused; kept for API compat
-    freq_sigma: float = 0.0,           # unused; kept for API compat
-    img2img_strength: float = 0.6,     # unused; kept for API compat
-    source_color: str = "",            # unused; kept for API compat
-    target_color: str = "",            # unused; kept for API compat
-    edge_strength: float = 0.7,        # unused; kept for API compat
-    latent_top_k: int = 0,
-    latent_alpha: float = 1.0,
+    anchor_end_frac: float = 0.0,       # unused; kept for API compat
+    freq_sigma: float = 0.0,            # unused; kept for API compat
+    img2img_strength: float = 0.6,      # unused; kept for API compat
+    source_color: str = "",             # unused; kept for API compat
+    target_color: str = "",             # unused; kept for API compat
+    edge_strength: float = 0.7,         # unused; kept for API compat
+    latent_top_k: int = 0,              # unused; kept for API compat
+    latent_alpha: float = 1.0,          # unused; kept for API compat
+    color_structure_frac: float = 0.4,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Colour editing via latent-space delta blending — two FLUX passes, no CV.
+    Colour editing via split-denoising: shared structure phase -> diverged colour phase.
 
-    Pass 1 — pipe(source_prompt, seed) → z_src  (packed latent, skip VAE decode)
-    Pass 2 — pipe(edit_prompt,   seed) → z_edit (packed latent, same z_T)
+    The num_steps denoising steps are split at N = round(color_structure_frac * num_steps):
 
-    Both passes start from the same noise z_T (same generator seed), so the
-    scene composition is nearly identical.  The colour change in the edit
-    prompt drives a large, spatially concentrated delta in the latent.
+    Phase 1  steps [0, N)   -- source prompt, single branch:
+        Both source and edit will share this denoising prefix.
+        Early steps commit the global composition -- car position, plate
+        location, face layout -- as a joint latent z_N.
 
-    Blend (pure latent arithmetic):
-        delta    = z_edit − z_src
-        [SVD]    delta ← rank-k(delta)       if latent_top_k > 0
-        w[i]     = ‖delta[i]‖ / p95‖delta‖  per-token soft mask
-        z_result = z_src + alpha × w × delta
+    Phase 2  steps [N, end) -- two branches, batched in one transformer call:
+        Source branch: continues with source_prompt -> renders red car.
+        Edit   branch: starts from z_N, uses edit_prompt -> renders blue car.
+        Because both branches are initialised from the IDENTICAL z_N, the
+        structure is locked by construction. No blending, no CV, no injection.
 
-    Why license plates / face are preserved:
-        Those regions are the same colour in both passes (they're not the
-        car body / hair) → delta ≈ 0 there → w ≈ 0 → z_src preserved.
+    This eliminates the "overlap of two images" artifact that comes from
+    blending independently-denoised latents: both branches share the same
+    trajectory up to step N, guaranteeing structural alignment.
 
-    latent_top_k (default 0 — try 4 if colour is weak):
-        SVD extracts the dominant global colour direction in channel space.
-        Discards local structural drift that crept in from prompt wording.
-
-    latent_alpha (default 1.0 — try 1.2 to amplify):
-        Scales the colour delta.  >1 overshoots slightly, giving a stronger
-        colour impression (useful when the delta is subtle).
+    color_structure_frac (tune in JSON / CLI):
+        0.2  ~5 shared steps   more colour freedom, slight drift risk
+        0.4  ~11 shared steps  good balance (default)
+        0.6  ~17 shared steps  very strong structure lock
 
     Returns (src_img, edit_img).
     """
     exec_device = getattr(pipe, "_execution_device", device)
+    split_step  = max(1, int(color_structure_frac * num_steps))
 
-    def _run_latent(prompt: str) -> torch.Tensor:
-        return pipe(
-            prompt=prompt,
-            num_inference_steps=num_steps,
-            guidance_scale=guidance_scale,
-            height=height,
-            width=width,
-            max_sequence_length=max_sequence_length,
-            generator=torch.Generator(device=exec_device).manual_seed(seed),
-            output_type="latent",
-        ).images                              # (1, N, C) packed latent tensor
+    # -- Encode both prompts --------------------------------------------------
+    def _encode(prompt: str):
+        enc = pipe.encode_prompt(
+            prompt, prompt_2=None, device=exec_device,
+            num_images_per_prompt=1, max_sequence_length=max_sequence_length,
+        )
+        # Recent diffusers: (pe, pp, txt_ids).  Older: 6 values.
+        if len(enc) == 3:
+            pe, pp, txt_ids = enc
+        else:
+            pe, _, pp, _, txt_ids, _ = enc
+        return pe, pp, txt_ids
 
-    print("[UltimateFlux P2P] Pass 1: generating source latent…")
-    z_src = _run_latent(source_prompt)
+    src_pe,  src_pp,  src_txt  = _encode(source_prompt)
+    edit_pe, edit_pp, edit_txt = _encode(edit_prompt)
 
-    print("[UltimateFlux P2P] Pass 2: generating edit latent (same seed)…")
-    z_edit = _run_latent(edit_prompt)
+    # -- Initial packed latent z_T --------------------------------------------
+    vae_scale = getattr(pipe, "vae_scale_factor", 8)
+    num_ch    = pipe.transformer.config.in_channels // 4   # VAE channels = 16
+    lat_h     = 2 * (height // (vae_scale * 2))           # unpacked latent H
+    lat_w     = 2 * (width  // (vae_scale * 2))           # unpacked latent W
 
-    print(
-        f"[UltimateFlux P2P] Blending in latent space "
-        f"(top_k={latent_top_k}, alpha={latent_alpha})…"
+    gen   = torch.Generator(device=exec_device).manual_seed(seed)
+    raw_z = randn_tensor(
+        (1, num_ch, lat_h, lat_w),
+        generator=gen, device=exec_device, dtype=src_pe.dtype,
     )
-    z_blend = _latent_blend(z_src, z_edit, top_k=latent_top_k, alpha=latent_alpha)
+    z_T     = pipe._pack_latents(raw_z, 1, num_ch, lat_h, lat_w)   # (1, N, 64)
+    img_ids = pipe._prepare_latent_image_ids(
+        1, lat_h // 2, lat_w // 2, exec_device, src_pe.dtype,
+    )                                                                 # (1, N, 3)
 
-    src_img  = _decode_latents(pipe, z_src,   height, width)
-    edit_img = _decode_latents(pipe, z_blend, height, width)
+    # -- Timesteps: match pipe()'s schedule -----------------------------------
+    pipe.scheduler.set_timesteps(num_steps, device=exec_device)
+    timesteps = pipe.scheduler.timesteps                              # length = num_steps
+
+    has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
+
+    def _transformer_step(
+        lat: torch.Tensor,
+        t: torch.Tensor,
+        pe: torch.Tensor,
+        pp: torch.Tensor,
+        txt: torch.Tensor,
+    ) -> torch.Tensor:
+        B  = lat.shape[0]
+        ts = t.expand(B)
+        g  = (torch.full([B], guidance_scale, device=exec_device, dtype=lat.dtype)
+              if has_guidance else None)
+        noise = pipe.transformer(
+            hidden_states=lat,
+            timestep=ts / 1000.0,
+            guidance=g,
+            pooled_projections=pp,
+            encoder_hidden_states=pe,
+            txt_ids=txt,
+            img_ids=img_ids.expand(B, -1, -1),
+            return_dict=False,
+        )[0]
+        return pipe.scheduler.step(noise, t, lat, return_dict=False)[0]
+
+    # -- Phase 1: single branch with source prompt ----------------------------
+    print(f"[UltimateFlux P2P] Phase 1: {split_step} shared steps (source prompt)...")
+    latents = z_T.clone()
+    for t in timesteps[:split_step]:
+        latents = _transformer_step(latents, t, src_pe, src_pp, src_txt)
+
+    z_split  = latents.clone()   # structure checkpoint -- both branches fork here
+    lat_src  = z_split.clone()
+    lat_edit = z_split.clone()
+
+    # -- Phase 2: two branches batched into one transformer call per step -----
+    print(
+        f"[UltimateFlux P2P] Phase 2: {num_steps - split_step} diverged steps "
+        f"(source | edit batched)..."
+    )
+    for t in timesteps[split_step:]:
+        # Concatenate both branches -- one forward pass handles both.
+        lat_b  = torch.cat([lat_src, lat_edit])                  # (2, N, 64)
+        pe_b   = torch.cat([src_pe,  edit_pe])
+        pp_b   = torch.cat([src_pp,  edit_pp])
+        txt_b  = torch.cat([src_txt, edit_txt])
+        ts     = t.expand(2)
+        g      = (torch.full([2], guidance_scale, device=exec_device, dtype=lat_b.dtype)
+                  if has_guidance else None)
+
+        noise_b = pipe.transformer(
+            hidden_states=lat_b,
+            timestep=ts / 1000.0,
+            guidance=g,
+            pooled_projections=pp_b,
+            encoder_hidden_states=pe_b,
+            txt_ids=txt_b,
+            img_ids=img_ids.expand(2, -1, -1),
+            return_dict=False,
+        )[0]
+
+        noise_src, noise_edit = noise_b.chunk(2)
+        lat_src  = pipe.scheduler.step(noise_src,  t, lat_src,  return_dict=False)[0]
+        lat_edit = pipe.scheduler.step(noise_edit, t, lat_edit, return_dict=False)[0]
+
+    src_img  = _decode_latents(pipe, lat_src,  height, width)
+    edit_img = _decode_latents(pipe, lat_edit, height, width)
     return src_img, edit_img

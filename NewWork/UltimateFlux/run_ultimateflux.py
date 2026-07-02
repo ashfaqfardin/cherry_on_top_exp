@@ -155,12 +155,9 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  edit_prompt:   {edit_prompt}")
 
     if policy is None:
-        # Colour editing: two FLUX passes (same seed) → latent-space delta blend.
-        # No pixel-space CV.  The soft per-token mask (delta norm) identifies
-        # which latent tokens changed most (= the coloured region) and applies
-        # the colour shift there while leaving everything else at z_src.
-        # latent_top_k: 0=soft mask only | 4=+SVD for dominant colour direction
-        # latent_alpha: 1.0=full swap | 1.2=amplify if colour looks weak
+        # Colour editing: split-denoising — shared structure phase (source prompt),
+        # then two branches diverge from the same z_N checkpoint.
+        # color_structure_frac controls the split point (0.4 = 11/28 shared steps).
         src_img, edit_img = generate_p2p(
             pipe=pipe,
             source_prompt=source_prompt,
@@ -173,8 +170,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
-            latent_top_k=cfg.get("latent_top_k", 0),
-            latent_alpha=cfg.get("latent_alpha", 1.0),
+            color_structure_frac=cfg.get("color_structure_frac", 0.4),
         )
     else:
         src_img, edit_img = generate_dual_branch(
@@ -262,10 +258,8 @@ def parse_args():
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "tier_a"],
                    help="attr_edit mode: color=latent delta blend (2 FLUX passes), tier_a=breed/shape change")
-    p.add_argument("--latent_top_k",  type=int,   default=0,
-                   help="SVD rank for latent delta (0=soft mask only | 4=+SVD global colour; default 0)")
-    p.add_argument("--latent_alpha",  type=float, default=1.0,
-                   help="Colour delta scale (1.0=full swap | 1.2=amplify; default 1.0)")
+    p.add_argument("--color_structure_frac", type=float, default=0.4,
+                   help="Fraction of steps shared (structure phase) before colour branches diverge (default 0.4)")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
@@ -322,9 +316,8 @@ def main():
         "fg_mask_image":  args.fg_mask_image,
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
-        "inject_layers":  args.inject_layers,
-        "latent_top_k":   args.latent_top_k,
-        "latent_alpha":   args.latent_alpha,
+        "inject_layers":        args.inject_layers,
+        "color_structure_frac": args.color_structure_frac,
         "pfb_alpha":     args.pfb_alpha,
         "seed":          args.seed,
         "num_steps":     args.num_steps,

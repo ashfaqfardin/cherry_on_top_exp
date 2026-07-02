@@ -103,14 +103,13 @@
       "seed": 30
     },
     {
-      "comment": "Latent delta blend: two FLUX passes (same seed) → soft per-token mask from delta norm selects the coloured region in latent space; no CV. latent_top_k=0 uses mask only; try 4 to add SVD global-colour filter. latent_alpha>1 amplifies if change is weak.",
+      "comment": "Split-denoising colour edit: shared Phase 1 (source prompt, first ~40% of steps) locks structure, then Phase 2 diverges into source and edit branches from the same z_N. No CV, no pixel blending. Tune color_structure_frac: 0.2=more colour freedom, 0.4=default balance, 0.6=tightest structure lock.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
-      "latent_top_k": 0,
-      "latent_alpha": 1.0,
+      "color_structure_frac": 0.4,
       "seed": 35
     },
     {
@@ -119,8 +118,7 @@
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
-      "latent_top_k": 0,
-      "latent_alpha": 1.0,
+      "color_structure_frac": 0.4,
       "seed": 40
     },
     {
