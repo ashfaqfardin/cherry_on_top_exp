@@ -159,20 +159,27 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         # Pass 1 → image_a (source_prompt + seed), recording K,V at all double-stream layers.
         # Pass 2 → edit image (edit_prompt + same z_T), injecting stored K,V.
         # Single-stream blocks (19-56) are free → edit text drives colour there.
-        # Colour mode: no attention injection.
-        # For prompts that differ only in a colour word, FLUX's same-seed
-        # determinism already keeps composition identical — the structural tokens
-        # ("sports car on a road", "woman with … hair") dominate the trajectory;
-        # only the colour token differs → colour changes, everything else stays.
-        # inject_steps_frac is used as a fallback anchor: if face/car drifts,
-        # set e.g. [0.0, 0.15] to add light K+V anchoring for the first 4 steps.
-        anchor_frac = tuple(cfg.get("inject_steps_frac", [0.0, 0.0]))
-        anchor_layers = [1, 2, 4]  # layout hotspot layers (double-stream only)
+        # Colour mode: P2P with K+V at 9 critical double-stream layers.
+        #
+        # All 19 double-stream → colour was mostly locked (V_src carries source colour).
+        # 0 layers (no injection) → whole car/person changes (no identity anchor).
+        #
+        # 9 layers = TIER_A∩DS ∪ HOTSPOT∩DS = [0,1,2,4,7,8,9,10,18]:
+        #   - Anchors identity at the most semantically important layers.
+        #   - Frees 10 other double-stream + 38 single-stream (48 total) to carry
+        #     the edit colour from the text ("blue car", "blonde hair").
+        #
+        # Fallback tuning: add "inject_steps_frac":[0.0,0.5] to the JSON run to
+        # limit anchoring to the first half of steps, freeing the second half
+        # completely (stronger colour change, slight identity risk).
+        _DS_TIER_A   = [l for l in TIER_A if l < N_DOUBLE]  # [0,7,8,9,10,18]
+        _DS_HOTSPOT  = [1, 2, 4]
+        _color_layers = sorted(set(_DS_TIER_A) | set(_DS_HOTSPOT))  # 9 layers
         src_img, edit_img = generate_p2p(
             pipe=pipe,
             source_prompt=source_prompt,
             edit_prompt=edit_prompt,
-            inject_layers=anchor_layers if anchor_frac[1] > 0.0 else [],
+            inject_layers=_color_layers,
             seed=seed,
             num_steps=num_steps,
             guidance_scale=guidance,
@@ -180,8 +187,8 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
-            k_only=False,            # K+V at hotspot layers if anchoring is on
-            inject_steps_frac=anchor_frac,
+            k_only=False,
+            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
         )
     else:
         src_img, edit_img = generate_dual_branch(

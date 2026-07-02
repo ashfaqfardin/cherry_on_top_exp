@@ -5,12 +5,12 @@
 #   (default / omit)      → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
 #                            Tightest identity lock — for ADDING an attribute
 #                            (glasses, hat, beard).
-#   --inject_layers color → No-injection two-pass: Pass 1 = image_a (source).
-#                            Pass 2 = same z_T + edit prompt, no attention injection.
-#                            FLUX same-seed determinism keeps composition identical
-#                            when prompts differ only in a colour word — only the
-#                            colour changes. Add --inject_steps_frac 0.0 0.15 if
-#                            face/car drifts (light K+V anchor at steps 0-4 only).
+#   --inject_layers color → P2P K+V at 9 critical double-stream layers
+#                            [0,1,2,4,7,8,9,10,18] (TIER_A∩DS ∪ HOTSPOT∩DS).
+#                            Identity anchored; 10 freed DS + 38 SS layers carry
+#                            the new colour from the edit text. If colour is still
+#                            weak add --inject_steps_frac 0.0 0.5 (limit anchoring
+#                            to first half; second half fully free for colour).
 #   --inject_layers tier_a  → TIER_A only (13 layers)
 #                            Appearance preserved, position flexible —
 #                            for shape-linked edits (breed change).

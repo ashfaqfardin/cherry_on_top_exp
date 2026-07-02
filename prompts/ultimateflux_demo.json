@@ -103,12 +103,13 @@
       "seed": 30
     },
     {
-      "comment": "Colour mode: no injection — same-seed FLUX keeps composition identical, only colour token differs. If face drifts, add inject_steps_frac:[0.0,0.15] for light early-step K+V anchor.",
+      "comment": "Colour mode: K+V at 9 critical DS layers [0,1,2,4,7,8,9,10,18]. Identity anchored; 10 freed DS + 38 SS layers carry new colour. Add inject_steps_frac:[0.0,0.5] if colour still weak.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 35
     },
     {
@@ -117,6 +118,7 @@
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
+      "inject_steps_frac": [0.0, 1.0],
       "seed": 40
     },
     {
