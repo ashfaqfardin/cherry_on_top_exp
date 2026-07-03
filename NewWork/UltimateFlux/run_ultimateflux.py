@@ -269,7 +269,6 @@ def parse_args():
                    help="Denoising step (0-indexed) at which PFB latent correction fires (default 3)")
     p.add_argument("--pfb_alpha",  type=float, default=1.0,
                    help="SVD reweighting strength for PFB (default 1.0)")
-    p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
     p.add_argument("--guidance_scale",type=float, default=3.5)
@@ -330,7 +329,6 @@ def main():
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
-        "pfb_alpha":     args.pfb_alpha,
         "seed":          args.seed,
         "num_steps":     args.num_steps,
         "guidance_scale":args.guidance_scale,
