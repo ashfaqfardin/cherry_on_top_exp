@@ -416,6 +416,7 @@ def generate_p2p(
     else:
         pipe.scheduler.set_timesteps(num_steps, device=exec_device)
     timesteps = pipe.scheduler.timesteps                              # length = num_steps
+    sigmas    = pipe.scheduler.sigmas                                 # length = num_steps+1
 
     has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
 
@@ -457,8 +458,8 @@ def generate_p2p(
         f"[UltimateFlux P2P] Phase 2: {num_steps - split_step} diverged steps "
         f"(source | edit batched)..."
     )
-    for t in timesteps[split_step:]:
-        # Concatenate both branches -- one forward pass handles both.
+    for i, t in enumerate(timesteps[split_step:]):
+        # Concatenate both branches — one forward pass handles both.
         lat_b  = torch.cat([lat_src, lat_edit])                  # (2, N, 64)
         pe_b   = torch.cat([src_pe,  edit_pe])                   # (2, T, C)
         pp_b   = torch.cat([src_pp,  edit_pp])                   # (2, C)
@@ -481,8 +482,14 @@ def generate_p2p(
         )[0]
 
         noise_src, noise_edit = noise_b.chunk(2)
-        lat_src  = pipe.scheduler.step(noise_src,  t, lat_src,  return_dict=False)[0]
-        lat_edit = pipe.scheduler.step(noise_edit, t, lat_edit, return_dict=False)[0]
+        # Apply Euler step directly: scheduler._step_index advances by 1 per
+        # scheduler.step() call, so calling it twice per timestep (src + edit)
+        # would double-advance the index and crash at the boundary.
+        # Flow matching Euler: x_{t-1} = x_t + (σ_{t-1} - σ_t) * v_pred
+        si       = split_step + i
+        dt       = sigmas[si + 1] - sigmas[si]                    # negative scalar
+        lat_src  = lat_src  + dt * noise_src
+        lat_edit = lat_edit + dt * noise_edit
 
     src_img  = _decode_latents(pipe, lat_src,  height, width)
     edit_img = _decode_latents(pipe, lat_edit, height, width)
