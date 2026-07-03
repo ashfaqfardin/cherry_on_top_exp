@@ -338,8 +338,10 @@ def generate_dual_branch(
     src_img  = result.images[0]
     edit_img = policy.post_process(src_img, result.images[1])
 
-    if save_intermediates and intermediate_out_dir and captured:
-        _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir)
+    if save_intermediates and intermediate_out_dir:
+        if captured:
+            _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir)
+        _save_color_mask(policy, intermediate_out_dir, height, width)
 
     return src_img, edit_img
 
@@ -494,6 +496,36 @@ def _save_intermediate_grids(
     edit_strip.save(os.path.join(out_dir, "edit_intermediate.png"))
     compare.save(   os.path.join(out_dir, "compare_intermediate.png"))
     print(f"  Intermediates → {out_dir}/{{source,edit,compare}}_intermediate.png")
+
+
+def _save_color_mask(policy, out_dir: str, height: int, width: int) -> None:
+    """
+    If the policy has a built editing-region mask, save it as editing_mask.png.
+
+    White pixels = editing region (hair/car body — target V used here).
+    Black pixels = preserved region (face/background — source V used here).
+    """
+    import numpy as np
+
+    mask = getattr(policy, "_mask", None)
+    if mask is None:
+        return
+
+    # FLUX packs latents: 1024px → 128px (VAE ÷8) → 64px (÷2 pack) → 64×64 = 4096 tokens
+    h_tok = height // 16
+    w_tok = width  // 16
+    if mask.numel() != h_tok * w_tok:
+        print(f"  [mask] unexpected size {mask.numel()}, expected {h_tok * w_tok}; skipping")
+        return
+
+    # mask: 0 = editing region, 1 = preserved → invert so editing shows white
+    mask_2d   = (1.0 - mask.float().cpu()).reshape(h_tok, w_tok).numpy()
+    mask_img  = Image.fromarray((mask_2d * 255).astype(np.uint8), mode="L")
+    mask_img  = mask_img.resize((width, height), Image.NEAREST)
+
+    save_path = os.path.join(out_dir, "editing_mask.png")
+    mask_img.save(save_path)
+    print(f"  Mask → {save_path}")
 
 
 @torch.no_grad()
