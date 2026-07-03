@@ -114,7 +114,7 @@
       "ds_key_inject": true,
       "color_word": "blonde",
       "top_k_frac": 0.25,
-      "mask_build_step": 5,
+      "mask_build_step": 20,
       "seed": 35
     },
     {
@@ -128,7 +128,7 @@
       "ds_key_inject": true,
       "color_word": "blue",
       "top_k_frac": 0.3,
-      "mask_build_step": 5,
+      "mask_build_step": 20,
       "seed": 40
     },
     {
