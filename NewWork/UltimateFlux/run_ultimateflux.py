@@ -262,8 +262,8 @@ def parse_args():
     p.add_argument("--sam2_model_id", default="facebook/sam2-hiera-large",
                    help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--inject_layers", default=None,
-                   choices=["color", "tier_a"],
-                   help="attr_edit mode: color=ColorCtrl attention editing, tier_a=breed/shape change")
+                   choices=["color", "double_stream", "tier_a"],
+                   help="attr_edit mode: double_stream=K+V lock 19 joint blocks (colour change), color=ColorCtrl mask-based, tier_a=breed/shape change")
     p.add_argument("--top_k_frac",  type=float, default=0.2,
                    help="ColorCtrl: fraction of image tokens treated as editing region (default 0.2)")
     p.add_argument("--qk_frac",    type=float, default=1.0,
