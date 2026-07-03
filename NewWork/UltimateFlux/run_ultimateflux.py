@@ -59,6 +59,7 @@ from NewWork.UltimateFlux.policies import (
     ObjectReplacementPolicy,
     BackgroundReplacePolicy,
     FineGrainedAttrPolicy,
+    ColorCtrlPolicy,
     StylePersonalizationPolicy,
 )
 
@@ -108,11 +109,14 @@ def build_policy(cfg: dict):
     if task == "attr_edit":
         inject_layers_raw = cfg.get("inject_layers", None)
         if inject_layers_raw in ("color", "colour"):
-            # Lock all 19 MM-DiT double-stream blocks (identity, structure, composition).
-            # Leave all 38 single-stream blocks free — edit prompt drives colour there.
-            # This is the FreeFlux/StableFlow K,V injection approach applied inside
-            # generate_dual_branch (same z_T shared latent, custom attention processor).
-            inject_layers = FineGrainedAttrPolicy._DOUBLE_STREAM
+            # ColorCtrl (arXiv:2508.09131): attention-based colour editing.
+            # Applied at ALL layers and ALL timesteps — no manual selection.
+            # top_k_frac controls editing-region size (20% default):
+            #   higher → more pixels allowed to change colour
+            #   lower  → tighter background preservation
+            return ColorCtrlPolicy(
+                top_k_frac=cfg.get("top_k_frac", 0.2),
+            )
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
         else:
@@ -242,17 +246,19 @@ def parse_args():
                    help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "tier_a"],
-                   help="attr_edit mode: color=latent delta blend (2 FLUX passes), tier_a=breed/shape change")
+                   help="attr_edit mode: color=ColorCtrl attention editing, tier_a=breed/shape change")
+    p.add_argument("--top_k_frac",  type=float, default=0.2,
+                   help="ColorCtrl: fraction of image tokens treated as editing region (default 0.2)")
     p.add_argument("--color_structure_frac", type=float, default=0.0,
                    help="Unused; kept for backward compat")
     p.add_argument("--inject_frac", type=float, default=0.5,
-                   help="Fraction of steps to run SAC (Q+K injection, default 0.5)")
+                   help="Unused; kept for backward compat")
     p.add_argument("--pfb_step",   type=int,   default=3,
-                   help="Denoising step (0-indexed) at which PFB latent correction fires (default 3)")
+                   help="Unused; kept for backward compat")
     p.add_argument("--pfb_alpha",   type=float, default=1.0,
-                   help="SVD reweighting strength for PFB (default 1.0)")
+                   help="Unused; kept for backward compat")
     p.add_argument("--delta_scale", type=float, default=1.5,
-                   help="Colour-delta amplification (1.0=edit only, 1.5=amplified, default 1.5)")
+                   help="Unused; kept for backward compat")
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
     p.add_argument("--guidance_scale",type=float, default=3.5)
@@ -309,6 +315,7 @@ def main():
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
         "inject_layers":        args.inject_layers,
+        "top_k_frac":           args.top_k_frac,
         "color_structure_frac": args.color_structure_frac,
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,

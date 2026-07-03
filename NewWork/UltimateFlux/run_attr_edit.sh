@@ -5,14 +5,14 @@
 #   (default / omit)        → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
 #                              Tightest identity lock — for ADDING an attribute
 #                              (glasses, hat, beard).
-#   --inject_layers color   → K,V injection at ALL 19 MM-DiT double-stream blocks
-#                              (layers 0-18, FreeFlux/StableFlow approach).
-#                              Both branches share the same z_T; source K,V are
-#                              injected into the edit branch at double-stream blocks
-#                              to lock identity/structure (face, car body, layout).
-#                              The 38 single-stream blocks are left FREE — the edit
-#                              prompt drives colour there without interference.
-#                              Tune via --inject_steps_frac (default: 0.0 1.0 = all steps).
+#   --inject_layers color   → ColorCtrl (arXiv:2508.09131) — all layers, all steps.
+#                              Structure Preservation: source K^image injected into
+#                              target at every layer (locks geometry/layout).
+#                              Color Preservation: vision-to-text attention mask
+#                              identifies editing region (top --top_k_frac tokens);
+#                              source V^image is copied to non-editing tokens,
+#                              editing region keeps target V (new colour).
+#                              Tune --top_k_frac 0.1–0.4 (default 0.2 = 20% of tokens).
 #   --inject_layers tier_a  → TIER_A only (13 layers)
 #                              Appearance preserved, position flexible —
 #                              for shape-linked edits (breed change).
@@ -27,7 +27,7 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Change colour (K,V injection at MM-DiT double-stream blocks) ─────────────────
+# ── Change colour (ColorCtrl: arXiv:2508.09131) ───────────────────────────────
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -37,6 +37,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
+    --top_k_frac 0.2 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -48,6 +49,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
+    --top_k_frac 0.2 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────

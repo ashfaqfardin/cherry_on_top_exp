@@ -103,12 +103,13 @@
       "seed": 30
     },
     {
-      "comment": "Colour edit via K,V injection at all 19 MM-DiT double-stream blocks (FreeFlux/StableFlow approach). Both branches share the same z_T. Source K,V injected into edit branch at layers 0-18 locks identity; 38 single-stream blocks are free for colour. No CV, no pixel blending.",
+      "comment": "ColorCtrl (arXiv:2508.09131): structure-preserving colour edit. All layers, all steps. Source K^img injected for structure; vision-to-text mask identifies hair region (top top_k_frac tokens); source V^img copied outside mask. top_k_frac: 0.1=tighter bg, 0.3=larger edit area.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
+      "top_k_frac": 0.2,
       "seed": 35
     },
     {
@@ -117,6 +118,7 @@
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
+      "top_k_frac": 0.2,
       "seed": 40
     },
     {
