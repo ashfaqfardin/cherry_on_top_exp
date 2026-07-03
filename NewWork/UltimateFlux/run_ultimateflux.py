@@ -123,6 +123,17 @@ def build_policy(cfg: dict):
                 chunk_size=cfg.get("chunk_size", 4),
                 mask_build_step=cfg.get("mask_build_step", 5),
             )
+        elif inject_layers_raw == "double_stream":
+            # Lock all 19 double-stream (joint text-image) blocks with K+V injection.
+            # Single-stream blocks (19-56) are completely free — the target text
+            # ("blonde", "blue") drives colour there without any mask or boundary.
+            # This eliminates the "adding colour over old colour" overlay artifact
+            # from V-masking boundary effects, and prevents forehead/structure drift
+            # that occurs when single-stream blocks run unconstrained (qk_frac=0).
+            return FineGrainedAttrPolicy(
+                inject_layers=list(range(N_DOUBLE)),  # _DOUBLE_STREAM: 0-18
+                inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+            )
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
         else:

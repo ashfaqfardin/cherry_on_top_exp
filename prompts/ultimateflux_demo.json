@@ -103,16 +103,12 @@
       "seed": 30
     },
     {
-      "comment": "ColorCtrl (arXiv:2508.09131): single-stream-only attention editing. Double-stream blocks untouched. Single-stream: source v-v pre-softmax scores injected into target (structure); editing-region mask from img→text attention (top top_k_frac tokens); source V copied to non-editing region. color_word focuses mask on specific T5 tokens.",
+      "comment": "double_stream: locks all 19 joint text-image blocks with K+V injection. All 38 single-stream blocks are free — edit text drives colour without mask or boundary effects. Fixes ColorCtrl overlay artifact ('blonde over black') and forehead drift from unconstrained single-stream layout.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
-      "inject_layers": "color",
-      "top_k_frac": 0.35,
-      "qk_frac": 0.0,
-      "mask_build_step": 6,
-      "color_word": "blonde",
+      "inject_layers": "double_stream",
       "seed": 35
     },
     {
@@ -120,11 +116,7 @@
       "task": "attr_edit",
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
-      "inject_layers": "color",
-      "top_k_frac": 0.4,
-      "qk_frac": 0.0,
-      "mask_build_step": 6,
-      "color_word": "blue",
+      "inject_layers": "double_stream",
       "seed": 40
     },
     {

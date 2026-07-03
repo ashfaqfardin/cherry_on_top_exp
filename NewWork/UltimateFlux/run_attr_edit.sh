@@ -5,18 +5,24 @@
 #   (default / omit)        → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
 #                              Tightest identity lock — for ADDING an attribute
 #                              (glasses, hat, beard).
+#   --inject_layers double_stream
+#                           → Lock all 19 double-stream (joint text-image) blocks
+#                              with K+V injection; 38 single-stream blocks are FREE.
+#                              Recommended for COLOUR changes — text drives colour in
+#                              single-stream with no mask, no overlay artifacts.
+#                              --inject_steps_frac [0.0, 1.0] (default: all steps).
+#                              If colour change is weak: try [0.0, 0.7].
+#
 #   --inject_layers color   → ColorCtrl (arXiv:2508.09131) — single-stream only.
 #                              Double-stream blocks (0-18): standard SDPA, untouched.
 #                              Single-stream blocks (19-56): manual attention with:
-#                                Structure: source v-v pre-softmax scores → target
-#                                  (locks spatial layout without touching colour V).
-#                                Colour: editing-region mask from target img→text
-#                                  attention; source V copied to NON-editing tokens;
-#                                  editing region keeps target V (new colour).
-#                              --top_k_frac 0.1–0.4 = editing region size (20% default).
+#                                Structure: source v-v pre-softmax scores → target.
+#                                Colour: binary V mask (editing-region mask from
+#                                  img→text attention; source V for non-editing).
+#                              --top_k_frac 0.1–0.4 = editing region size.
 #                              --color_word 'blonde'/'blue' = focus mask on that word.
 #                              --qk_frac / --v_frac = step fraction for each component.
-#                              --chunk_size = heads per manual-attn chunk (OOM → 2 or 1).
+#                              --chunk_size = heads per manual-attn chunk (OOM → 2/1).
 #   --inject_layers tier_a  → TIER_A only (13 layers)
 #                              Appearance preserved, position flexible —
 #                              for shape-linked edits (breed change).
@@ -31,18 +37,17 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Change colour (ColorCtrl: arXiv:2508.09131) ───────────────────────────────
-# Tuning guide for color editing:
-#   top_k_frac  — editing region size (fraction of 4096 image tokens).
-#                 0.2 = 20% ≈ 820 tokens; too small → boundary hair/car stays old colour.
-#                 0.35 is a safer default for hair; 0.4 for large subjects like cars.
-#   qk_frac     — fraction of steps with v-v pre-softmax score injection (structure).
-#                 1.0 = all steps → each editing token's output is ~80% source V (diluted).
-#                 0.0 = disabled → V masking alone; colour changes fully, structure from noise.
-#                 Try 0.0 first for strongest colour; raise if identity drifts too much.
-#   mask_build_step — steps of free denoising before building the editing mask.
-#                 5–8 = sufficient structure to locate the colour region.
-#   v_frac      — steps with V masking active. 1.0 (all) is correct; lower only to debug.
+# ── Change colour (double_stream: lock 19 joint blocks, free 38 single blocks) ─
+# inject_layers double_stream:
+#   Locks all 19 double-stream (joint text-image) blocks with K+V injection.
+#   All 38 single-stream blocks are completely free — the edit text ("blonde",
+#   "blue") drives colour there without any mask or boundary effect.
+#   Fixes two ColorCtrl artifacts at qk_frac=0:
+#     - "adding new colour over old" (V-mask binary boundary blending)
+#     - forehead/structure drift (unconstrained single-stream spatial layout)
+#
+# If colour change is weak: lower inject_steps_frac end (e.g. [0.0, 0.7]) so
+# later steps are fully free. If structure drifts: raise end back toward 1.0.
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
@@ -52,11 +57,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name woman_hair_color \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
-    --inject_layers color \
-    --top_k_frac 0.35 \
-    --qk_frac 0.0 \
-    --color_word blonde \
-    --mask_build_step 6 \
+    --inject_layers double_stream \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -67,11 +68,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name car_color_change \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
-    --inject_layers color \
-    --top_k_frac 0.4 \
-    --qk_frac 0.0 \
-    --color_word blue \
-    --mask_build_step 6 \
+    --inject_layers double_stream \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────
