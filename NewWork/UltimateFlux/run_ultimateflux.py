@@ -165,17 +165,24 @@ def build_policy(cfg: dict):
 # ───────────────────────────── Single run ─────────────────────────────────────
 
 def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
-    name          = cfg.get("name", "output")
-    source_prompt = cfg.get("source_prompt", cfg.get("prompt", ""))
-    edit_prompt   = cfg.get("edit_prompt",   cfg.get("prompt", ""))
-    seed          = cfg.get("seed", 42)
-    num_steps     = cfg.get("num_steps", 28)
-    guidance      = cfg.get("guidance_scale", 3.5)
-    height        = cfg.get("height", 1024)
-    width         = cfg.get("width",  1024)
-    max_seq_len   = cfg.get("max_sequence_length", 512)
+    name               = cfg.get("name", "output")
+    source_prompt      = cfg.get("source_prompt", cfg.get("prompt", ""))
+    edit_prompt        = cfg.get("edit_prompt",   cfg.get("prompt", ""))
+    seed               = cfg.get("seed", 42)
+    num_steps          = cfg.get("num_steps", 28)
+    guidance           = cfg.get("guidance_scale", 3.5)
+    height             = cfg.get("height", 1024)
+    width              = cfg.get("width",  1024)
+    max_seq_len        = cfg.get("max_sequence_length", 512)
+    save_intermediates = cfg.get("save_intermediates", False)
+    intermediate_every = cfg.get("intermediate_every", 4)
 
     policy = build_policy(cfg)
+
+    # Always create run_dir when saving anything (finals or intermediates).
+    run_dir = os.path.join(out_dir, name)
+    if save_images or save_intermediates:
+        os.makedirs(run_dir, exist_ok=True)
 
     print(f"\n[UltimateFlux] '{name}' | task={cfg.get('task','non_rigid')} | seed={seed}")
     print(f"  source_prompt: {source_prompt}")
@@ -193,11 +200,12 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         width=width,
         max_sequence_length=max_seq_len,
         device=device,
+        save_intermediates=save_intermediates,
+        intermediate_out_dir=run_dir if save_intermediates else None,
+        intermediate_every=intermediate_every,
     )
 
     if save_images:
-        run_dir = os.path.join(out_dir, name)
-        os.makedirs(run_dir, exist_ok=True)
         src_path  = os.path.join(run_dir, "source.png")
         edit_path = os.path.join(run_dir, "edit.png")
         src_img.save(src_path)
@@ -241,6 +249,10 @@ def parse_args():
     p.add_argument("--cache_dir",   default="./models")
     p.add_argument("--out_dir",     default="results/ultimateflux")
     p.add_argument("--save_images", action="store_true")
+    p.add_argument("--save_intermediates", action="store_true", default=False,
+                   help="Save source/edit/compare intermediate step grids alongside final images")
+    p.add_argument("--intermediate_every", type=int, default=4,
+                   help="Capture a frame every N denoising steps (--save_intermediates)")
 
     # Config file (batch mode)
     p.add_argument("--config", default=None, help="Path to JSON config for batch runs")
@@ -367,11 +379,13 @@ def main():
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
         "delta_scale":          args.delta_scale,
-        "seed":          args.seed,
-        "num_steps":     args.num_steps,
-        "guidance_scale":args.guidance_scale,
-        "height":        args.height,
-        "width":         args.width,
+        "seed":               args.seed,
+        "num_steps":          args.num_steps,
+        "guidance_scale":     args.guidance_scale,
+        "height":             args.height,
+        "width":              args.width,
+        "save_intermediates": args.save_intermediates,
+        "intermediate_every": args.intermediate_every,
     }
     run_single(pipe, single_cfg, args.out_dir, args.save_images, args.device)
 

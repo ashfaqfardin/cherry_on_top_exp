@@ -20,7 +20,7 @@ from diffusers import FluxPipeline
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.utils.torch_utils import randn_tensor
-from PIL import Image
+from PIL import Image, ImageDraw
 from typing import Optional, List, Tuple, Dict, Callable
 
 # ── Layer tier constants (from FreeFlux ICCV 2025, validated on FLUX.1-dev) ──
@@ -244,6 +244,9 @@ def generate_dual_branch(
     width: int = 1024,
     max_sequence_length: int = 512,
     device: str = "cuda",
+    save_intermediates: bool = False,
+    intermediate_out_dir: Optional[str] = None,
+    intermediate_every: int = 4,
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Dual-branch denoising with injections from policy.
@@ -306,6 +309,15 @@ def generate_dual_branch(
             block = pipe.transformer.single_transformer_blocks[block_idx - N_DOUBLE]
         handles.append(block.register_forward_hook(hook_fn))
 
+    # Intermediate-step capture: store (step_idx, n_steps, latents_cpu) tuples.
+    # The callback must always return callback_kwargs unchanged.
+    captured: List[Tuple[int, int, torch.Tensor]] = []
+
+    def _capture(pipe_ref, step_index, timestep, callback_kwargs):
+        if step_index % intermediate_every == 0 or step_index == num_steps - 1:
+            captured.append((step_index, num_steps, callback_kwargs["latents"].clone().cpu()))
+        return callback_kwargs
+
     try:
         result = pipe(
             prompt=[source_prompt, edit_prompt],
@@ -316,6 +328,8 @@ def generate_dual_branch(
             width=width,
             max_sequence_length=max_sequence_length,
             output_type="pil",
+            callback_on_step_end=_capture if save_intermediates else None,
+            callback_on_step_end_tensor_inputs=["latents"] if save_intermediates else [],
         )
     finally:
         for h in handles:
@@ -323,6 +337,10 @@ def generate_dual_branch(
 
     src_img  = result.images[0]
     edit_img = policy.post_process(src_img, result.images[1])
+
+    if save_intermediates and intermediate_out_dir and captured:
+        _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir)
+
     return src_img, edit_img
 
 
@@ -409,6 +427,73 @@ def _decode_latents(
     latents   = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
     raw       = pipe.vae.decode(latents, return_dict=False)[0]
     return pipe.image_processor.postprocess(raw, output_type="pil")[0]
+
+
+def _save_intermediate_grids(
+    pipe: FluxPipeline,
+    captured: List[Tuple[int, int, torch.Tensor]],  # (step_idx, n_steps, latents B=2)
+    height: int,
+    width: int,
+    out_dir: str,
+    thumb_size: int = 256,
+) -> None:
+    """
+    Decode captured latents at intermediate steps and write three images:
+
+    source_intermediate.png   — strip of source branch frames left→right
+    edit_intermediate.png     — strip of edit   branch frames left→right
+    compare_intermediate.png  — 2-row grid: top=source, bottom=edit
+                                with step number labels above each column
+    """
+    label_h = 22   # pixels reserved for step label above each thumbnail
+    pad     = 4    # gap between the two rows in compare image
+    bg      = (30, 30, 30)   # dark background
+    fg      = (220, 220, 220)  # label text colour
+
+    src_thumbs:  List[Image.Image] = []
+    edit_thumbs: List[Image.Image] = []
+    step_labels: List[str]         = []
+
+    for step_idx, n_steps, lats_cpu in captured:
+        lats = lats_cpu.to(pipe.device, dtype=pipe.vae.dtype)
+        with torch.no_grad():
+            src_img  = _decode_latents(pipe, lats[:1], height, width)
+            edit_img = _decode_latents(pipe, lats[1:], height, width)
+        src_thumbs.append(src_img.resize((thumb_size, thumb_size), Image.LANCZOS))
+        edit_thumbs.append(edit_img.resize((thumb_size, thumb_size), Image.LANCZOS))
+        step_labels.append(f"step {step_idx:02d}/{n_steps}")
+
+    n       = len(step_labels)
+    strip_w = n * thumb_size
+    strip_h = thumb_size + label_h
+
+    def make_strip(thumbs: List[Image.Image]) -> Image.Image:
+        img  = Image.new("RGB", (strip_w, strip_h), bg)
+        draw = ImageDraw.Draw(img)
+        for i, (thumb, label) in enumerate(zip(thumbs, step_labels)):
+            x = i * thumb_size
+            img.paste(thumb, (x, label_h))
+            # Centre-align label text
+            try:
+                tw = draw.textlength(label)
+            except AttributeError:
+                tw = len(label) * 7  # fallback estimate
+            draw.text((x + (thumb_size - tw) // 2, 3), label, fill=fg)
+        return img
+
+    src_strip  = make_strip(src_thumbs)
+    edit_strip = make_strip(edit_thumbs)
+
+    compare_h = strip_h * 2 + pad
+    compare   = Image.new("RGB", (strip_w, compare_h), bg)
+    compare.paste(src_strip,  (0, 0))
+    compare.paste(edit_strip, (0, strip_h + pad))
+
+    os.makedirs(out_dir, exist_ok=True)
+    src_strip.save( os.path.join(out_dir, "source_intermediate.png"))
+    edit_strip.save(os.path.join(out_dir, "edit_intermediate.png"))
+    compare.save(   os.path.join(out_dir, "compare_intermediate.png"))
+    print(f"  Intermediates → {out_dir}/{{source,edit,compare}}_intermediate.png")
 
 
 @torch.no_grad()
