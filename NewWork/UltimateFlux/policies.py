@@ -961,14 +961,21 @@ class ColorCtrlPolicy(BasePolicy):
             print(f"[ColorCtrl] '{self.color_word}' → T5 indices: {self._color_tok_ids}")
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        # Double-stream K injection: locks spatial layout (same face positions)
-        # without locking V, so single-stream can still drive colour change freely.
+        # Double-stream K+V injection: locks both spatial layout (K) and output
+        # values (V) so the representation entering single-stream is source-like.
+        # K-only was insufficient: without V, 38 free single-stream blocks generate
+        # a completely different person/car.  V injection anchors identity strongly;
+        # colour change is then driven by re-weighting in single-stream via V_txt.
         if self.ds_key_inject and txt_len > 0:
             img_offset = txt_len
             k_src, k_tgt = k.chunk(2)
+            v_src, v_tgt = v.chunk(2)
             k_tgt_new = k_tgt.clone()
+            v_tgt_new = v_tgt.clone()
             k_tgt_new[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
+            v_tgt_new[:, :, img_offset:, :] = v_src[:, :, img_offset:, :]
             k = torch.cat([k_src, k_tgt_new])
+            v = torch.cat([v_src, v_tgt_new])
         return q, k, v
 
     def inject_attention(

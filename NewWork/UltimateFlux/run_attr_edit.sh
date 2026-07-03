@@ -64,6 +64,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --reweight_scale 3.0 \
     --ds_key_inject \
     --color_word blonde \
+    --top_k_frac 0.25 \
     --mask_build_step 5 \
     --seed 35
 
@@ -80,6 +81,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --reweight_scale 3.0 \
     --ds_key_inject \
     --color_word blue \
+    --top_k_frac 0.3 \
     --mask_build_step 5 \
     --seed 40
 
