@@ -989,14 +989,31 @@ class ColorCtrlPolicy(BasePolicy):
         txt_len: int = 0,
     ) -> Optional[torch.Tensor]:
         """
-        Custom attention for single-stream blocks only.
+        Structure-colour separated injection for single-stream blocks.
 
-        Double-stream blocks (txt_len > 0): returns None → standard SDPA.
-        Single-stream blocks: manual head-chunked attention with:
-          • V masking (colour preservation, gated by v_frac)
-          • v-v pre-softmax score injection (structure preservation, gated by qk_frac)
+        Algorithm
+        ---------
+        1. Mask: image patches attending most to the colour word → editing region.
+           Derived from target branch img→text attention at mask_build_step.
+        2. ALL image tokens  → source K   (structure lock everywhere)
+           Every image patch attends to the SAME spatial positions as in source,
+           preserving geometry for both the editing region (hair/car shape) and
+           non-editing region (face, background).
+        3. NON-editing tokens → source V  (identity lock: face, bg = source)
+           EDITING tokens     → target V  (colour free: hair/car conditioned on
+           edit text, e.g. "blonde" / "blue")
+        4. Standard SDPA — no manual attention loops needed.
+
+        Parameters (reused from __init__)
+        ----------------------------------
+        qk_frac : step fraction for K injection (default 1.0 = all steps).
+        v_frac  : step fraction for V masking   (default 1.0 = all steps).
+        top_k_frac      : fraction of image tokens in the editing mask.
+        mask_build_step : first step at which the mask is extracted.
+        color_word      : word in edit_prompt whose T5 tokens focus the mask.
+        ds_key_inject   : K+V injection in double-stream blocks for coarse anchor.
         """
-        # ── Double-stream: leave unchanged (paper does standard SDPA there) ────
+        # ── Double-stream: handled by inject_qkv ─────────────────────────────
         if txt_len > 0:
             return None
 
@@ -1010,113 +1027,83 @@ class ColorCtrlPolicy(BasePolicy):
             return None
 
         n_img    = n_total - text_len
-        n_heads  = q.shape[1]
         head_dim = q.shape[-1]
         scale    = head_dim ** -0.5
 
-        do_qk = step < int(self.qk_frac * n_steps)  # v-v score injection active?
-        do_v  = step < int(self.v_frac  * n_steps)  # V masking active?
-        # Re-weighting requires the mask so it only amplifies the EDITING REGION.
-        # Global amplification (all tokens ×scale) destroys spatial structure because
-        # every image token — including face — floods toward the colour-word V.
-        do_rw = (self.reweight_scale > 1.0
-                 and bool(self._color_tok_ids)
-                 and self._mask is not None)
+        do_struct = step < int(self.qk_frac * n_steps)   # K injection active
+        do_colour = step < int(self.v_frac  * n_steps)   # V masking active
 
-        # ── Mask build: attempt once conditions are met (needed for do_v / do_qk) ─
-        # Re-weighting (do_rw) does NOT need the mask — it fires from step 0.
-        # The mask is only built when mask_build_step is reached, giving the model
-        # time to form spatial structure before localising the editing region.
+        # ── 1. Mask extraction ───────────────────────────────────────────────
+        # Wait until mask_build_step so the model has formed spatial structure.
+        # Use the target branch's img→text attention to find which image patches
+        # attend most strongly to the colour-word token(s).
         if not self._mask_built and step >= self.mask_build_step and layer >= N_DOUBLE:
             q_tgt    = q[B // 2:]
             k_tgt_tx = k[B // 2:, :, :text_len, :]
+            # img→text raw (pre-softmax) scores averaged over heads
             v2t      = torch.matmul(
                 q_tgt[:, :, text_len:, :].float(),
                 k_tgt_tx.float().transpose(-2, -1),
-            ) * scale                                # (1, H, n_img, n_txt)
-            v2t_mean = v2t.mean(dim=(0, 1))          # (n_img, n_txt)
+            ) * scale                                      # (1, H, n_img, n_txt)
+            v2t_mean = v2t.mean(dim=(0, 1))               # (n_img, n_txt)
+
             if self._color_tok_ids:
                 ids        = [i for i in self._color_tok_ids if i < text_len]
                 edit_score = (v2t_mean[:, ids].mean(dim=-1)
                               if ids else v2t_mean.mean(dim=-1))
             else:
-                edit_score = v2t_mean.mean(dim=-1)
+                edit_score = v2t_mean.mean(dim=-1)        # (n_img,)
+
             k_top        = max(1, int(self.top_k_frac * n_img))
             edit_idx     = edit_score.topk(k_top).indices
-            preserve_mask = torch.ones(n_img, device=q.device, dtype=torch.float32)
-            preserve_mask[edit_idx] = 0.0           # 0 = editing region
-            self._mask       = preserve_mask
-            self._mask_built = True
-            print(f"[ColorCtrl] mask built layer={layer} step={step}: "
-                  f"{k_top}/{n_img} editing tokens "
-                  f"({'colour-word focused' if self._color_tok_ids else 'all-text mean'})")
 
-        v_active    = do_v and self._mask is not None
-        need_manual = do_qk or v_active or do_rw
-        if not need_manual:
+            # preserve_mask: 1 = NON-editing (face, bg), 0 = editing (hair, car)
+            preserve_mask            = torch.ones(n_img, device=q.device,
+                                                  dtype=torch.float32)
+            preserve_mask[edit_idx] = 0.0
+            self._mask               = preserve_mask
+            self._mask_built         = True
+            print(f"[ColorCtrl] mask built at layer={layer} step={step}: "
+                  f"{k_top}/{n_img} editing tokens "
+                  f"({'colour-word focused' if self._color_tok_ids else 'all-text'})")
+
+        # Need the mask for any injection
+        if self._mask is None:
+            return None
+        if not do_struct and not do_colour:
             return None
 
-        # ── §3.4 Colour Preservation: V masking ──────────────────────────────
-        if v_active:
-            v_src, v_tgt = v.chunk(2)
-            mask4 = self._mask.to(device=v.device, dtype=v.dtype).view(1, 1, -1, 1)
-            v_tgt_new = v_tgt.clone()
+        # ── 2. Structure: ALL image tokens → source K ────────────────────────
+        # Replaces the target's image K with source's, so every patch attends to
+        # the same spatial positions as in the source image.  Preserves geometry
+        # of the editing object (hair shape, car silhouette) AND the face/bg.
+        k_src, k_tgt = k.chunk(2)
+        v_src, v_tgt = v.chunk(2)
+        k_tgt_new    = k_tgt.clone()
+        v_tgt_new    = v_tgt.clone()
+
+        if do_struct:
+            k_tgt_new[:, :, text_len:, :] = k_src[:, :, text_len:, :]
+
+        # ── 3. Colour: split editing region ─────────────────────────────────
+        # NON-editing (face, bg)  → source V : these regions are identity-locked.
+        # EDITING (hair, car)     → target V : free to adopt the new colour from
+        #                                       the edit text ("blonde", "blue").
+        if do_colour:
+            non_edit = self._mask.to(device=v.device,
+                                     dtype=v.dtype).view(1, 1, -1, 1)  # 1=non-edit
             v_tgt_new[:, :, text_len:, :] = (
-                v_src[:, :, text_len:, :] * mask4
-                + v_tgt[:, :, text_len:, :] * (1.0 - mask4)
+                v_src[:, :, text_len:, :] * non_edit               # non-edit: source
+                + v_tgt[:, :, text_len:, :] * (1.0 - non_edit)    # editing : target
             )
-            v = torch.cat([v_src, v_tgt_new])
 
-        # ── Fast path: V masking only, no pre-softmax score manipulation ─────
-        if not do_qk and not do_rw:
-            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        k_new = torch.cat([k_src, k_tgt_new])
+        v_new = torch.cat([v_src, v_tgt_new])
 
-        # ── Manual attention: §3.3 v-v injection and/or §3.5 re-weighting ────
-        out      = torch.zeros(B, n_heads, n_total, head_dim,
-                               device=q.device, dtype=q.dtype)
-        rw_ids   = ([i for i in self._color_tok_ids if i < text_len]
-                    if do_rw else [])
-
-        for h0 in range(0, n_heads, self.chunk_size):
-            h1 = min(h0 + self.chunk_size, n_heads)
-            q_c, k_c, v_c = q[:, h0:h1], k[:, h0:h1], v[:, h0:h1]
-
-            # Source branch — standard attention; save v-v scores if needed
-            q_s, k_s = q_c[:B // 2], k_c[:B // 2]
-            scores_s = torch.matmul(q_s.float(), k_s.float().transpose(-2, -1)) * scale
-            vv_src   = scores_s[:, :, text_len:, text_len:].clone() if do_qk else None
-            probs_s  = torch.softmax(scores_s, dim=-1).to(q.dtype)
-            out[:B // 2, h0:h1] = torch.matmul(probs_s, v_c[:B // 2])
-
-            # Target branch
-            q_t, k_t = q_c[B // 2:], k_c[B // 2:]
-            scores_t  = torch.matmul(q_t.float(), k_t.float().transpose(-2, -1)) * scale
-
-            # §3.3 Structure: replace image→image pre-softmax scores with source's
-            if do_qk and vv_src is not None:
-                scores_t[:, :, text_len:, text_len:] = vv_src
-
-            # §3.5 Attribute re-weighting: amplify image→colour-word scores.
-            # Applied ONLY to editing-region image tokens (mask=0); non-editing
-            # tokens (face, bg) keep scale=1.0 so their colour is unaffected.
-            # Global amplification (all tokens) collapses spatial structure.
-            if rw_ids:
-                # editing_region: 1.0 where mask=0 (editing), 0.0 elsewhere
-                editing_region = (1.0 - self._mask).to(
-                    device=scores_t.device, dtype=scores_t.dtype)  # (n_img,)
-                # per-token scale: editing→reweight_scale, non-editing→1.0
-                scale_vec = (
-                    1.0 + (self.reweight_scale - 1.0) * editing_region
-                ).view(1, 1, n_img)                                 # (1,1,n_img)
-                for c in rw_ids:
-                    scores_t[:, :, text_len:, c] = (
-                        scores_t[:, :, text_len:, c] * scale_vec
-                    )
-
-            probs_t = torch.softmax(scores_t, dim=-1).to(q.dtype)
-            out[B // 2:, h0:h1] = torch.matmul(probs_t, v_c[B // 2:])
-
-        return out
+        # ── 4. Standard SDPA with modified K, V ─────────────────────────────
+        return F.scaled_dot_product_attention(
+            q, k_new, v_new, dropout_p=0.0, is_causal=False
+        )
 
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────

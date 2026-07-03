@@ -37,19 +37,26 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Change colour (ColorCtrl §3.5 re-weighting + double-stream K anchor) ────
-# Key parameters for colour editing:
-#   --reweight_scale 3.0   Amplify image→colour-word attention scores ×3 before
-#                          softmax (§3.5). Image tokens that already attend to
-#                          "blonde"/"blue" pull ×3 harder from that word's V_txt.
-#                          Soft self-selecting mask — no hard boundary artifacts.
-#                          Try 2.0–5.0; higher = stronger colour, less identity.
-#   --ds_key_inject        K-only injection in double-stream blocks (0-18):
-#                          locks face/car spatial layout without locking colour.
-#   --qk_frac 0.0          Disable v-v score injection (avoids colour dilution).
-#   --v_frac 0.0           Disable V masking (eliminates overlay artifact).
-#   --mask_build_step 999  Mask never built (not needed without V masking).
-#   --color_word           T5 token to re-weight; must appear in edit_prompt.
+# ── Colour editing: attention-mask structure-colour separation ────────────────
+#
+# Algorithm:
+#   1. At step mask_build_step, extract which image patches attend most to the
+#      colour word in the TARGET branch → binary editing mask (hair / car body).
+#   2. ALL image tokens → source K (same attention positions = same geometry).
+#      This locks the shape of the editing object AND the face/background.
+#   3. NON-editing tokens → source V (identity: face, background = source).
+#      EDITING tokens     → target V (colour free: conditioned on edit text).
+#   4. Standard SDPA with modified K, V — no manual loops, no re-weighting.
+#   Plus: double-stream K+V injection (--ds_key_inject) anchors coarse identity.
+#
+# Tuning:
+#   --top_k_frac 0.2-0.3   Editing mask size. 0.25 ≈ 1024 tokens ≈ hair region.
+#                           If colour bleeds outside (face turns blonde): lower.
+#                           If hair/car boundary not fully covered: raise.
+#   --mask_build_step 5-8  Steps before mask extraction.  Higher = better mask
+#                           spatial structure; lower = more colour change freedom.
+#   --qk_frac 1.0           K injection active for all steps (structure).
+#   --v_frac  1.0           V masking active for all steps (colour separation).
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
@@ -60,8 +67,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
-    --qk_frac 0.0 --v_frac 0.0 \
-    --reweight_scale 3.0 \
+    --qk_frac 1.0 --v_frac 1.0 \
     --ds_key_inject \
     --color_word blonde \
     --top_k_frac 0.25 \
@@ -77,8 +83,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
-    --qk_frac 0.0 --v_frac 0.0 \
-    --reweight_scale 3.0 \
+    --qk_frac 1.0 --v_frac 1.0 \
     --ds_key_inject \
     --color_word blue \
     --top_k_frac 0.3 \
