@@ -302,39 +302,71 @@ def generate_dual_branch(
 
 
 
-# ──────────────────── K-injection colour editing ──────────────────────────────
+# ──────────────────── PFB + SAC colour editing ────────────────────────────────
+#
+# Adapted from "SVD-Style" (DGIST 2025) for FLUX.1-dev:
+#
+#   PFB (Principal Feature Blending) — applied once at denoising step pfb_step:
+#       Φ(F, α) = U · diag(exp(-α·i) · S) · Vᵀ
+#       lat_edit ← Φ(lat_src) + (lat_edit − Φ(lat_edit))
+#     Replaces edit's dominant (structural) singular directions with source's,
+#     while keeping edit's residual (detail / colour) from its own trajectory.
+#
+#   SAC (Structural Attention Correction) — applied for the first sac_steps:
+#       In double-stream HOTSPOT layers [1, 2, 4], replace edit's image-token
+#       Q and K with source's Q and K.  This forces the edit branch to attend to
+#       the same spatial positions as source (identity, layout) while V and text
+#       conditioning drive the colour change.
 
-def _setup_k_hooks(pipe, n_double: int):
+
+def svd_extract(F: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    """Φ(F, α): principal feature extraction with exponential singular-value reweighting."""
+    B, N, C = F.shape
+    out = []
+    for b in range(B):
+        U, S, Vh = torch.linalg.svd(F[b].float(), full_matrices=False)
+        w = torch.exp(-alpha * torch.arange(S.shape[0], device=F.device, dtype=torch.float32))
+        out.append(((U * (S * w).unsqueeze(0)) @ Vh).to(F.dtype))
+    return torch.stack(out)
+
+
+def apply_pfb(lat_edit: torch.Tensor, lat_src: torch.Tensor,
+              alpha: float = 1.0) -> torch.Tensor:
+    """PFB: replace edit's principal components with source's; keep edit's residual."""
+    return svd_extract(lat_src, alpha) + (lat_edit - svd_extract(lat_edit, alpha))
+
+
+def _setup_sac_hooks(pipe, n_double: int):
     """
-    Register to_k forward hooks on the double-stream HOTSPOT blocks (layers 1, 2, 4).
+    Register to_q + to_k hooks on double-stream HOTSPOT layers [1, 2, 4] for SAC.
 
     Returns (hooks, mode_ref, storage).
-      mode_ref  — mutable list; set to "store", "inject", or "normal" each step.
-      storage   — dict {layer_idx: K_tensor}; written in store mode, read in inject mode.
+      mode_ref  — mutable ['normal'|'store'|'inject'] toggled each step by the caller.
+      storage   — {'q_L': Q_tensor, 'k_L': K_tensor} populated during 'store' pass.
 
-    The hook fires on `block.attn.to_k` (the linear that projects image hidden_states
-    to K before reshape / norm / rotary-emb).  Injecting pre-reshape K is safe because
-    the norms and RoPE that follow are shared weights applied identically to both branches.
+    Hooks fire on block.attn.to_q / to_k (pre-reshape, pre-norm, pre-rotary-emb).
+    Injecting at this point is safe: the shared layer-norm and RoPE that follow are
+    applied identically regardless of which branch's Q/K we use.
     """
     storage  = {}
     mode_ref = ["normal"]
     hooks    = []
 
-    double_hotspot = [l for l in HOTSPOT if l < n_double]   # [1, 2, 4]
-
-    for l in double_hotspot:
+    for l in [x for x in HOTSPOT if x < n_double]:
         block = pipe.transformer.transformer_blocks[l]
 
-        def _make(lid):
+        def _make(lid, kind):
+            key = f"{kind}_{lid}"
             def _hook(module, args, output):
                 if mode_ref[0] == "store":
-                    storage[lid] = output.detach().clone()
-                elif mode_ref[0] == "inject" and lid in storage:
-                    return storage[lid]
+                    storage[key] = output.detach().clone()
+                elif mode_ref[0] == "inject" and key in storage:
+                    return storage[key]
                 return output
             return _hook
 
-        hooks.append(block.attn.to_k.register_forward_hook(_make(l)))
+        hooks.append(block.attn.to_q.register_forward_hook(_make(l, "q")))
+        hooks.append(block.attn.to_k.register_forward_hook(_make(l, "k")))
 
     return hooks, mode_ref, storage
 
@@ -375,35 +407,38 @@ def generate_p2p(
     latent_top_k: int = 0,              # unused; kept for API compat
     latent_alpha: float = 1.0,          # unused; kept for API compat
     color_structure_frac: float = 0.0,  # unused; kept for API compat
-    inject_frac: float = 0.3,
+    inject_frac: float = 0.5,
+    pfb_step: int = 3,
+    pfb_alpha: float = 1.0,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Colour editing via K-injection + independent denoising.
+    Colour editing via PFB + SAC, adapted from SVD-Style (DGIST 2025) to FLUX.
 
-    Both branches denoise independently from the same z_T (same seed) so the
-    edit prompt is free to establish its own colour from step 0.  To preserve
-    identity (face, plate, composition) we inject the image-token KEYS from the
-    source branch into the edit branch for the first inject_frac fraction of steps,
-    in the double-stream HOTSPOT layers (position-dependent: 1, 2, 4).
+    Both branches start from the same z_T (same seed, free to render their own
+    colour from step 0).  Two mechanisms preserve identity:
 
-    How K-injection preserves structure without locking colour:
-      • K encodes spatial query positions — WHERE to attend.
-      • V encodes content values — WHAT to paint (colour, texture).
-      • Text conditioning reaches the image tokens via Q→text-K/V cross-attention.
-    Replacing only the image-K of the edit branch with source's image-K makes the
-    edit branch lay down its objects in the same spatial positions as source, while
-    V (colour) and text conditioning (edit prompt) remain fully independent.
+    SAC — steps 0 .. ceil(inject_frac * num_steps):
+        Source and edit run as separate forward passes.  In double-stream HOTSPOT
+        layers [1,2,4] the edit branch's image-token Q and K are replaced with
+        the source branch's Q and K.  This forces the edit branch to attend to the
+        same spatial positions (face, plate, car body) while V and text conditioning
+        drive the colour change.
 
-    inject_frac (tune in JSON / CLI):
-        0.0   no injection  — pure same-seed generation, maximum colour freedom,
-                              may drift in identity for very different prompts
-        0.3   ~8 steps      — good balance: face/plate preserved, colour changes (default)
-        0.5   ~14 steps     — stronger structure lock, use if identity still drifts
+    PFB — exactly at denoising step pfb_step (default 3):
+        lat_edit ← Φ(lat_src, α) + (lat_edit − Φ(lat_edit, α))
+        where Φ is SVD with exp(-α·i) singular-value reweighting.
+        Replaces the dominant structural singular directions of lat_edit with
+        source's, locking in layout without overwriting colour channels.
+
+    Tuning:
+        inject_frac  0.3–0.7   more = tighter identity, less = more freedom
+        pfb_step     2–6       step at which latent is corrected (0-indexed)
+        pfb_alpha    1.0       higher = fewer singular vectors blended (more structure-only)
 
     Returns (src_img, edit_img).
     """
-    exec_device  = getattr(pipe, "_execution_device", device)
-    inject_steps = max(0, int(inject_frac * num_steps))
+    exec_device = getattr(pipe, "_execution_device", device)
+    sac_steps   = max(0, int(inject_frac * num_steps))
 
     # -- Encode both prompts --------------------------------------------------
     def _encode(prompt: str):
@@ -456,27 +491,28 @@ def generate_p2p(
 
     has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
 
-    # -- K-injection hooks on double-stream HOTSPOT layers --------------------
-    hooks, mode_ref, _ = _setup_k_hooks(pipe, N_DOUBLE)
+    # -- SAC hooks: Q+K on double-stream HOTSPOT layers -----------------------
+    hooks, mode_ref, _ = _setup_sac_hooks(pipe, N_DOUBLE)
 
     lat_src  = z_T.clone()
     lat_edit = z_T.clone()
 
     print(
         f"[UltimateFlux P2P] {num_steps} steps | "
-        f"K-inject first {inject_steps} steps in HOTSPOT layers [1,2,4]"
+        f"SAC first {sac_steps} steps (HOTSPOT layers [1,2,4]) | "
+        f"PFB at step {pfb_step} (α={pfb_alpha})"
     )
 
     try:
         for i, t in enumerate(timesteps):
-            dt  = sigmas[i + 1] - sigmas[i]          # negative (toward clean image)
+            dt  = sigmas[i + 1] - sigmas[i]
             ts1 = t.expand(1)
             g1  = (torch.full([1], guidance_scale, device=exec_device, dtype=lat_src.dtype)
                    if has_guidance else None)
 
-            if i < inject_steps:
-                # Injection phase: two separate passes per step
-                # Source pass — stores image-K in HOTSPOT layers
+            if i < sac_steps:
+                # SAC phase: separate source and edit passes
+                # Source — store Q and K in HOTSPOT layers
                 mode_ref[0] = "store"
                 src_noise = pipe.transformer(
                     hidden_states=lat_src,
@@ -488,8 +524,7 @@ def generate_p2p(
                     img_ids=img_ids,
                     return_dict=False,
                 )[0]
-                # Edit pass — injects stored source K into HOTSPOT layers;
-                # text conditioning, Q, and V remain from the edit prompt
+                # Edit — inject source Q+K; text conditioning and V stay from edit prompt
                 mode_ref[0] = "inject"
                 edit_noise = pipe.transformer(
                     hidden_states=lat_edit,
@@ -503,7 +538,7 @@ def generate_p2p(
                 )[0]
                 mode_ref[0] = "normal"
             else:
-                # Free phase: single batched pass, no injection
+                # Free phase: one batched pass, no SAC
                 lat_b = torch.cat([lat_src, lat_edit])
                 pe_b  = torch.cat([src_pe,  edit_pe])
                 pp_b  = torch.cat([src_pp,  edit_pp])
@@ -525,6 +560,12 @@ def generate_p2p(
             # Flow-matching Euler step (manual — avoids scheduler._step_index drift)
             lat_src  = lat_src  + dt * src_noise
             lat_edit = lat_edit + dt * edit_noise
+
+            # PFB: one-shot latent correction at pfb_step
+            # Replace edit's dominant singular directions with source's so that
+            # layout / identity locked in at this step; colour residual kept.
+            if i == pfb_step:
+                lat_edit = apply_pfb(lat_edit, lat_src, pfb_alpha)
 
     finally:
         for h in hooks:

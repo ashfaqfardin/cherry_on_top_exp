@@ -37,7 +37,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
-    --inject_frac 0.3 \
+    --inject_frac 0.5 --pfb_step 3 --pfb_alpha 1.0 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -49,7 +49,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
-    --inject_frac 0.3 \
+    --inject_frac 0.5 --pfb_step 3 --pfb_alpha 1.0 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────

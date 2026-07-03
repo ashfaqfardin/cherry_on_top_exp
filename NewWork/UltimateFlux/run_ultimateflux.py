@@ -171,7 +171,9 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             max_sequence_length=max_seq_len,
             device=device,
             color_structure_frac=cfg.get("color_structure_frac", 0.0),
-            inject_frac=cfg.get("inject_frac", 0.3),
+            inject_frac=cfg.get("inject_frac", 0.5),
+            pfb_step=cfg.get("pfb_step", 3),
+            pfb_alpha=cfg.get("pfb_alpha", 1.0),
         )
     else:
         src_img, edit_img = generate_dual_branch(
@@ -261,8 +263,12 @@ def parse_args():
                    help="attr_edit mode: color=latent delta blend (2 FLUX passes), tier_a=breed/shape change")
     p.add_argument("--color_structure_frac", type=float, default=0.0,
                    help="Unused; kept for backward compat")
-    p.add_argument("--inject_frac", type=float, default=0.3,
-                   help="Fraction of steps to inject source image-K into edit (default 0.3; 0=disable)")
+    p.add_argument("--inject_frac", type=float, default=0.5,
+                   help="Fraction of steps to run SAC (Q+K injection, default 0.5)")
+    p.add_argument("--pfb_step",   type=int,   default=3,
+                   help="Denoising step (0-indexed) at which PFB latent correction fires (default 3)")
+    p.add_argument("--pfb_alpha",  type=float, default=1.0,
+                   help="SVD reweighting strength for PFB (default 1.0)")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
@@ -322,6 +328,8 @@ def main():
         "inject_layers":        args.inject_layers,
         "color_structure_frac": args.color_structure_frac,
         "inject_frac":          args.inject_frac,
+        "pfb_step":             args.pfb_step,
+        "pfb_alpha":            args.pfb_alpha,
         "pfb_alpha":     args.pfb_alpha,
         "seed":          args.seed,
         "num_steps":     args.num_steps,
