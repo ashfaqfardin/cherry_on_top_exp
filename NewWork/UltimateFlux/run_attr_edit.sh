@@ -43,6 +43,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --inject_layers color \
     --top_k_frac 0.2 \
     --color_word blonde \
+    --mask_build_step 5 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -56,6 +57,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --inject_layers color \
     --top_k_frac 0.2 \
     --color_word blue \
+    --mask_build_step 5 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────

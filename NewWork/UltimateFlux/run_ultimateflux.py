@@ -121,6 +121,7 @@ def build_policy(cfg: dict):
                 v_frac=cfg.get("v_frac", 1.0),
                 color_word=cfg.get("color_word", None),
                 chunk_size=cfg.get("chunk_size", 4),
+                mask_build_step=cfg.get("mask_build_step", 5),
             )
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
@@ -263,6 +264,10 @@ def parse_args():
                         "focuses the editing-region mask on that word's T5 tokens")
     p.add_argument("--chunk_size", type=int, default=4,
                    help="ColorCtrl: heads per chunk in manual attention (reduce to 2/1 for OOM)")
+    p.add_argument("--mask_build_step", type=int, default=5,
+                   help="ColorCtrl: denoising step at which to build the editing-region mask "
+                        "(steps 0..N-1 run freely; mask built at N, ColorCtrl from N..end). "
+                        "Larger = more accurate mask but less structure locked early.")
     p.add_argument("--color_structure_frac", type=float, default=0.0,
                    help="Unused; kept for backward compat")
     p.add_argument("--inject_frac", type=float, default=0.5,
@@ -334,6 +339,7 @@ def main():
         "v_frac":               args.v_frac,
         "color_word":           args.color_word,
         "chunk_size":           args.chunk_size,
+        "mask_build_step":      args.mask_build_step,
         "color_structure_frac": args.color_structure_frac,
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,

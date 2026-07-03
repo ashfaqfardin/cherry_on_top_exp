@@ -902,12 +902,20 @@ class ColorCtrlPolicy(BasePolicy):
         v_frac: float = 1.0,
         color_word: Optional[str] = None,
         chunk_size: int = 4,
+        mask_build_step: int = 5,
     ):
         self.top_k_frac      = top_k_frac
         self.qk_frac         = qk_frac
         self.v_frac          = v_frac
         self.color_word      = color_word
         self.chunk_size      = chunk_size
+        # Delay mask building until this denoising step so the model has time
+        # to form spatial structure.  Steps 0..(mask_build_step-1): both branches
+        # run with standard SDPA and freely differentiate (source=old colour,
+        # target=new colour).  At step mask_build_step the editing region mask is
+        # derived from the partially-formed representations, then ColorCtrl injection
+        # is applied for the remaining steps.
+        self.mask_build_step = mask_build_step
         self._txt_len        = 512
         self._color_tok_ids: List[int] = []
         self._mask: Optional[torch.Tensor] = None   # (n_img,) preserve mask
@@ -967,39 +975,52 @@ class ColorCtrlPolicy(BasePolicy):
         head_dim = q.shape[-1]
         scale    = head_dim ** -0.5
 
+        # ── Free-differentiation phase: no injection until mask_build_step ─────
+        # Both branches run with standard SDPA so they develop colour independently.
+        # At step 0 the latent is pure noise — there is no spatial structure to mask.
+        # By step mask_build_step the model has formed enough structure that the
+        # img→text attention reliably identifies the colour region (hair, car body).
+        if not self._mask_built:
+            if step < self.mask_build_step:
+                return None  # standard SDPA; both branches diverge freely
+            # First eligible single-stream call at or after mask_build_step
+            if layer >= N_DOUBLE:
+                # Build editing-region mask from target branch's img→text attention.
+                # At this step the target branch has partially generated the new colour,
+                # so tokens attending most to the colour-word tokens identify the
+                # editing region.
+                q_tgt    = q[B // 2:]                      # (1, H, n_total, D)
+                k_tgt_tx = k[B // 2:, :, :text_len, :]    # (1, H, n_txt, D)
+                v2t = torch.matmul(
+                    q_tgt[:, :, text_len:, :].float(),     # (1, H, n_img, D)
+                    k_tgt_tx.float().transpose(-2, -1),    # (1, H, D, n_txt)
+                ) * scale                                   # (1, H, n_img, n_txt)
+                v2t_mean = v2t.mean(dim=(0, 1))            # (n_img, n_txt)
+
+                if self._color_tok_ids:
+                    ids = [i for i in self._color_tok_ids if i < text_len]
+                    edit_score = (v2t_mean[:, ids].mean(dim=-1) if ids
+                                  else v2t_mean.mean(dim=-1))
+                else:
+                    edit_score = v2t_mean.mean(dim=-1)     # (n_img,)
+
+                k_top = max(1, int(self.top_k_frac * n_img))
+                edit_idx = edit_score.topk(k_top).indices
+
+                # preserve_mask: 1 = non-editing → copy source V
+                #                0 = editing region → keep target V  (ColorCtrl §3.4)
+                preserve_mask = torch.ones(n_img, device=q.device, dtype=torch.float32)
+                preserve_mask[edit_idx] = 0.0
+                self._mask = preserve_mask
+                self._mask_built = True
+                print(f"[ColorCtrl] mask built layer={layer} step={step}: "
+                      f"{k_top}/{n_img} editing tokens "
+                      f"({'colour-word focused' if self._color_tok_ids else 'all-text mean'})")
+            else:
+                return None  # mask not yet built, still in free phase
+
         do_qk = step < int(self.qk_frac * n_steps)  # structure preservation active?
         do_v  = step < int(self.v_frac  * n_steps)  # colour preservation active?
-
-        # ── Build editing-region mask at first single-stream call ────────────
-        if not self._mask_built and layer >= N_DOUBLE:
-            # Use target branch Q vs target text K — focuses on edit-prompt tokens.
-            q_tgt    = q[B // 2:]                          # (1, H, n_total, D)
-            k_tgt_tx = k[B // 2:, :, :text_len, :]        # (1, H, n_txt, D)
-            v2t = torch.matmul(
-                q_tgt[:, :, text_len:, :].float(),         # (1, H, n_img, D)
-                k_tgt_tx.float().transpose(-2, -1),        # (1, H, D, n_txt)
-            ) * scale                                       # (1, H, n_img, n_txt)
-            v2t_mean = v2t.mean(dim=(0, 1))                # (n_img, n_txt)
-
-            if self._color_tok_ids:
-                ids = [i for i in self._color_tok_ids if i < text_len]
-                edit_score = (v2t_mean[:, ids].mean(dim=-1) if ids
-                              else v2t_mean.mean(dim=-1))
-            else:
-                edit_score = v2t_mean.mean(dim=-1)         # (n_img,)
-
-            k_top = max(1, int(self.top_k_frac * n_img))
-            edit_idx = edit_score.topk(k_top).indices
-
-            # preserve_mask: 1 = non-editing → copy source V
-            #                0 = editing region → keep target V  (ColorCtrl convention)
-            preserve_mask = torch.ones(n_img, device=q.device, dtype=torch.float32)
-            preserve_mask[edit_idx] = 0.0
-            self._mask = preserve_mask
-            self._mask_built = True
-            print(f"[ColorCtrl] mask built layer={layer} step={step}: "
-                  f"{k_top}/{n_img} editing tokens "
-                  f"({'colour-word focused' if self._color_tok_ids else 'all-text mean'})")
 
         # ── Colour Preservation: V masking before attention ──────────────────
         if do_v and self._mask is not None:
