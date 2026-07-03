@@ -158,6 +158,19 @@ def _kv_full_inject(k, v, txt_len: int = 0):
     return torch.cat([k_src, k_edit]), torch.cat([v_src, v_edit])
 
 
+def _k_only_inject(k, v, txt_len: int = 0):
+    """Copy source image-token K (only) into the edit branch; V is left untouched.
+
+    Use for colour-change double_stream mode: K injection anchors spatial layout
+    (same attention positions → same face/object structure) while V remains
+    conditioned on the edit text → full colour freedom without overlay artifacts.
+    """
+    k_src, k_edit = k.chunk(2)
+    k_edit = k_edit.clone()
+    k_edit[:, :, txt_len:, :] = k_src[:, :, txt_len:, :]
+    return torch.cat([k_src, k_edit]), v
+
+
 def _masked_kv_inject(k, v, mask_1d: torch.Tensor, txt_len: int):
     """
     Soft-blend source K,V into edit K,V at image-token positions weighted by mask_1d.
@@ -827,11 +840,13 @@ class FineGrainedAttrPolicy(BasePolicy):
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        key_only: bool = False,
     ):
         self._inject_layers = (
             inject_layers if inject_layers is not None else self._PRESERVE_LAYERS
         )
         self.inject_steps_frac = inject_steps_frac
+        self.key_only = key_only
         self._txt_len_single = 512
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
@@ -844,7 +859,10 @@ class FineGrainedAttrPolicy(BasePolicy):
             return q, k, v
 
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-        k, v = _kv_full_inject(k, v, img_offset)
+        if self.key_only:
+            k, v = _k_only_inject(k, v, img_offset)
+        else:
+            k, v = _kv_full_inject(k, v, img_offset)
         return q, k, v
 
 

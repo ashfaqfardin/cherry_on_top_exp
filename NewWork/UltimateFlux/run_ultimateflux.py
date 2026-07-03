@@ -124,15 +124,15 @@ def build_policy(cfg: dict):
                 mask_build_step=cfg.get("mask_build_step", 5),
             )
         elif inject_layers_raw == "double_stream":
-            # Lock all 19 double-stream (joint text-image) blocks with K+V injection.
-            # Single-stream blocks (19-56) are completely free — the target text
-            # ("blonde", "blue") drives colour there without any mask or boundary.
-            # This eliminates the "adding colour over old colour" overlay artifact
-            # from V-masking boundary effects, and prevents forehead/structure drift
-            # that occurs when single-stream blocks run unconstrained (qk_frac=0).
+            # Lock all 19 double-stream (joint text-image) blocks; 38 single-stream free.
+            # key_only=True (default): inject only K into double-stream blocks.
+            #   K locks SPATIAL POSITIONS (structure preserved, no forehead drift).
+            #   V stays target-conditioned ("blonde"/"blue") → full colour change.
+            # key_only=False: inject K+V (stronger structure lock, weaker colour change).
             return FineGrainedAttrPolicy(
                 inject_layers=list(range(N_DOUBLE)),  # _DOUBLE_STREAM: 0-18
                 inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+                key_only=cfg.get("key_only", True),
             )
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
@@ -263,7 +263,9 @@ def parse_args():
                    help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "double_stream", "tier_a"],
-                   help="attr_edit mode: double_stream=K+V lock 19 joint blocks (colour change), color=ColorCtrl mask-based, tier_a=breed/shape change")
+                   help="attr_edit mode: double_stream=lock 19 joint blocks (colour change), color=ColorCtrl mask-based, tier_a=breed/shape change")
+    p.add_argument("--key_only", action="store_true", default=False,
+                   help="double_stream mode: inject K only (not V) — locks spatial layout without locking colour. Default True for double_stream via config.")
     p.add_argument("--top_k_frac",  type=float, default=0.2,
                    help="ColorCtrl: fraction of image tokens treated as editing region (default 0.2)")
     p.add_argument("--qk_frac",    type=float, default=1.0,
@@ -345,6 +347,7 @@ def main():
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
         "inject_layers":        args.inject_layers,
+        "key_only":             args.key_only,
         "top_k_frac":           args.top_k_frac,
         "qk_frac":              args.qk_frac,
         "v_frac":               args.v_frac,
