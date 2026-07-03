@@ -174,6 +174,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             inject_frac=cfg.get("inject_frac", 0.5),
             pfb_step=cfg.get("pfb_step", 3),
             pfb_alpha=cfg.get("pfb_alpha", 1.0),
+            delta_scale=cfg.get("delta_scale", 1.5),
         )
     else:
         src_img, edit_img = generate_dual_branch(
@@ -267,8 +268,10 @@ def parse_args():
                    help="Fraction of steps to run SAC (Q+K injection, default 0.5)")
     p.add_argument("--pfb_step",   type=int,   default=3,
                    help="Denoising step (0-indexed) at which PFB latent correction fires (default 3)")
-    p.add_argument("--pfb_alpha",  type=float, default=1.0,
+    p.add_argument("--pfb_alpha",   type=float, default=1.0,
                    help="SVD reweighting strength for PFB (default 1.0)")
+    p.add_argument("--delta_scale", type=float, default=1.5,
+                   help="Colour-delta amplification (1.0=edit only, 1.5=amplified, default 1.5)")
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
     p.add_argument("--guidance_scale",type=float, default=3.5)
@@ -329,6 +332,7 @@ def main():
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
+        "delta_scale":          args.delta_scale,
         "seed":          args.seed,
         "num_steps":     args.num_steps,
         "guidance_scale":args.guidance_scale,

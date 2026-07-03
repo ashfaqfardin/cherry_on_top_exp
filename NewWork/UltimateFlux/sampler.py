@@ -407,9 +407,10 @@ def generate_p2p(
     latent_top_k: int = 0,              # unused; kept for API compat
     latent_alpha: float = 1.0,          # unused; kept for API compat
     color_structure_frac: float = 0.0,  # unused; kept for API compat
-    inject_frac: float = 0.5,
-    pfb_step: int = 3,
-    pfb_alpha: float = 1.0,
+    inject_frac: float = 0.5,           # unused; kept for API compat
+    pfb_step: int = 3,                  # unused; kept for API compat
+    pfb_alpha: float = 1.0,             # unused; kept for API compat
+    delta_scale: float = 1.5,
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Colour editing via PFB + SAC, adapted from SVD-Style (DGIST 2025) to FLUX.
@@ -435,10 +436,33 @@ def generate_p2p(
         pfb_step     2–6       step at which latent is corrected (0-indexed)
         pfb_alpha    1.0       higher = fewer singular vectors blended (more structure-only)
 
+    Colour editing via Delta Flow Guidance.
+
+    Phase 1 — source generation (num_steps, source prompt):
+        Standard denoising from z_T → lat_src.
+
+    Phase 2 — guided edit (num_steps, from the same z_T):
+        At every step, BOTH velocities are evaluated at the SAME current latent
+        (lat_edit), with different text conditioning:
+
+            v_src  = model(lat_edit, t, source_prompt)
+            v_edit = model(lat_edit, t, edit_prompt)
+
+        Because they share the same input, their difference is a pure colour
+        signal — structural components cancel.  The guided velocity is:
+
+            v_guided = v_src + delta_scale × (v_edit − v_src)
+
+        v_src anchors the trajectory to source structure.
+        (v_edit − v_src) is the colour-change direction.
+        delta_scale amplifies it:
+            1.0  → pure edit prompt direction
+            1.5  → amplified colour, good default
+            2.0  → stronger colour, may introduce minor artefacts
+
     Returns (src_img, edit_img).
     """
     exec_device = getattr(pipe, "_execution_device", device)
-    sac_steps   = max(0, int(inject_frac * num_steps))
 
     # -- Encode both prompts --------------------------------------------------
     def _encode(prompt: str):
@@ -491,85 +515,59 @@ def generate_p2p(
 
     has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
 
-    # -- SAC hooks: Q+K on double-stream HOTSPOT layers -----------------------
-    hooks, mode_ref, _ = _setup_sac_hooks(pipe, N_DOUBLE)
+    # -- Phase 1: source generation -------------------------------------------
+    print(f"[UltimateFlux P2P] Phase 1: source ({num_steps} steps)...")
+    lat_src = z_T.clone()
+    for i, t in enumerate(timesteps):
+        dt  = sigmas[i + 1] - sigmas[i]
+        ts1 = t.expand(1)
+        g1  = (torch.full([1], guidance_scale, device=exec_device, dtype=lat_src.dtype)
+               if has_guidance else None)
+        v_s = pipe.transformer(
+            hidden_states=lat_src,
+            timestep=ts1 / 1000.0,
+            guidance=g1,
+            pooled_projections=src_pp,
+            encoder_hidden_states=src_pe,
+            txt_ids=src_txt,
+            img_ids=img_ids,
+            return_dict=False,
+        )[0]
+        lat_src = lat_src + dt * v_s
 
-    lat_src  = z_T.clone()
-    lat_edit = z_T.clone()
-
+    # -- Phase 2: delta flow guidance -----------------------------------------
     print(
-        f"[UltimateFlux P2P] {num_steps} steps | "
-        f"SAC first {sac_steps} steps (HOTSPOT layers [1,2,4]) | "
-        f"PFB at step {pfb_step} (α={pfb_alpha})"
+        f"[UltimateFlux P2P] Phase 2: delta flow guidance "
+        f"(delta_scale={delta_scale}, {num_steps} steps)..."
     )
+    lat_edit = z_T.clone()
+    for i, t in enumerate(timesteps):
+        dt  = sigmas[i + 1] - sigmas[i]
+        ts2 = t.expand(2)
+        g2  = (torch.full([2], guidance_scale, device=exec_device, dtype=lat_edit.dtype)
+               if has_guidance else None)
 
-    try:
-        for i, t in enumerate(timesteps):
-            dt  = sigmas[i + 1] - sigmas[i]
-            ts1 = t.expand(1)
-            g1  = (torch.full([1], guidance_scale, device=exec_device, dtype=lat_src.dtype)
-                   if has_guidance else None)
+        # Both velocities evaluated at THE SAME lat_edit — their difference is
+        # a pure colour signal; structural terms cancel.
+        lat_b = torch.cat([lat_edit, lat_edit])
+        pe_b  = torch.cat([src_pe,   edit_pe])
+        pp_b  = torch.cat([src_pp,   edit_pp])
 
-            if i < sac_steps:
-                # SAC phase: separate source and edit passes
-                # Source — store Q and K in HOTSPOT layers
-                mode_ref[0] = "store"
-                src_noise = pipe.transformer(
-                    hidden_states=lat_src,
-                    timestep=ts1 / 1000.0,
-                    guidance=g1,
-                    pooled_projections=src_pp,
-                    encoder_hidden_states=src_pe,
-                    txt_ids=src_txt,
-                    img_ids=img_ids,
-                    return_dict=False,
-                )[0]
-                # Edit — inject source Q+K; text conditioning and V stay from edit prompt
-                mode_ref[0] = "inject"
-                edit_noise = pipe.transformer(
-                    hidden_states=lat_edit,
-                    timestep=ts1 / 1000.0,
-                    guidance=g1,
-                    pooled_projections=edit_pp,
-                    encoder_hidden_states=edit_pe,
-                    txt_ids=src_txt,
-                    img_ids=img_ids,
-                    return_dict=False,
-                )[0]
-                mode_ref[0] = "normal"
-            else:
-                # Free phase: one batched pass, no SAC
-                lat_b = torch.cat([lat_src, lat_edit])
-                pe_b  = torch.cat([src_pe,  edit_pe])
-                pp_b  = torch.cat([src_pp,  edit_pp])
-                ts2   = t.expand(2)
-                g2    = (torch.full([2], guidance_scale, device=exec_device, dtype=lat_b.dtype)
-                         if has_guidance else None)
-                noise_b = pipe.transformer(
-                    hidden_states=lat_b,
-                    timestep=ts2 / 1000.0,
-                    guidance=g2,
-                    pooled_projections=pp_b,
-                    encoder_hidden_states=pe_b,
-                    txt_ids=src_txt,
-                    img_ids=img_ids,
-                    return_dict=False,
-                )[0]
-                src_noise, edit_noise = noise_b.chunk(2)
+        noise_b = pipe.transformer(
+            hidden_states=lat_b,
+            timestep=ts2 / 1000.0,
+            guidance=g2,
+            pooled_projections=pp_b,
+            encoder_hidden_states=pe_b,
+            txt_ids=src_txt,
+            img_ids=img_ids,
+            return_dict=False,
+        )[0]
+        v_src, v_edit = noise_b.chunk(2)
 
-            # Flow-matching Euler step (manual — avoids scheduler._step_index drift)
-            lat_src  = lat_src  + dt * src_noise
-            lat_edit = lat_edit + dt * edit_noise
-
-            # PFB: one-shot latent correction at pfb_step
-            # Replace edit's dominant singular directions with source's so that
-            # layout / identity locked in at this step; colour residual kept.
-            if i == pfb_step:
-                lat_edit = apply_pfb(lat_edit, lat_src, pfb_alpha)
-
-    finally:
-        for h in hooks:
-            h.remove()
+        # Anchor to source structure, push along colour-change direction
+        v_guided = v_src + delta_scale * (v_edit - v_src)
+        lat_edit = lat_edit + dt * v_guided
 
     src_img  = _decode_latents(pipe, lat_src,  height, width)
     edit_img = _decode_latents(pipe, lat_edit, height, width)
