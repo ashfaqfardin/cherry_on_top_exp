@@ -564,9 +564,16 @@ def generate_p2p(
             return_dict=False,
         )[0]
         v_src, v_edit = noise_b.chunk(2)
+        v_delta = v_edit - v_src                             # (1, N, 64)
 
-        # Anchor to source structure, push along colour-change direction
-        v_guided = v_src + delta_scale * (v_edit - v_src)
+        # Soft per-token mask: tokens where source and edit disagree most
+        # (hair, car body) receive the full colour delta; tokens where they
+        # agree (face outline, background, plate) receive near-zero correction.
+        # The model itself localises the colour region — no CV or user mask needed.
+        mag  = v_delta.norm(dim=-1, keepdim=True)            # (1, N, 1)
+        mask = mag / (mag.max() + 1e-8)                      # (1, N, 1) ∈ [0, 1]
+
+        v_guided = v_src + delta_scale * mask * v_delta
         lat_edit = lat_edit + dt * v_guided
 
     src_img  = _decode_latents(pipe, lat_src,  height, width)
