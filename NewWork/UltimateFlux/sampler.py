@@ -358,14 +358,18 @@ def generate_p2p(
     trajectory up to step N, guaranteeing structural alignment.
 
     color_structure_frac (tune in JSON / CLI):
-        0.2  ~5 shared steps   more colour freedom, slight drift risk
-        0.4  ~11 shared steps  good balance (default)
-        0.6  ~17 shared steps  very strong structure lock
+        0.0   0 shared steps  — both branches fully independent from z_T (default)
+                               Same seed + similar prompts → same composition, different colour.
+                               Early steps determine colour; sharing them with the source
+                               prompt would lock in the source colour before the edit
+                               branch can act.
+        0.1  ~3 shared steps  — tiny structural anchor, slight colour bleed risk
+        0.3  ~8 shared steps  — strong structure but colour change may be weak
 
     Returns (src_img, edit_img).
     """
     exec_device = getattr(pipe, "_execution_device", device)
-    split_step  = max(1, int(color_structure_frac * num_steps))
+    split_step  = max(0, int(color_structure_frac * num_steps))
 
     # -- Encode both prompts --------------------------------------------------
     def _encode(prompt: str):
@@ -443,7 +447,7 @@ def generate_p2p(
         )[0]
         return pipe.scheduler.step(noise, t, lat, return_dict=False)[0]
 
-    # -- Phase 1: single branch with source prompt ----------------------------
+    # -- Phase 1: shared structure phase (may be 0 steps for colour editing) ----
     print(f"[UltimateFlux P2P] Phase 1: {split_step} shared steps (source prompt)...")
     latents = z_T.clone()
     for t in timesteps[:split_step]:
