@@ -28,6 +28,10 @@ from typing import Optional, List, Tuple, Dict, Callable
 # Source: FreeFlux non_rigid_attn_utils.py layer_idx (RoPE frequency analysis)
 TIER_A = [0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56]
 
+# HOTSPOT — Position-dependent layers (high RoPE frequency): spatial layout
+# Source: FreeFlux RoPE frequency analysis
+HOTSPOT = [1, 2, 4, 26, 30, 54, 55]
+
 # Tier B — All layers: used when shape/pose deformation is needed
 TIER_B = list(range(57))
 
@@ -298,7 +302,42 @@ def generate_dual_branch(
 
 
 
-# ──────────────────── Split-denoising colour editing ──────────────────────────
+# ──────────────────── K-injection colour editing ──────────────────────────────
+
+def _setup_k_hooks(pipe, n_double: int):
+    """
+    Register to_k forward hooks on the double-stream HOTSPOT blocks (layers 1, 2, 4).
+
+    Returns (hooks, mode_ref, storage).
+      mode_ref  — mutable list; set to "store", "inject", or "normal" each step.
+      storage   — dict {layer_idx: K_tensor}; written in store mode, read in inject mode.
+
+    The hook fires on `block.attn.to_k` (the linear that projects image hidden_states
+    to K before reshape / norm / rotary-emb).  Injecting pre-reshape K is safe because
+    the norms and RoPE that follow are shared weights applied identically to both branches.
+    """
+    storage  = {}
+    mode_ref = ["normal"]
+    hooks    = []
+
+    double_hotspot = [l for l in HOTSPOT if l < n_double]   # [1, 2, 4]
+
+    for l in double_hotspot:
+        block = pipe.transformer.transformer_blocks[l]
+
+        def _make(lid):
+            def _hook(module, args, output):
+                if mode_ref[0] == "store":
+                    storage[lid] = output.detach().clone()
+                elif mode_ref[0] == "inject" and lid in storage:
+                    return storage[lid]
+                return output
+            return _hook
+
+        hooks.append(block.attn.to_k.register_forward_hook(_make(l)))
+
+    return hooks, mode_ref, storage
+
 
 def _decode_latents(
     pipe: FluxPipeline,
@@ -335,41 +374,36 @@ def generate_p2p(
     edge_strength: float = 0.7,         # unused; kept for API compat
     latent_top_k: int = 0,              # unused; kept for API compat
     latent_alpha: float = 1.0,          # unused; kept for API compat
-    color_structure_frac: float = 0.4,
+    color_structure_frac: float = 0.0,  # unused; kept for API compat
+    inject_frac: float = 0.3,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Colour editing via split-denoising: shared structure phase -> diverged colour phase.
+    Colour editing via K-injection + independent denoising.
 
-    The num_steps denoising steps are split at N = round(color_structure_frac * num_steps):
+    Both branches denoise independently from the same z_T (same seed) so the
+    edit prompt is free to establish its own colour from step 0.  To preserve
+    identity (face, plate, composition) we inject the image-token KEYS from the
+    source branch into the edit branch for the first inject_frac fraction of steps,
+    in the double-stream HOTSPOT layers (position-dependent: 1, 2, 4).
 
-    Phase 1  steps [0, N)   -- source prompt, single branch:
-        Both source and edit will share this denoising prefix.
-        Early steps commit the global composition -- car position, plate
-        location, face layout -- as a joint latent z_N.
+    How K-injection preserves structure without locking colour:
+      • K encodes spatial query positions — WHERE to attend.
+      • V encodes content values — WHAT to paint (colour, texture).
+      • Text conditioning reaches the image tokens via Q→text-K/V cross-attention.
+    Replacing only the image-K of the edit branch with source's image-K makes the
+    edit branch lay down its objects in the same spatial positions as source, while
+    V (colour) and text conditioning (edit prompt) remain fully independent.
 
-    Phase 2  steps [N, end) -- two branches, batched in one transformer call:
-        Source branch: continues with source_prompt -> renders red car.
-        Edit   branch: starts from z_N, uses edit_prompt -> renders blue car.
-        Because both branches are initialised from the IDENTICAL z_N, the
-        structure is locked by construction. No blending, no CV, no injection.
-
-    This eliminates the "overlap of two images" artifact that comes from
-    blending independently-denoised latents: both branches share the same
-    trajectory up to step N, guaranteeing structural alignment.
-
-    color_structure_frac (tune in JSON / CLI):
-        0.0   0 shared steps  — both branches fully independent from z_T (default)
-                               Same seed + similar prompts → same composition, different colour.
-                               Early steps determine colour; sharing them with the source
-                               prompt would lock in the source colour before the edit
-                               branch can act.
-        0.1  ~3 shared steps  — tiny structural anchor, slight colour bleed risk
-        0.3  ~8 shared steps  — strong structure but colour change may be weak
+    inject_frac (tune in JSON / CLI):
+        0.0   no injection  — pure same-seed generation, maximum colour freedom,
+                              may drift in identity for very different prompts
+        0.3   ~8 steps      — good balance: face/plate preserved, colour changes (default)
+        0.5   ~14 steps     — stronger structure lock, use if identity still drifts
 
     Returns (src_img, edit_img).
     """
-    exec_device = getattr(pipe, "_execution_device", device)
-    split_step  = max(0, int(color_structure_frac * num_steps))
+    exec_device  = getattr(pipe, "_execution_device", device)
+    inject_steps = max(0, int(inject_frac * num_steps))
 
     # -- Encode both prompts --------------------------------------------------
     def _encode(prompt: str):
@@ -377,7 +411,6 @@ def generate_p2p(
             prompt, prompt_2=None, device=exec_device,
             num_images_per_prompt=1, max_sequence_length=max_sequence_length,
         )
-        # Recent diffusers: (pe, pp, txt_ids).  Older: 6 values.
         if len(enc) == 3:
             pe, pp, txt_ids = enc
         else:
@@ -389,24 +422,23 @@ def generate_p2p(
 
     # -- Initial packed latent z_T --------------------------------------------
     vae_scale = getattr(pipe, "vae_scale_factor", 8)
-    num_ch    = pipe.transformer.config.in_channels // 4   # VAE channels = 16
-    lat_h     = 2 * (height // (vae_scale * 2))           # unpacked latent H
-    lat_w     = 2 * (width  // (vae_scale * 2))           # unpacked latent W
+    num_ch    = pipe.transformer.config.in_channels // 4
+    lat_h     = 2 * (height // (vae_scale * 2))
+    lat_w     = 2 * (width  // (vae_scale * 2))
 
     gen   = torch.Generator(device=exec_device).manual_seed(seed)
     raw_z = randn_tensor(
         (1, num_ch, lat_h, lat_w),
         generator=gen, device=exec_device, dtype=src_pe.dtype,
     )
-    z_T     = pipe._pack_latents(raw_z, 1, num_ch, lat_h, lat_w)   # (1, N, 64)
+    z_T     = pipe._pack_latents(raw_z, 1, num_ch, lat_h, lat_w)
     img_ids = pipe._prepare_latent_image_ids(
         1, lat_h // 2, lat_w // 2, exec_device, src_pe.dtype,
-    )                                                                 # (1, N, 3) or (N, 3)
+    )
     if img_ids.ndim == 3:
-        img_ids = img_ids.squeeze(0)                                  # → (N, 3) new 2d API
+        img_ids = img_ids.squeeze(0)
 
-    # -- Timesteps: match pipe()'s schedule -----------------------------------
-    # FLUX uses dynamic shifting: mu scales the schedule to image resolution.
+    # -- Timesteps ------------------------------------------------------------
     image_seq_len = (lat_h // 2) * (lat_w // 2)
     sched_cfg     = pipe.scheduler.config
     if getattr(sched_cfg, "use_dynamic_shifting", False):
@@ -414,86 +446,89 @@ def generate_p2p(
         max_seq   = getattr(sched_cfg, "max_image_seq_len",  4096)
         base_shft = getattr(sched_cfg, "base_shift",         0.5)
         max_shft  = getattr(sched_cfg, "max_shift",          1.15)
-        m   = (max_shft - base_shft) / (max_seq - base_seq)
-        mu  = image_seq_len * m + (base_shft - m * base_seq)
+        m  = (max_shft - base_shft) / (max_seq - base_seq)
+        mu = image_seq_len * m + (base_shft - m * base_seq)
         pipe.scheduler.set_timesteps(num_steps, device=exec_device, mu=mu)
     else:
         pipe.scheduler.set_timesteps(num_steps, device=exec_device)
-    timesteps = pipe.scheduler.timesteps                              # length = num_steps
-    sigmas    = pipe.scheduler.sigmas                                 # length = num_steps+1
+    timesteps = pipe.scheduler.timesteps
+    sigmas    = pipe.scheduler.sigmas
 
     has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
 
-    def _transformer_step(
-        lat: torch.Tensor,
-        t: torch.Tensor,
-        pe: torch.Tensor,
-        pp: torch.Tensor,
-        txt: torch.Tensor,
-    ) -> torch.Tensor:
-        B  = lat.shape[0]
-        ts = t.expand(B)
-        g  = (torch.full([B], guidance_scale, device=exec_device, dtype=lat.dtype)
-              if has_guidance else None)
-        noise = pipe.transformer(
-            hidden_states=lat,
-            timestep=ts / 1000.0,
-            guidance=g,
-            pooled_projections=pp,
-            encoder_hidden_states=pe,
-            txt_ids=txt,
-            img_ids=img_ids,
-            return_dict=False,
-        )[0]
-        return pipe.scheduler.step(noise, t, lat, return_dict=False)[0]
+    # -- K-injection hooks on double-stream HOTSPOT layers --------------------
+    hooks, mode_ref, _ = _setup_k_hooks(pipe, N_DOUBLE)
 
-    # -- Phase 1: shared structure phase (may be 0 steps for colour editing) ----
-    print(f"[UltimateFlux P2P] Phase 1: {split_step} shared steps (source prompt)...")
-    latents = z_T.clone()
-    for t in timesteps[:split_step]:
-        latents = _transformer_step(latents, t, src_pe, src_pp, src_txt)
+    lat_src  = z_T.clone()
+    lat_edit = z_T.clone()
 
-    z_split  = latents.clone()   # structure checkpoint -- both branches fork here
-    lat_src  = z_split.clone()
-    lat_edit = z_split.clone()
-
-    # -- Phase 2: two branches batched into one transformer call per step -----
     print(
-        f"[UltimateFlux P2P] Phase 2: {num_steps - split_step} diverged steps "
-        f"(source | edit batched)..."
+        f"[UltimateFlux P2P] {num_steps} steps | "
+        f"K-inject first {inject_steps} steps in HOTSPOT layers [1,2,4]"
     )
-    for i, t in enumerate(timesteps[split_step:]):
-        # Concatenate both branches — one forward pass handles both.
-        lat_b  = torch.cat([lat_src, lat_edit])                  # (2, N, 64)
-        pe_b   = torch.cat([src_pe,  edit_pe])                   # (2, T, C)
-        pp_b   = torch.cat([src_pp,  edit_pp])                   # (2, C)
-        # txt_ids are all-zero position IDs from encode_prompt — shape (T, 3),
-        # NOT batched. Concatenating them would double the sequence length and
-        # break RoPE. Pass src_txt (== edit_txt) as the shared 2d position IDs.
-        ts     = t.expand(2)
-        g      = (torch.full([2], guidance_scale, device=exec_device, dtype=lat_b.dtype)
-                  if has_guidance else None)
 
-        noise_b = pipe.transformer(
-            hidden_states=lat_b,
-            timestep=ts / 1000.0,
-            guidance=g,
-            pooled_projections=pp_b,
-            encoder_hidden_states=pe_b,
-            txt_ids=src_txt,
-            img_ids=img_ids,
-            return_dict=False,
-        )[0]
+    try:
+        for i, t in enumerate(timesteps):
+            dt  = sigmas[i + 1] - sigmas[i]          # negative (toward clean image)
+            ts1 = t.expand(1)
+            g1  = (torch.full([1], guidance_scale, device=exec_device, dtype=lat_src.dtype)
+                   if has_guidance else None)
 
-        noise_src, noise_edit = noise_b.chunk(2)
-        # Apply Euler step directly: scheduler._step_index advances by 1 per
-        # scheduler.step() call, so calling it twice per timestep (src + edit)
-        # would double-advance the index and crash at the boundary.
-        # Flow matching Euler: x_{t-1} = x_t + (σ_{t-1} - σ_t) * v_pred
-        si       = split_step + i
-        dt       = sigmas[si + 1] - sigmas[si]                    # negative scalar
-        lat_src  = lat_src  + dt * noise_src
-        lat_edit = lat_edit + dt * noise_edit
+            if i < inject_steps:
+                # Injection phase: two separate passes per step
+                # Source pass — stores image-K in HOTSPOT layers
+                mode_ref[0] = "store"
+                src_noise = pipe.transformer(
+                    hidden_states=lat_src,
+                    timestep=ts1 / 1000.0,
+                    guidance=g1,
+                    pooled_projections=src_pp,
+                    encoder_hidden_states=src_pe,
+                    txt_ids=src_txt,
+                    img_ids=img_ids,
+                    return_dict=False,
+                )[0]
+                # Edit pass — injects stored source K into HOTSPOT layers;
+                # text conditioning, Q, and V remain from the edit prompt
+                mode_ref[0] = "inject"
+                edit_noise = pipe.transformer(
+                    hidden_states=lat_edit,
+                    timestep=ts1 / 1000.0,
+                    guidance=g1,
+                    pooled_projections=edit_pp,
+                    encoder_hidden_states=edit_pe,
+                    txt_ids=src_txt,
+                    img_ids=img_ids,
+                    return_dict=False,
+                )[0]
+                mode_ref[0] = "normal"
+            else:
+                # Free phase: single batched pass, no injection
+                lat_b = torch.cat([lat_src, lat_edit])
+                pe_b  = torch.cat([src_pe,  edit_pe])
+                pp_b  = torch.cat([src_pp,  edit_pp])
+                ts2   = t.expand(2)
+                g2    = (torch.full([2], guidance_scale, device=exec_device, dtype=lat_b.dtype)
+                         if has_guidance else None)
+                noise_b = pipe.transformer(
+                    hidden_states=lat_b,
+                    timestep=ts2 / 1000.0,
+                    guidance=g2,
+                    pooled_projections=pp_b,
+                    encoder_hidden_states=pe_b,
+                    txt_ids=src_txt,
+                    img_ids=img_ids,
+                    return_dict=False,
+                )[0]
+                src_noise, edit_noise = noise_b.chunk(2)
+
+            # Flow-matching Euler step (manual — avoids scheduler._step_index drift)
+            lat_src  = lat_src  + dt * src_noise
+            lat_edit = lat_edit + dt * edit_noise
+
+    finally:
+        for h in hooks:
+            h.remove()
 
     src_img  = _decode_latents(pipe, lat_src,  height, width)
     edit_img = _decode_latents(pipe, lat_edit, height, width)

@@ -170,7 +170,8 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             width=width,
             max_sequence_length=max_seq_len,
             device=device,
-            color_structure_frac=cfg.get("color_structure_frac", 0.4),
+            color_structure_frac=cfg.get("color_structure_frac", 0.0),
+            inject_frac=cfg.get("inject_frac", 0.3),
         )
     else:
         src_img, edit_img = generate_dual_branch(
@@ -258,8 +259,10 @@ def parse_args():
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "tier_a"],
                    help="attr_edit mode: color=latent delta blend (2 FLUX passes), tier_a=breed/shape change")
-    p.add_argument("--color_structure_frac", type=float, default=0.4,
-                   help="Fraction of steps shared (structure phase) before colour branches diverge (default 0.4)")
+    p.add_argument("--color_structure_frac", type=float, default=0.0,
+                   help="Unused; kept for backward compat")
+    p.add_argument("--inject_frac", type=float, default=0.3,
+                   help="Fraction of steps to inject source image-K into edit (default 0.3; 0=disable)")
     p.add_argument("--pfb_alpha",     type=float, default=1.0)
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
@@ -318,6 +321,7 @@ def main():
         "sam2_model_id":  args.sam2_model_id,
         "inject_layers":        args.inject_layers,
         "color_structure_frac": args.color_structure_frac,
+        "inject_frac":          args.inject_frac,
         "pfb_alpha":     args.pfb_alpha,
         "seed":          args.seed,
         "num_steps":     args.num_steps,
