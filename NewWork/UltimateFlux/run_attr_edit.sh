@@ -32,6 +32,18 @@ W=1024
 echo "=== Task 5: Fine-grained attribute editing ==="
 
 # ── Change colour (ColorCtrl: arXiv:2508.09131) ───────────────────────────────
+# Tuning guide for color editing:
+#   top_k_frac  — editing region size (fraction of 4096 image tokens).
+#                 0.2 = 20% ≈ 820 tokens; too small → boundary hair/car stays old colour.
+#                 0.35 is a safer default for hair; 0.4 for large subjects like cars.
+#   qk_frac     — fraction of steps with v-v pre-softmax score injection (structure).
+#                 1.0 = all steps → each editing token's output is ~80% source V (diluted).
+#                 0.0 = disabled → V masking alone; colour changes fully, structure from noise.
+#                 Try 0.0 first for strongest colour; raise if identity drifts too much.
+#   mask_build_step — steps of free denoising before building the editing mask.
+#                 5–8 = sufficient structure to locate the colour region.
+#   v_frac      — steps with V masking active. 1.0 (all) is correct; lower only to debug.
+
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -41,9 +53,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
-    --top_k_frac 0.2 \
+    --top_k_frac 0.35 \
+    --qk_frac 0.0 \
     --color_word blonde \
-    --mask_build_step 9 \
+    --mask_build_step 6 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -55,9 +68,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
-    --top_k_frac 0.2 \
+    --top_k_frac 0.4 \
+    --qk_frac 0.0 \
     --color_word blue \
-    --mask_build_step 9 \
+    --mask_build_step 6 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────
