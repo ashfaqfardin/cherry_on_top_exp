@@ -1009,8 +1009,12 @@ class ColorCtrlPolicy(BasePolicy):
 
         do_qk = step < int(self.qk_frac * n_steps)  # v-v score injection active?
         do_v  = step < int(self.v_frac  * n_steps)  # V masking active?
-        do_rw = (self.reweight_scale > 1.0          # re-weighting active when:
-                 and bool(self._color_tok_ids))      #   scale set AND color_word known
+        # Re-weighting requires the mask so it only amplifies the EDITING REGION.
+        # Global amplification (all tokens ×scale) destroys spatial structure because
+        # every image token — including face — floods toward the colour-word V.
+        do_rw = (self.reweight_scale > 1.0
+                 and bool(self._color_tok_ids)
+                 and self._mask is not None)
 
         # ── Mask build: attempt once conditions are met (needed for do_v / do_qk) ─
         # Re-weighting (do_rw) does NOT need the mask — it fires from step 0.
@@ -1086,13 +1090,21 @@ class ColorCtrlPolicy(BasePolicy):
                 scores_t[:, :, text_len:, text_len:] = vv_src
 
             # §3.5 Attribute re-weighting: amplify image→colour-word scores.
-            # scores_t rows text_len: = image queries; cols rw_ids = colour-word keys.
-            # After softmax, image tokens pull proportionally more from V_txt[colour],
-            # driving strong colour change without needing a binary mask.
+            # Applied ONLY to editing-region image tokens (mask=0); non-editing
+            # tokens (face, bg) keep scale=1.0 so their colour is unaffected.
+            # Global amplification (all tokens) collapses spatial structure.
             if rw_ids:
-                scores_t[:, :, text_len:, rw_ids] = (
-                    scores_t[:, :, text_len:, rw_ids] * self.reweight_scale
-                )
+                # editing_region: 1.0 where mask=0 (editing), 0.0 elsewhere
+                editing_region = (1.0 - self._mask).to(
+                    device=scores_t.device, dtype=scores_t.dtype)  # (n_img,)
+                # per-token scale: editing→reweight_scale, non-editing→1.0
+                scale_vec = (
+                    1.0 + (self.reweight_scale - 1.0) * editing_region
+                ).view(1, 1, n_img)                                 # (1,1,n_img)
+                for c in rw_ids:
+                    scores_t[:, :, text_len:, c] = (
+                        scores_t[:, :, text_len:, c] * scale_vec
+                    )
 
             probs_t = torch.softmax(scores_t, dim=-1).to(q.dtype)
             out[B // 2:, h0:h1] = torch.matmul(probs_t, v_c[B // 2:])

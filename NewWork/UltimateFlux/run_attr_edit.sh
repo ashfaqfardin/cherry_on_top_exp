@@ -64,7 +64,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --reweight_scale 3.0 \
     --ds_key_inject \
     --color_word blonde \
-    --mask_build_step 999 \
+    --mask_build_step 5 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -80,7 +80,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --reweight_scale 3.0 \
     --ds_key_inject \
     --color_word blue \
-    --mask_build_step 999 \
+    --mask_build_step 5 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────
