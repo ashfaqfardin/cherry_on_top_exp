@@ -60,6 +60,26 @@ class BasePolicy:
         """Called inside every attention layer.  Modify q/k/v for edit branch."""
         return q, k, v
 
+    def inject_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: int,
+        step: int,
+        n_steps: int,
+        txt_len: int = 0,
+    ) -> Optional[torch.Tensor]:
+        """
+        Optional custom attention computation.  Called AFTER inject_qkv with the
+        (potentially modified) q/k/v.
+
+        Return the attention output (B, H, L, D) to replace SDPA, or None to
+        let SDPA run as usual.  Policies that need to manipulate pre-softmax
+        attention scores (e.g. ColorCtrl) override this method.
+        """
+        return None
+
     def get_block_hooks(self) -> Dict[int, Callable]:
         """
         Return {block_idx: hook_fn} for transformer block forward hooks.
@@ -167,8 +187,14 @@ class UltimateFluxAttnProcessor:
         # ── Policy injection ──────────────────────────────────────────────
         q, k, v = self.policy.inject_qkv(q, k, v, layer, step, self.total_steps, txt_len)
 
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False,
-                                             attn_mask=attention_mask)
+        # Policy may override attention computation entirely (e.g. ColorCtrl needs
+        # to manipulate pre-softmax scores, which SDPA does not expose).
+        custom_out = self.policy.inject_attention(q, k, v, layer, step, self.total_steps, txt_len)
+        if custom_out is not None:
+            out = custom_out  # (B, H, L, D) — same shape as SDPA output
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False,
+                                                 attn_mask=attention_mask)
         out = out.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         out = out.to(q.dtype)
 

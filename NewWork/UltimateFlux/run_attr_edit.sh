@@ -5,14 +5,18 @@
 #   (default / omit)        → _PRESERVE_LAYERS (TIER_A + HOTSPOT, 20 layers)
 #                              Tightest identity lock — for ADDING an attribute
 #                              (glasses, hat, beard).
-#   --inject_layers color   → ColorCtrl (arXiv:2508.09131) — all layers, all steps.
-#                              Structure Preservation: source K^image injected into
-#                              target at every layer (locks geometry/layout).
-#                              Color Preservation: vision-to-text attention mask
-#                              identifies editing region (top --top_k_frac tokens);
-#                              source V^image is copied to non-editing tokens,
-#                              editing region keeps target V (new colour).
-#                              Tune --top_k_frac 0.1–0.4 (default 0.2 = 20% of tokens).
+#   --inject_layers color   → ColorCtrl (arXiv:2508.09131) — single-stream only.
+#                              Double-stream blocks (0-18): standard SDPA, untouched.
+#                              Single-stream blocks (19-56): manual attention with:
+#                                Structure: source v-v pre-softmax scores → target
+#                                  (locks spatial layout without touching colour V).
+#                                Colour: editing-region mask from target img→text
+#                                  attention; source V copied to NON-editing tokens;
+#                                  editing region keeps target V (new colour).
+#                              --top_k_frac 0.1–0.4 = editing region size (20% default).
+#                              --color_word 'blonde'/'blue' = focus mask on that word.
+#                              --qk_frac / --v_frac = step fraction for each component.
+#                              --chunk_size = heads per manual-attn chunk (OOM → 2 or 1).
 #   --inject_layers tier_a  → TIER_A only (13 layers)
 #                              Appearance preserved, position flexible —
 #                              for shape-linked edits (breed change).
@@ -38,6 +42,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
     --top_k_frac 0.2 \
+    --color_word blonde \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -50,6 +55,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
     --top_k_frac 0.2 \
+    --color_word blue \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────

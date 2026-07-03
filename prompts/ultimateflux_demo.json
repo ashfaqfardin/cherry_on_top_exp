@@ -103,13 +103,14 @@
       "seed": 30
     },
     {
-      "comment": "ColorCtrl (arXiv:2508.09131): structure-preserving colour edit. All layers, all steps. Source K^img injected for structure; vision-to-text mask identifies hair region (top top_k_frac tokens); source V^img copied outside mask. top_k_frac: 0.1=tighter bg, 0.3=larger edit area.",
+      "comment": "ColorCtrl (arXiv:2508.09131): single-stream-only attention editing. Double-stream blocks untouched. Single-stream: source v-v pre-softmax scores injected into target (structure); editing-region mask from img→text attention (top top_k_frac tokens); source V copied to non-editing region. color_word focuses mask on specific T5 tokens.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
       "top_k_frac": 0.2,
+      "color_word": "blonde",
       "seed": 35
     },
     {
@@ -119,6 +120,7 @@
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
       "top_k_frac": 0.2,
+      "color_word": "blue",
       "seed": 40
     },
     {

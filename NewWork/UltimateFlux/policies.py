@@ -852,105 +852,205 @@ class FineGrainedAttrPolicy(BasePolicy):
 
 class ColorCtrlPolicy(BasePolicy):
     """
-    ColorCtrl (arXiv:2508.09131) — structure-preserving colour editing.
+    Faithful implementation of ColorCtrl (arXiv:2508.09131) for FLUX.1-dev.
 
-    Applied at ALL attention layers and ALL denoising steps; no manual layer
-    or step selection required.
+    Scope — SINGLE-STREAM BLOCKS ONLY (layers 19-56):
+        Double-stream blocks (0-18): standard SDPA, no modification.
+        Single-stream blocks: manual head-chunked attention with:
 
     Structure Preservation (§3.3):
-        Source image-token K is injected into the target branch at every layer.
-        This approximates ColorCtrl's attention-map copy (which replaces the
-        vision-to-vision attention quadrant post-softmax) without materialising
-        the full seq×seq attention matrix — equivalent to FreeFlux K-injection
-        but global rather than layer-selective.
+        Before softmax, the source branch's image-to-image (v-v) attention
+        score quadrant is copied into the target branch.  This forces the
+        target to attend to the SAME spatial positions as the source, locking
+        the geometric layout while allowing colour to change via V + text.
 
     Color Preservation (§3.4):
-        For each attention call, compute the vision-to-text raw scores
-        (Q^img_target × K^txt_target^T) to identify the editing region.
-        The top-k% of image tokens (by max v→t score over text tokens,
-        averaged across heads) are flagged as the editing region (e.g., hair,
-        car body).  Source V^image is copied to ALL OTHER tokens (background,
-        face outline, etc.) so the non-editing structure stays faithful to source.
-        Editing-region tokens keep target V (new colour from edit prompt).
+        A binary preserve_mask identifies the NON-editing region (background,
+        face, licence plate, …).  Source V^image is blended into the target's
+        value tensor at those positions before the attention is computed, so
+        those regions are anchored to the source appearance.  Editing-region
+        tokens (hair, car body) keep the target's V and receive the new colour.
 
-    top_k_frac  fraction of image tokens treated as the editing region.
-                Default 0.2 (top 20%).  Increase for larger edit areas,
-                decrease for tighter background preservation.
+    Mask derivation:
+        At the FIRST single-stream attention call (step=0, layer=19), the target
+        branch's image→text attention scores are used to identify which image
+        tokens attend most strongly to the target-prompt text (or to the
+        specific colour-word tokens when color_word is supplied).  The top-K%
+        tokens become the editing region (preserve_mask=0); all others are
+        preserved (preserve_mask=1).  The mask is cached and reused for all
+        subsequent layers and steps.
+
+    Parameters
+    ----------
+    top_k_frac   : Fraction of image tokens treated as the editing region.
+                   0.2 = 20%.  Increase for larger edits, decrease to tighten.
+    qk_frac      : Fraction of denoising steps for structure preservation
+                   (v-v score injection).  1.0 = all steps.
+    v_frac       : Fraction of denoising steps for colour preservation
+                   (V masking).  1.0 = all steps.
+    color_word   : The specific colour word in the edit prompt (e.g. "blonde",
+                   "blue").  When supplied, the mask focuses on tokens that
+                   attend to its T5 token IDs, giving a tighter editing region.
+    chunk_size   : Heads processed at once in the manual attention loop.
+                   Reduce to 2 or 1 if you encounter OOM errors.
     """
 
-    def __init__(self, top_k_frac: float = 0.2):
+    def __init__(
+        self,
+        top_k_frac: float = 0.2,
+        qk_frac: float = 1.0,
+        v_frac: float = 1.0,
+        color_word: Optional[str] = None,
+        chunk_size: int = 4,
+    ):
         self.top_k_frac      = top_k_frac
-        self._txt_len_single = 512
+        self.qk_frac         = qk_frac
+        self.v_frac          = v_frac
+        self.color_word      = color_word
+        self.chunk_size      = chunk_size
+        self._txt_len        = 512
+        self._color_tok_ids: List[int] = []
+        self._mask: Optional[torch.Tensor] = None   # (n_img,) preserve mask
+        self._mask_built     = False
 
-    def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
-        self._txt_len_single = max_sequence_length
+    def pre_generate(
+        self,
+        pipe,
+        max_sequence_length: int = 512,
+        edit_prompt: str = "",
+        **kwargs,
+    ):
+        self._txt_len = max_sequence_length
+        self._mask = None
+        self._mask_built = False
+        self._color_tok_ids = []
+        if self.color_word and edit_prompt:
+            self._color_tok_ids = _get_t5_token_indices(pipe, edit_prompt, self.color_word)
+            print(f"[ColorCtrl] '{self.color_word}' → T5 indices: {self._color_tok_ids}")
 
-    def inject_qkv(
+    # inject_qkv is intentionally a no-op — all logic lives in inject_attention.
+    # (BasePolicy default returns q, k, v unchanged.)
+
+    def inject_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         layer: int,
-        step:  int,
+        step: int,
         n_steps: int,
         txt_len: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Optional[torch.Tensor]:
+        """
+        Custom attention for single-stream blocks only.
+
+        Double-stream blocks (txt_len > 0): returns None → standard SDPA.
+        Single-stream blocks: manual head-chunked attention with:
+          • V masking (colour preservation, gated by v_frac)
+          • v-v pre-softmax score injection (structure preservation, gated by qk_frac)
+        """
+        # ── Double-stream: leave unchanged (paper does standard SDPA there) ────
+        if txt_len > 0:
+            return None
+
         B = q.shape[0]
         if B < 2:
-            return q, k, v
+            return None
 
-        # img_offset: where image tokens start in the combined [text | image] sequence.
-        # Double-stream blocks: txt_len is set by the processor from encoder_hidden_states.
-        # Single-stream blocks: txt_len==0; image tokens start after the text prefix.
-        img_offset = txt_len if txt_len > 0 else self._txt_len_single
-        if img_offset >= q.shape[2]:
-            return q, k, v
+        text_len = self._txt_len
+        n_total  = q.shape[2]
+        if n_total <= text_len:
+            return None
 
-        q_src, q_tgt = q.chunk(2)   # each (1, H, L, D)
-        k_src, k_tgt = k.chunk(2)
-        v_src, v_tgt = v.chunk(2)
+        n_img    = n_total - text_len
+        n_heads  = q.shape[1]
+        head_dim = q.shape[-1]
+        scale    = head_dim ** -0.5
 
-        scale = q.shape[-1] ** -0.5
+        do_qk = step < int(self.qk_frac * n_steps)  # structure preservation active?
+        do_v  = step < int(self.v_frac  * n_steps)  # colour preservation active?
 
-        # ── Editing-region mask from target vision-to-text scores (§3.4) ──────
-        # Q^img_tgt × K^txt_tgt^T: (1, H, N_img, N_txt)
-        # No full softmax needed — raw scores rank tokens by text attention.
-        q_img  = q_tgt[:, :, img_offset:, :]       # (1, H, N_img, D)
-        k_txt  = k_tgt[:, :, :img_offset, :]        # (1, H, N_txt, D)
-        v2t    = torch.matmul(
-            q_img.float(), k_txt.float().transpose(-2, -1)
-        ) * scale                                    # (1, H, N_img, N_txt)
+        # ── Build editing-region mask at first single-stream call ────────────
+        if not self._mask_built and layer >= N_DOUBLE:
+            # Use target branch Q vs target text K — focuses on edit-prompt tokens.
+            q_tgt    = q[B // 2:]                          # (1, H, n_total, D)
+            k_tgt_tx = k[B // 2:, :, :text_len, :]        # (1, H, n_txt, D)
+            v2t = torch.matmul(
+                q_tgt[:, :, text_len:, :].float(),         # (1, H, n_img, D)
+                k_tgt_tx.float().transpose(-2, -1),        # (1, H, D, n_txt)
+            ) * scale                                       # (1, H, n_img, n_txt)
+            v2t_mean = v2t.mean(dim=(0, 1))                # (n_img, n_txt)
 
-        # Per-token: max over text tokens, mean over heads → editing score (N_img,)
-        edit_score = v2t.max(dim=-1).values[0].mean(dim=0)
-        n_img      = edit_score.shape[0]
-        k_top      = max(1, int(self.top_k_frac * n_img))
-        edit_idx   = edit_score.topk(k_top).indices            # top-k token indices
+            if self._color_tok_ids:
+                ids = [i for i in self._color_tok_ids if i < text_len]
+                edit_score = (v2t_mean[:, ids].mean(dim=-1) if ids
+                              else v2t_mean.mean(dim=-1))
+            else:
+                edit_score = v2t_mean.mean(dim=-1)         # (n_img,)
 
-        # edit_mask[i]=1 → editing region (keep target V); 0 → copy source V
-        edit_mask = torch.zeros(n_img, device=q.device, dtype=v.dtype)
-        edit_mask[edit_idx] = 1.0
-        edit4     = edit_mask.view(1, 1, -1, 1)    # (1, 1, N_img, 1) for broadcasting
-        keep4     = 1.0 - edit4                     # (1, 1, N_img, 1) non-editing
+            k_top = max(1, int(self.top_k_frac * n_img))
+            edit_idx = edit_score.topk(k_top).indices
 
-        # ── Structure Preservation: source K^img → target K^img (§3.3) ────────
-        k_tgt_new = k_tgt.clone()
-        k_tgt_new[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
+            # preserve_mask: 1 = non-editing → copy source V
+            #                0 = editing region → keep target V  (ColorCtrl convention)
+            preserve_mask = torch.ones(n_img, device=q.device, dtype=torch.float32)
+            preserve_mask[edit_idx] = 0.0
+            self._mask = preserve_mask
+            self._mask_built = True
+            print(f"[ColorCtrl] mask built layer={layer} step={step}: "
+                  f"{k_top}/{n_img} editing tokens "
+                  f"({'colour-word focused' if self._color_tok_ids else 'all-text mean'})")
 
-        # ── Color Preservation: source V^img → non-editing tokens (§3.4) ──────
-        # Editing region keeps target V (new colour from edit prompt).
-        # Non-editing region gets source V (preserves background, face, plates).
-        v_tgt_new = v_tgt.clone()
-        v_tgt_new[:, :, img_offset:, :] = (
-            v_src[:, :, img_offset:, :].to(v_tgt.dtype) * keep4
-            + v_tgt[:, :, img_offset:, :]             * edit4
-        )
+        # ── Colour Preservation: V masking before attention ──────────────────
+        if do_v and self._mask is not None:
+            v_src, v_tgt = v.chunk(2)
+            mask4 = self._mask.to(device=v.device, dtype=v.dtype).view(1, 1, -1, 1)
+            # text tokens: always use target V (no modification, as in ColorCtrl)
+            # image tokens: preserve_mask=1 → source V; preserve_mask=0 → target V
+            v_tgt_new = v_tgt.clone()
+            v_tgt_new[:, :, text_len:, :] = (
+                v_src[:, :, text_len:, :] * mask4
+                + v_tgt[:, :, text_len:, :] * (1.0 - mask4)
+            )
+            v = torch.cat([v_src, v_tgt_new])
 
-        return (
-            torch.cat([q_src, q_tgt]),
-            torch.cat([k_src, k_tgt_new]),
-            torch.cat([v_src, v_tgt_new]),
-        )
+        if not do_v and not do_qk:
+            return None  # nothing to do — standard SDPA is fine
+
+        # ── Standard SDPA when only V masking needed (no score injection) ─────
+        if not do_qk:
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+
+        # ── Structure Preservation: head-chunked manual attention ─────────────
+        # Process in chunks of `chunk_size` heads to manage GPU memory.
+        # Source branch first → save v-v pre-softmax scores → inject into target.
+        out = torch.zeros(B, n_heads, n_total, head_dim,
+                          device=q.device, dtype=q.dtype)
+
+        for h0 in range(0, n_heads, self.chunk_size):
+            h1 = min(h0 + self.chunk_size, n_heads)
+            q_c = q[:, h0:h1]    # (B, chunk, n_total, D)
+            k_c = k[:, h0:h1]
+            v_c = v[:, h0:h1]
+
+            # Source branch
+            q_s = q_c[:B // 2]
+            k_s = k_c[:B // 2]
+            scores_s = torch.matmul(q_s.float(), k_s.float().transpose(-2, -1)) * scale
+            # Save v-v (image→image) pre-softmax quadrant from source
+            vv_src = scores_s[:, :, text_len:, text_len:].clone()
+            probs_s = torch.softmax(scores_s, dim=-1).to(q.dtype)
+            out[:B // 2, h0:h1] = torch.matmul(probs_s, v_c[:B // 2])
+
+            # Target branch — inject source v-v scores (structure preservation)
+            q_t = q_c[B // 2:]
+            k_t = k_c[B // 2:]
+            scores_t = torch.matmul(q_t.float(), k_t.float().transpose(-2, -1)) * scale
+            scores_t[:, :, text_len:, text_len:] = vv_src  # §3.3
+            probs_t = torch.softmax(scores_t, dim=-1).to(q.dtype)
+            out[B // 2:, h0:h1] = torch.matmul(probs_t, v_c[B // 2:])
+
+        return out
 
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────

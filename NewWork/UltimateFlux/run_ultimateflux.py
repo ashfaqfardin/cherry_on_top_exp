@@ -109,13 +109,18 @@ def build_policy(cfg: dict):
     if task == "attr_edit":
         inject_layers_raw = cfg.get("inject_layers", None)
         if inject_layers_raw in ("color", "colour"):
-            # ColorCtrl (arXiv:2508.09131): attention-based colour editing.
-            # Applied at ALL layers and ALL timesteps — no manual selection.
-            # top_k_frac controls editing-region size (20% default):
-            #   higher → more pixels allowed to change colour
-            #   lower  → tighter background preservation
+            # ColorCtrl (arXiv:2508.09131): single-stream-only attention editing.
+            # Double-stream blocks (0-18): standard SDPA, untouched.
+            # Single-stream blocks (19-56): manual head-chunked attention with:
+            #   Structure: source v-v pre-softmax scores injected into target.
+            #   Colour:    binary V mask — source V for non-editing region,
+            #              target V for editing region (top_k_frac of tokens).
             return ColorCtrlPolicy(
                 top_k_frac=cfg.get("top_k_frac", 0.2),
+                qk_frac=cfg.get("qk_frac", 1.0),
+                v_frac=cfg.get("v_frac", 1.0),
+                color_word=cfg.get("color_word", None),
+                chunk_size=cfg.get("chunk_size", 4),
             )
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
@@ -249,6 +254,15 @@ def parse_args():
                    help="attr_edit mode: color=ColorCtrl attention editing, tier_a=breed/shape change")
     p.add_argument("--top_k_frac",  type=float, default=0.2,
                    help="ColorCtrl: fraction of image tokens treated as editing region (default 0.2)")
+    p.add_argument("--qk_frac",    type=float, default=1.0,
+                   help="ColorCtrl: fraction of steps for structure preservation / v-v score injection")
+    p.add_argument("--v_frac",     type=float, default=1.0,
+                   help="ColorCtrl: fraction of steps for colour preservation / V masking")
+    p.add_argument("--color_word", default=None,
+                   help="ColorCtrl: colour word in edit prompt (e.g. 'blonde', 'blue'); "
+                        "focuses the editing-region mask on that word's T5 tokens")
+    p.add_argument("--chunk_size", type=int, default=4,
+                   help="ColorCtrl: heads per chunk in manual attention (reduce to 2/1 for OOM)")
     p.add_argument("--color_structure_frac", type=float, default=0.0,
                    help="Unused; kept for backward compat")
     p.add_argument("--inject_frac", type=float, default=0.5,
@@ -316,6 +330,10 @@ def main():
         "sam2_model_id":  args.sam2_model_id,
         "inject_layers":        args.inject_layers,
         "top_k_frac":           args.top_k_frac,
+        "qk_frac":              args.qk_frac,
+        "v_frac":               args.v_frac,
+        "color_word":           args.color_word,
+        "chunk_size":           args.chunk_size,
         "color_structure_frac": args.color_structure_frac,
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,
