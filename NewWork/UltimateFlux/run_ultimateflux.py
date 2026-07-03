@@ -51,7 +51,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from NewWork.UltimateFlux.sampler import (
-    load_pipeline, generate_dual_branch, generate_p2p, TIER_A, TIER_B, N_DOUBLE,
+    load_pipeline, generate_dual_branch, TIER_A, TIER_B, N_DOUBLE,
 )
 from NewWork.UltimateFlux.policies import (
     NonRigidPolicy,
@@ -108,7 +108,11 @@ def build_policy(cfg: dict):
     if task == "attr_edit":
         inject_layers_raw = cfg.get("inject_layers", None)
         if inject_layers_raw in ("color", "colour"):
-            return None  # colour mode uses generate_p2p — no dual-branch policy needed
+            # Lock all 19 MM-DiT double-stream blocks (identity, structure, composition).
+            # Leave all 38 single-stream blocks free — edit prompt drives colour there.
+            # This is the FreeFlux/StableFlow K,V injection approach applied inside
+            # generate_dual_branch (same z_T shared latent, custom attention processor).
+            inject_layers = FineGrainedAttrPolicy._DOUBLE_STREAM
         elif inject_layers_raw == "tier_a":
             inject_layers = TIER_A          # K+V — breed/shape change
         else:
@@ -154,42 +158,19 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  source_prompt: {source_prompt}")
     print(f"  edit_prompt:   {edit_prompt}")
 
-    if policy is None:
-        # Colour editing: split-denoising — shared structure phase (source prompt),
-        # then two branches diverge from the same z_N checkpoint.
-        # color_structure_frac controls the split point (0.4 = 11/28 shared steps).
-        src_img, edit_img = generate_p2p(
-            pipe=pipe,
-            source_prompt=source_prompt,
-            edit_prompt=edit_prompt,
-            inject_layers=[],
-            seed=seed,
-            num_steps=num_steps,
-            guidance_scale=guidance,
-            height=height,
-            width=width,
-            max_sequence_length=max_seq_len,
-            device=device,
-            color_structure_frac=cfg.get("color_structure_frac", 0.0),
-            inject_frac=cfg.get("inject_frac", 0.5),
-            pfb_step=cfg.get("pfb_step", 3),
-            pfb_alpha=cfg.get("pfb_alpha", 1.0),
-            delta_scale=cfg.get("delta_scale", 1.5),
-        )
-    else:
-        src_img, edit_img = generate_dual_branch(
-            pipe=pipe,
-            policy=policy,
-            source_prompt=source_prompt,
-            edit_prompt=edit_prompt,
-            seed=seed,
-            num_steps=num_steps,
-            guidance_scale=guidance,
-            height=height,
-            width=width,
-            max_sequence_length=max_seq_len,
-            device=device,
-        )
+    src_img, edit_img = generate_dual_branch(
+        pipe=pipe,
+        policy=policy,
+        source_prompt=source_prompt,
+        edit_prompt=edit_prompt,
+        seed=seed,
+        num_steps=num_steps,
+        guidance_scale=guidance,
+        height=height,
+        width=width,
+        max_sequence_length=max_seq_len,
+        device=device,
+    )
 
     if save_images:
         run_dir = os.path.join(out_dir, name)

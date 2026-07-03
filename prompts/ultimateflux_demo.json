@@ -103,13 +103,12 @@
       "seed": 30
     },
     {
-      "comment": "Split-denoising colour edit: shared Phase 1 (source prompt, first ~40% of steps) locks structure, then Phase 2 diverges into source and edit branches from the same z_N. No CV, no pixel blending. Tune color_structure_frac: 0.2=more colour freedom, 0.4=default balance, 0.6=tightest structure lock.",
+      "comment": "Colour edit via K,V injection at all 19 MM-DiT double-stream blocks (FreeFlux/StableFlow approach). Both branches share the same z_T. Source K,V injected into edit branch at layers 0-18 locks identity; 38 single-stream blocks are free for colour. No CV, no pixel blending.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
-      "delta_scale": 1.5,
       "seed": 35
     },
     {
@@ -118,7 +117,6 @@
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
-      "delta_scale": 1.5,
       "seed": 40
     },
     {
