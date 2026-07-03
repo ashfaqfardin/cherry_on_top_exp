@@ -122,6 +122,8 @@ def build_policy(cfg: dict):
                 color_word=cfg.get("color_word", None),
                 chunk_size=cfg.get("chunk_size", 4),
                 mask_build_step=cfg.get("mask_build_step", 5),
+                reweight_scale=cfg.get("reweight_scale", 1.0),
+                ds_key_inject=cfg.get("ds_key_inject", False),
             )
         elif inject_layers_raw == "double_stream":
             # Lock all 19 double-stream (joint text-image) blocks; 38 single-stream free.
@@ -266,6 +268,10 @@ def parse_args():
                    help="attr_edit mode: double_stream=lock 19 joint blocks (colour change), color=ColorCtrl mask-based, tier_a=breed/shape change")
     p.add_argument("--key_only", action="store_true", default=False,
                    help="double_stream mode: inject K only (not V) — locks spatial layout without locking colour. Default True for double_stream via config.")
+    p.add_argument("--reweight_scale", type=float, default=1.0,
+                   help="color mode: multiply image→colour-word attention scores by this factor pre-softmax (§3.5). 1.0=disabled; try 3.0–5.0 for strong colour change.")
+    p.add_argument("--ds_key_inject", action="store_true", default=False,
+                   help="color mode: also inject K in double-stream blocks to prevent face-structure drift when qk_frac=0.")
     p.add_argument("--top_k_frac",  type=float, default=0.2,
                    help="ColorCtrl: fraction of image tokens treated as editing region (default 0.2)")
     p.add_argument("--qk_frac",    type=float, default=1.0,
@@ -348,6 +354,8 @@ def main():
         "sam2_model_id":  args.sam2_model_id,
         "inject_layers":        args.inject_layers,
         "key_only":             args.key_only,
+        "reweight_scale":       args.reweight_scale,
+        "ds_key_inject":        args.ds_key_inject,
         "top_k_frac":           args.top_k_frac,
         "qk_frac":              args.qk_frac,
         "v_frac":               args.v_frac,

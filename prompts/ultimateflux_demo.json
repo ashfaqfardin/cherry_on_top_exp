@@ -103,12 +103,18 @@
       "seed": 30
     },
     {
-      "comment": "double_stream: locks all 19 joint text-image blocks with K+V injection. All 38 single-stream blocks are free — edit text drives colour without mask or boundary effects. Fixes ColorCtrl overlay artifact ('blonde over black') and forehead drift from unconstrained single-stream layout.",
+      "comment": "ColorCtrl §3.5 re-weighting + double-stream K anchor. reweight_scale amplifies image→colour-word attention scores before softmax — image tokens attending to 'blonde' pull proportionally harder from V_txt[blonde], no hard mask boundary. ds_key_inject locks face spatial layout via K injection in double-stream. qk_frac/v_frac=0 disables V-masking overlay artifact.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
-      "inject_layers": "double_stream",
+      "inject_layers": "color",
+      "qk_frac": 0.0,
+      "v_frac": 0.0,
+      "reweight_scale": 3.0,
+      "ds_key_inject": true,
+      "color_word": "blonde",
+      "mask_build_step": 999,
       "seed": 35
     },
     {
@@ -116,7 +122,13 @@
       "task": "attr_edit",
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
-      "inject_layers": "double_stream",
+      "inject_layers": "color",
+      "qk_frac": 0.0,
+      "v_frac": 0.0,
+      "reweight_scale": 3.0,
+      "ds_key_inject": true,
+      "color_word": "blue",
+      "mask_build_step": 999,
       "seed": 40
     },
     {

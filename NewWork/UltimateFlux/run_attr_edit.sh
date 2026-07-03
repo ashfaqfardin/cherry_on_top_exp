@@ -37,17 +37,19 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Change colour (double_stream: lock 19 joint blocks, free 38 single blocks) ─
-# inject_layers double_stream:
-#   Locks all 19 double-stream (joint text-image) blocks with K+V injection.
-#   All 38 single-stream blocks are completely free — the edit text ("blonde",
-#   "blue") drives colour there without any mask or boundary effect.
-#   Fixes two ColorCtrl artifacts at qk_frac=0:
-#     - "adding new colour over old" (V-mask binary boundary blending)
-#     - forehead/structure drift (unconstrained single-stream spatial layout)
-#
-# If colour change is weak: lower inject_steps_frac end (e.g. [0.0, 0.7]) so
-# later steps are fully free. If structure drifts: raise end back toward 1.0.
+# ── Change colour (ColorCtrl §3.5 re-weighting + double-stream K anchor) ────
+# Key parameters for colour editing:
+#   --reweight_scale 3.0   Amplify image→colour-word attention scores ×3 before
+#                          softmax (§3.5). Image tokens that already attend to
+#                          "blonde"/"blue" pull ×3 harder from that word's V_txt.
+#                          Soft self-selecting mask — no hard boundary artifacts.
+#                          Try 2.0–5.0; higher = stronger colour, less identity.
+#   --ds_key_inject        K-only injection in double-stream blocks (0-18):
+#                          locks face/car spatial layout without locking colour.
+#   --qk_frac 0.0          Disable v-v score injection (avoids colour dilution).
+#   --v_frac 0.0           Disable V masking (eliminates overlay artifact).
+#   --mask_build_step 999  Mask never built (not needed without V masking).
+#   --color_word           T5 token to re-weight; must appear in edit_prompt.
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
@@ -57,7 +59,12 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name woman_hair_color \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
-    --inject_layers double_stream \
+    --inject_layers color \
+    --qk_frac 0.0 --v_frac 0.0 \
+    --reweight_scale 3.0 \
+    --ds_key_inject \
+    --color_word blonde \
+    --mask_build_step 999 \
     --seed 35
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -68,7 +75,12 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name car_color_change \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
-    --inject_layers double_stream \
+    --inject_layers color \
+    --qk_frac 0.0 --v_frac 0.0 \
+    --reweight_scale 3.0 \
+    --ds_key_inject \
+    --color_word blue \
+    --mask_build_step 999 \
     --seed 40
 
 # ── Add an accessory (strong identity preservation) ───────────────────────────
