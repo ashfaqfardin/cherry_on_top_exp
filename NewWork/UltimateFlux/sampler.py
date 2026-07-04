@@ -831,12 +831,16 @@ def generate_masked_delta_flow(
     timesteps    = pipe.scheduler.timesteps
     sigmas       = pipe.scheduler.sigmas
     has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
+    mdtype = src_pe.dtype   # bfloat16 — transformer weight dtype
 
     def _fwd(z: torch.Tensor, i: int, pe, pp) -> torch.Tensor:
+        # sigmas are float32; after Euler steps z can drift to float32.
+        # Cast back to model dtype before every forward pass.
+        z = z.to(mdtype)
         B = z.shape[0]
         t = timesteps[i].expand(B)
         g = torch.full([B], guidance_scale, device=exec_device,
-                       dtype=z.dtype) if has_guidance else None
+                       dtype=mdtype) if has_guidance else None
         return pipe.transformer(
             hidden_states=z, timestep=t / 1000.0, guidance=g,
             pooled_projections=pp, encoder_hidden_states=pe,
@@ -849,19 +853,23 @@ def generate_masked_delta_flow(
     print(f"[MaskedDeltaFlow] Phase 1: {mask_step} source-only steps…")
     z = z_T.clone()
     for i in range(mask_step):
-        z = z + (sigmas[i + 1] - sigmas[i]) * _fwd(z, i, src_pe, src_pp)
+        dt = (sigmas[i + 1] - sigmas[i]).to(mdtype)
+        z  = z + dt * _fwd(z, i, src_pe, src_pp)
     z_shared = z.clone()    # checkpoint — both branches branch off from here
 
     # ── Mask building ──────────────────────────────────────────────────────────
     print(f"[MaskedDeltaFlow] Building mask at step {mask_step}…")
-    from diffusers.models.attention_processor import FluxAttnProcessor2_0
+    try:
+        from diffusers.models.attention_processor import FluxAttnProcessor
+    except ImportError:
+        from diffusers.models.attention_processor import FluxAttnProcessor2_0 as FluxAttnProcessor
 
     cap = _MaskCaptureAttnProc(txt_len=max_sequence_length)
     pipe.transformer.set_attn_processor(cap)
     try:
         _fwd(z_shared, mask_step, edit_pe, edit_pp)   # B=1 probe with edit prompt
     finally:
-        pipe.transformer.set_attn_processor(FluxAttnProcessor2_0())
+        pipe.transformer.set_attn_processor(FluxAttnProcessor())
 
     use_sam2 = getattr(policy, "use_sam2", False)
 
@@ -909,7 +917,8 @@ def generate_masked_delta_flow(
         print(f"  [MaskBuild] fallback centre mask: {k_top}/{n_img} tokens")
 
     # edit_mask: (1, N, 1) — 1 = editing region, 0 = preserved
-    edit_mask_2d = (1.0 - policy._mask).to(exec_device).view(1, -1, 1)
+    # Cast to model dtype so that arithmetic in Phase 2 stays in bfloat16.
+    edit_mask_2d = (1.0 - policy._mask).to(device=exec_device, dtype=mdtype).view(1, -1, 1)
 
     # ── Phase 2: interleaved source + masked delta-flow ───────────────────────
     n2 = num_steps - mask_step
@@ -922,7 +931,7 @@ def generate_masked_delta_flow(
     captured: List[Tuple[int, int, torch.Tensor]] = []
 
     for i in range(mask_step, num_steps):
-        dt = sigmas[i + 1] - sigmas[i]
+        dt = (sigmas[i + 1] - sigmas[i]).to(mdtype)
 
         # B=3 batch: [z_src+src,  z_edit+src,  z_edit+edit]
         # v[0] → v_src_ref (advances source reference)
