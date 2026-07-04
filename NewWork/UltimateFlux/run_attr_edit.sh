@@ -46,10 +46,11 @@ echo "=== Task 5: Fine-grained attribute editing ==="
 #   3. Single-stream blocks (19-56): no injection.  Edit text drives colour.
 #
 # Tuning:
-#   --qk_steps_frac [0.0, 1.0]   Q+K injection range (default: all steps).
-#                                 Reduce to [0.0, 0.7] if colour change is weak.
-#   --svd_alpha 1.0              Enable PFB at block 1 for extra identity lock.
-#                                 Start without it; add only if face drifts.
+#   --k_only_steps_frac 0.0 0.7  Reduce K-only injection window in single-stream
+#                                 if colour change is too weak.  Default [0.0, 1.0].
+#   --qk_steps_frac 0.0 0.7      Reduce Q+K injection in double-stream similarly.
+#   --svd_alpha 1.0              Enable PFB at block 1 for extra structural anchor.
+#                                 Add only if identity still drifts after K injection.
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \

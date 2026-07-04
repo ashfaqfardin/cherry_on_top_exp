@@ -52,7 +52,7 @@ if _REPO_ROOT not in sys.path:
 
 from NewWork.UltimateFlux.sampler import (
     load_pipeline, generate_dual_branch, generate_masked_delta_flow,
-    TIER_A, TIER_B, N_DOUBLE,
+    TIER_A, TIER_B, N_DOUBLE, N_SINGLE,
 )
 from NewWork.UltimateFlux.policies import (
     NonRigidPolicy,
@@ -119,7 +119,9 @@ def build_policy(cfg: dict):
             # edit's residual for extra identity anchoring.
             return KontextColorPolicy(
                 qk_layers=list(range(N_DOUBLE)),
+                k_only_layers=list(range(N_DOUBLE, N_DOUBLE + N_SINGLE)),
                 qk_steps_frac=tuple(cfg.get("qk_steps_frac", [0.0, 1.0])),
+                k_only_steps_frac=tuple(cfg.get("k_only_steps_frac", [0.0, 1.0])),
                 svd_alpha=cfg.get("svd_alpha", 0.0),
                 svd_layers=cfg.get("svd_layers", [1]),
                 svd_steps_frac=tuple(cfg.get("svd_steps_frac", [0.0, 0.25])),
@@ -329,8 +331,10 @@ def parse_args():
                         "(steps 0..N-1 run freely; mask built at N, ColorCtrl from N..end). "
                         "Larger = more accurate mask but less structure locked early.")
     p.add_argument("--qk_steps_frac", type=float, nargs=2, default=[0.0, 1.0],
-                   help="color mode: [start end] fraction of steps for Q+K injection. "
-                        "Default all steps. Reduce end (e.g. 0.0 0.7) if colour change is weak.")
+                   help="color mode: [start end] fraction of steps for double-stream Q+K injection.")
+    p.add_argument("--k_only_steps_frac", type=float, nargs=2, default=[0.0, 1.0],
+                   help="color mode: [start end] fraction of steps for single-stream K-only injection. "
+                        "Reduce end (e.g. 0.0 0.7) if colour change is weak.")
     p.add_argument("--svd_alpha",   type=float, default=0.0,
                    help="color mode: PFB alpha for optional SVD block hook (0 = disabled). "
                         "Enable (e.g. 1.0) to blend source structural features into edit's residual.")
@@ -418,6 +422,7 @@ def main():
         "color_sam2":           args.color_sam2,
         "color_sam2_model":     args.color_sam2_model,
         "qk_steps_frac":        args.qk_steps_frac,
+        "k_only_steps_frac":    args.k_only_steps_frac,
         "svd_alpha":            args.svd_alpha,
         "svd_layers":           args.svd_layers,
         "svd_steps_frac":       args.svd_steps_frac,
