@@ -59,9 +59,9 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task attr_edit \
     --name woman_hair_color \
-    --source_prompt "a woman with black hair" \
-    --edit_prompt   "a woman with blonde hair" \
-    --ss_q_steps_frac 0.0 0.3 \
+    --source_prompt "a woman with red hair" \
+    --edit_prompt   "a woman with black hair" \
+    --ss_q_steps_frac 0.0 0.5 \
     --inject_layers color \
     --save_intermediates --intermediate_every 4 \
     --seed 35
@@ -72,9 +72,9 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task attr_edit \
     --name car_color_change \
-    --source_prompt "a red sports car on a road" \
-    --edit_prompt   "a blue sports car on a road" \
-    --ss_q_steps_frac 0.0 0.3 \
+    --source_prompt "a green sports car on a road" \
+    --edit_prompt   "a black sports car on a road" \
+    --ss_q_steps_frac 0.0 0.5 \
     --inject_layers color \
     --save_intermediates --intermediate_every 4 \
     --seed 40
