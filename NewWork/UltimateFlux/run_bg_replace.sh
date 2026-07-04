@@ -23,6 +23,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a cat sitting in a forest" \
     --edit_prompt   "a cat sitting on a sunny beach" \
     --use_sam2 \
+    --save_intermediates \
     --seed 20
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -34,6 +35,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a dog standing in a park" \
     --edit_prompt   "a dog standing on a city street" \
     --use_sam2 \
+    --save_intermediates \
     --seed 25
 
 echo "=== Background replacement complete. Results in results/ultimateflux/ ==="
