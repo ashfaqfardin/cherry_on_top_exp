@@ -1122,11 +1122,12 @@ class KontextColorPolicy(BasePolicy):
        Edit image-token Q AND K ← source Q and K.
        Text Q/K stay from the edit branch → edit prompt conditions V freely.
 
-    2. Single-stream blocks (19-56) — K-only injection:
-       Edit image-token K ← source K.  Q and V are left from edit branch.
-       K injection locks WHERE each image patch attends (spatial structure),
-       preserving identity without blocking colour.  V from the edit branch
-       carries the new colour ("blonde", "blue") through all 38 refinement blocks.
+    2. Single-stream blocks (19-56) — Q+K injection:
+       Edit image-token Q AND K ← source Q and K.  V is left from edit branch.
+       Q injection prevents the patches from "asking for" edit-coloured features
+       (which causes subtle structural drift), locking the attention query to the
+       source identity.  V from the edit branch still carries the new colour
+       ("blonde", "blue") through all 38 refinement blocks.
 
     This combination preserves identity (face geometry, car shape) while allowing
     the edit text to drive colour through V at every attention layer.
@@ -1139,9 +1140,10 @@ class KontextColorPolicy(BasePolicy):
     Parameters
     ----------
     qk_layers       : double-stream layers for Q+K injection (default: all 0-18).
-    k_only_layers   : single-stream layers for K-only injection (default: all 19-56).
-    qk_steps_frac   : step fraction for Q+K injection.  Default all steps.
-    k_only_steps_frac: step fraction for K-only injection.  Default all steps.
+    k_only_layers   : single-stream layers for Q+K injection (default: all 19-56).
+    qk_steps_frac   : step fraction for double-stream Q+K injection.  Default all.
+    k_only_steps_frac: step fraction for single-stream Q+K injection.  Default all.
+                      Reduce end (e.g. 0.0 0.7) if colour change is too weak.
     svd_alpha       : PFB reweighting factor.  0 = disabled (default).
     svd_layers      : blocks for PFB hook.  Default [1].
     svd_steps_frac  : step fraction for PFB.  Default first 25 %.
@@ -1207,17 +1209,23 @@ class KontextColorPolicy(BasePolicy):
             return torch.cat([q_src, q_edit]), torch.cat([k_src, k_edit]), v
 
         else:
-            # ── Single-stream: K-only injection ─────────────────────────────
+            # ── Single-stream: Q+K injection ──────────────────────────────��─
             # txt_len == 0 here; text prefix offset comes from max_sequence_length.
+            # Injecting Q locks the attention queries to the source identity state,
+            # preventing edit-conditioned queries from causing structural drift.
+            # V stays from the edit branch → colour change unaffected.
             if layer not in self._k_only_layers:
                 return q, k, v
             if not _step_active(step, n_steps, self.k_only_steps_frac):
                 return q, k, v
             img_offset = self._txt_len
+            q_src, q_edit = q.chunk(2)
             k_src, k_edit = k.chunk(2)
+            q_edit = q_edit.clone()
             k_edit = k_edit.clone()
+            q_edit[:, :, img_offset:, :] = q_src[:, :, img_offset:, :]
             k_edit[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
-            return q, torch.cat([k_src, k_edit]), v
+            return torch.cat([q_src, q_edit]), torch.cat([k_src, k_edit]), v
 
     def get_block_hooks(self) -> Dict[int, Callable]:
         if self.svd_alpha <= 0.0:
