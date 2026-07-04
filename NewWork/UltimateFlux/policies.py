@@ -923,6 +923,8 @@ class ColorCtrlPolicy(BasePolicy):
         mask_build_step: int = 5,
         reweight_scale: float = 1.0,
         ds_key_inject: bool = False,
+        use_sam2: bool = False,
+        sam2_model_id: str = "facebook/sam2-hiera-large",
     ):
         self.top_k_frac      = top_k_frac
         self.qk_frac         = qk_frac
@@ -930,20 +932,15 @@ class ColorCtrlPolicy(BasePolicy):
         self.color_word      = color_word
         self.chunk_size      = chunk_size
         self.mask_build_step = mask_build_step
-        # §3.5 Attribute re-weighting: multiply image→colour-word attention scores
-        # by reweight_scale before softmax.  Image tokens that naturally attend to
-        # "blonde"/"blue" pull even more from V_txt[color_word] → stronger colour.
-        # Applied in ALL single-stream layers, independently of the V-mask.
-        # Set reweight_scale=1.0 to disable (paper: unspecified value, typically 2–5).
         self.reweight_scale  = reweight_scale
-        # K-only injection in double-stream blocks (0-18): locks spatial layout via K
-        # without locking V, so face structure is preserved while colour changes freely.
-        # Use with qk_frac=0, v_frac=0, reweight_scale≥2 for cleanest colour editing.
         self.ds_key_inject   = ds_key_inject
+        self.use_sam2        = use_sam2
+        self.sam2_model_id   = sam2_model_id
         self._txt_len        = 512
         self._color_tok_ids: List[int] = []
-        self._mask: Optional[torch.Tensor] = None   # (n_img,) preserve mask
+        self._mask: Optional[torch.Tensor] = None       # (n_img,) preserve mask
         self._mask_built     = False
+        self._edit_score_map: Optional[torch.Tensor] = None  # (n_img,) CPU — for SAM2
 
     def pre_generate(
         self,
@@ -955,6 +952,7 @@ class ColorCtrlPolicy(BasePolicy):
         self._txt_len = max_sequence_length
         self._mask = None
         self._mask_built = False
+        self._edit_score_map = None
         self._color_tok_ids = []
         if self.color_word and edit_prompt:
             self._color_tok_ids = _get_t5_token_indices(pipe, edit_prompt, self.color_word)
@@ -1054,18 +1052,24 @@ class ColorCtrlPolicy(BasePolicy):
             else:
                 edit_score = v2t_mean.mean(dim=-1)        # (n_img,)
 
-            k_top        = max(1, int(self.top_k_frac * n_img))
-            edit_idx     = edit_score.topk(k_top).indices
-
-            # preserve_mask: 1 = NON-editing (face, bg), 0 = editing (hair, car)
-            preserve_mask            = torch.ones(n_img, device=q.device,
-                                                  dtype=torch.float32)
-            preserve_mask[edit_idx] = 0.0
-            self._mask               = preserve_mask
-            self._mask_built         = True
-            print(f"[ColorCtrl] mask built at layer={layer} step={step}: "
-                  f"{k_top}/{n_img} editing tokens "
-                  f"({'colour-word focused' if self._color_tok_ids else 'all-text'})")
+            if not self.use_sam2:
+                # Attention-based topk mask (default, no extra dependencies)
+                k_top        = max(1, int(self.top_k_frac * n_img))
+                edit_idx     = edit_score.topk(k_top).indices
+                preserve_mask            = torch.ones(n_img, device=q.device,
+                                                      dtype=torch.float32)
+                preserve_mask[edit_idx] = 0.0
+                self._mask               = preserve_mask
+                self._mask_built         = True
+                print(f"[ColorCtrl] attention mask built at layer={layer} step={step}: "
+                      f"{k_top}/{n_img} editing tokens "
+                      f"({'colour-word focused' if self._color_tok_ids else 'all-text'})")
+            else:
+                # SAM2 path: store scores on CPU; the step-end callback will decode
+                # the latent and run SAM2 with the attention-peak as a point prompt.
+                self._edit_score_map = edit_score.detach().cpu()
+                print(f"[ColorCtrl] attention scores stored at step={step} layer={layer} "
+                      f"— SAM2 will segment in step-end callback")
 
         # Need the mask for any injection
         if self._mask is None:

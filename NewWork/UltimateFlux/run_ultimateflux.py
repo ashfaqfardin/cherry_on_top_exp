@@ -124,6 +124,8 @@ def build_policy(cfg: dict):
                 mask_build_step=cfg.get("mask_build_step", 5),
                 reweight_scale=cfg.get("reweight_scale", 1.0),
                 ds_key_inject=cfg.get("ds_key_inject", False),
+                use_sam2=cfg.get("color_sam2", False),
+                sam2_model_id=cfg.get("color_sam2_model", "facebook/sam2-hiera-large"),
             )
         elif inject_layers_raw == "double_stream":
             # Lock all 19 double-stream (joint text-image) blocks; 38 single-stream free.
@@ -295,6 +297,11 @@ def parse_args():
                         "focuses the editing-region mask on that word's T5 tokens")
     p.add_argument("--chunk_size", type=int, default=4,
                    help="ColorCtrl: heads per chunk in manual attention (reduce to 2/1 for OOM)")
+    p.add_argument("--color_sam2", action="store_true", default=False,
+                   help="color mode: use SAM2 point-prompted segmentation for the editing mask "
+                        "instead of attention topk. Requires: pip install sam2")
+    p.add_argument("--color_sam2_model", default="facebook/sam2-hiera-large",
+                   help="HuggingFace SAM2 model ID for color mask segmentation")
     p.add_argument("--mask_build_step", type=int, default=5,
                    help="ColorCtrl: denoising step at which to build the editing-region mask "
                         "(steps 0..N-1 run freely; mask built at N, ColorCtrl from N..end). "
@@ -374,6 +381,8 @@ def main():
         "color_word":           args.color_word,
         "chunk_size":           args.chunk_size,
         "mask_build_step":      args.mask_build_step,
+        "color_sam2":           args.color_sam2,
+        "color_sam2_model":     args.color_sam2_model,
         "color_structure_frac": args.color_structure_frac,
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,

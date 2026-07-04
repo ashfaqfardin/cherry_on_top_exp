@@ -309,13 +309,28 @@ def generate_dual_branch(
             block = pipe.transformer.single_transformer_blocks[block_idx - N_DOUBLE]
         handles.append(block.register_forward_hook(hook_fn))
 
-    # Intermediate-step capture: store (step_idx, n_steps, latents_cpu) tuples.
-    # The callback must always return callback_kwargs unchanged.
+    # The step-end callback serves two purposes:
+    #   1. SAM2 mask building: decode edit latent → segment → set policy._mask
+    #   2. Intermediate capture: store latents for grid visualisation
+    # Always enable when either feature is active.
+    use_sam2_mask  = getattr(policy, "use_sam2", False)
+    needs_callback = save_intermediates or use_sam2_mask
+
     captured: List[Tuple[int, int, torch.Tensor]] = []
 
     def _capture(pipe_ref, step_index, timestep, callback_kwargs):
-        if step_index % intermediate_every == 0 or step_index == num_steps - 1:
-            captured.append((step_index, num_steps, callback_kwargs["latents"].clone().cpu()))
+        lats = callback_kwargs["latents"]
+
+        # SAM2: fires as soon as attention scores are stored (after mask_build_step)
+        if (use_sam2_mask
+                and not getattr(policy, "_mask_built", True)
+                and getattr(policy, "_edit_score_map", None) is not None):
+            _build_sam2_mask(pipe, policy, lats, height, width)
+
+        if save_intermediates and (step_index % intermediate_every == 0
+                                   or step_index == num_steps - 1):
+            captured.append((step_index, num_steps, lats.clone().cpu()))
+
         return callback_kwargs
 
     try:
@@ -328,8 +343,8 @@ def generate_dual_branch(
             width=width,
             max_sequence_length=max_sequence_length,
             output_type="pil",
-            callback_on_step_end=_capture if save_intermediates else None,
-            callback_on_step_end_tensor_inputs=["latents"] if save_intermediates else [],
+            callback_on_step_end=_capture if needs_callback else None,
+            callback_on_step_end_tensor_inputs=["latents"] if needs_callback else [],
         )
     finally:
         for h in handles:
@@ -526,6 +541,89 @@ def _save_color_mask(policy, out_dir: str, height: int, width: int) -> None:
     save_path = os.path.join(out_dir, "editing_mask.png")
     mask_img.save(save_path)
     print(f"  Mask → {save_path}")
+
+
+def _fallback_attn_mask(policy, score_map: torch.Tensor, device) -> None:
+    """Set policy._mask from attention topk scores when SAM2 fails or is unavailable."""
+    n_img    = score_map.shape[0]
+    k_top    = max(1, int(getattr(policy, "top_k_frac", 0.25) * n_img))
+    edit_idx = score_map.topk(k_top).indices
+    pres     = torch.ones(n_img, dtype=torch.float32)
+    pres[edit_idx] = 0.0
+    policy._mask       = pres.to(device)
+    policy._mask_built = True
+    print(f"  [ColorCtrl] fallback attention mask: {k_top}/{n_img} editing tokens")
+
+
+def _build_sam2_mask(
+    pipe: FluxPipeline,
+    policy,
+    lats: torch.Tensor,
+    height: int,
+    width: int,
+) -> None:
+    """
+    Decode the edit-branch latent, run SAM2 with the attention-derived peak as a
+    foreground point prompt, and write the result into policy._mask / _mask_built.
+
+    Falls back to attention topk on any failure so generation always continues.
+    """
+    import numpy as np
+
+    score_map = getattr(policy, "_edit_score_map", None)
+    if score_map is None:
+        return
+
+    h_tok, w_tok = height // 16, width // 16
+
+    # Peak attention token → pixel centre coordinate
+    peak_idx  = int(score_map.argmax().item())
+    peak_row  = peak_idx // w_tok
+    peak_col  = peak_idx % w_tok
+    px = int((peak_col + 0.5) * (width  / w_tok))
+    py = int((peak_row + 0.5) * (height / h_tok))
+
+    # Decode edit branch (index 1)
+    try:
+        edit_lats = lats[1:2].to(pipe.device, dtype=pipe.vae.dtype)
+        with torch.no_grad():
+            edit_img = _decode_latents(pipe, edit_lats, height, width)
+    except Exception as exc:
+        print(f"  [SAM2] latent decode failed: {exc}")
+        _fallback_attn_mask(policy, score_map, lats.device)
+        return
+
+    # Point-prompted SAM2 segmentation
+    try:
+        from sam2.build_sam import build_sam2_hf
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        sam2_model_id = getattr(policy, "sam2_model_id", "facebook/sam2-hiera-large")
+        print(f"  [SAM2] point=({px},{py}), loading {sam2_model_id}…")
+        sam2      = build_sam2_hf(sam2_model_id, device=str(pipe.device))
+        predictor = SAM2ImagePredictor(sam2)
+        predictor.set_image(np.array(edit_img.convert("RGB")))
+        masks, scores, _ = predictor.predict(
+            point_coords=np.array([[px, py]]),
+            point_labels=np.array([1]),          # 1 = foreground
+            multimask_output=True,
+        )
+        best_mask = masks[scores.argmax()]        # (H, W) bool, H=W=1024
+
+        # Downscale pixel mask → FLUX token grid (64×64 for 1024px)
+        mask_pil  = Image.fromarray(best_mask.astype(np.uint8) * 255, mode="L")
+        tok_np    = np.array(mask_pil.resize((w_tok, h_tok), Image.NEAREST))
+        # SAM2 mask: white (255) = segmented object = editing region → preserve_mask = 0
+        pres_mask = torch.from_numpy((tok_np < 128).astype(np.float32)).flatten()
+
+        policy._mask       = pres_mask.to(lats.device)
+        policy._mask_built = True
+        n_edit = int((pres_mask < 0.5).sum().item())
+        print(f"  [SAM2] mask ready: {n_edit}/{pres_mask.numel()} editing tokens")
+
+    except Exception as exc:
+        print(f"  [SAM2] segmentation failed: {exc}  — falling back to attention mask")
+        _fallback_attn_mask(policy, score_map, lats.device)
 
 
 @torch.no_grad()

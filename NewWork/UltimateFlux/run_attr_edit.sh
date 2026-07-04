@@ -72,6 +72,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --color_word blonde \
     --top_k_frac 0.25 \
     --mask_build_step 20 \
+    --color_sam2 \
     --save_intermediates --intermediate_every 4 \
     --seed 35
 
@@ -89,6 +90,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --color_word blue \
     --top_k_frac 0.3 \
     --mask_build_step 20 \
+    --color_sam2 \
     --save_intermediates --intermediate_every 4 \
     --seed 40
 
