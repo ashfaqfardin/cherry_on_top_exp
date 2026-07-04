@@ -8,21 +8,19 @@
 #   --inject_layers double_stream
 #                           → Lock all 19 double-stream (joint text-image) blocks
 #                              with K+V injection; 38 single-stream blocks are FREE.
-#                              Recommended for COLOUR changes — text drives colour in
-#                              single-stream with no mask, no overlay artifacts.
-#                              --inject_steps_frac [0.0, 1.0] (default: all steps).
-#                              If colour change is weak: try [0.0, 0.7].
+#                              Recommended if colour change is weak.
 #
-#   --inject_layers color   → ColorCtrl (arXiv:2508.09131) — single-stream only.
-#                              Double-stream blocks (0-18): standard SDPA, untouched.
-#                              Single-stream blocks (19-56): manual attention with:
-#                                Structure: source v-v pre-softmax scores → target.
-#                                Colour: binary V mask (editing-region mask from
-#                                  img→text attention; source V for non-editing).
-#                              --top_k_frac 0.1–0.4 = editing region size.
-#                              --color_word 'blonde'/'blue' = focus mask on that word.
-#                              --qk_frac / --v_frac = step fraction for each component.
-#                              --chunk_size = heads per manual-attn chunk (OOM → 2/1).
+#   --inject_layers color   → Kontext-style colour editing (KontextColorPolicy).
+#                              SAC in all 19 double-stream blocks: replace edit-branch
+#                              image Q and K with source Q and K → locks face geometry
+#                              and object shape.  Text Q/K stay from edit branch so the
+#                              edit prompt ("blonde", "blue") conditions V freely.
+#                              Single-stream blocks (19-56) run with NO injection —
+#                              edit text drives colour through all 38 refinement blocks.
+#                              Uses generate_dual_branch (standard B=2 loop).
+#                              Optional: --svd_alpha 1.0 adds PFB at block 1 for extra
+#                              identity anchoring (start without it; add if face drifts).
+#
 #   --inject_layers tier_a  → TIER_A only (13 layers)
 #                              Appearance preserved, position flexible —
 #                              for shape-linked edits (breed change).
@@ -37,26 +35,21 @@ W=1024
 
 echo "=== Task 5: Fine-grained attribute editing ==="
 
-# ── Colour editing: attention-mask structure-colour separation ────────────────
+# ── Colour editing: Kontext-style SAC (Q+K injection in double-stream) ────────
 #
 # Algorithm:
-#   1. At step mask_build_step, extract which image patches attend most to the
-#      colour word in the TARGET branch → binary editing mask (hair / car body).
-#   2. ALL image tokens → source K (same attention positions = same geometry).
-#      This locks the shape of the editing object AND the face/background.
-#   3. NON-editing tokens → source V (identity: face, background = source).
-#      EDITING tokens     → target V (colour free: conditioned on edit text).
-#   4. Standard SDPA with modified K, V — no manual loops, no re-weighting.
-#   Plus: double-stream K+V injection (--ds_key_inject) anchors coarse identity.
+#   1. B=2 dual-branch loop: [source_prompt, edit_prompt] share identical z_T.
+#   2. In every double-stream block (0-18), edit-branch image-token Q and K are
+#      replaced with source-branch values.  This forces the edit branch to attend
+#      to exactly the same spatial positions as the source (face, car silhouette).
+#      Text tokens keep the edit branch's Q/K so "blonde"/"blue" conditions V.
+#   3. Single-stream blocks (19-56): no injection.  Edit text drives colour.
 #
 # Tuning:
-#   --top_k_frac 0.2-0.3   Editing mask size. 0.25 ≈ 1024 tokens ≈ hair region.
-#                           If colour bleeds outside (face turns blonde): lower.
-#                           If hair/car boundary not fully covered: raise.
-#   --mask_build_step 5-8  Steps before mask extraction.  Higher = better mask
-#                           spatial structure; lower = more colour change freedom.
-#   --qk_frac 1.0           K injection active for all steps (structure).
-#   --v_frac  1.0           V masking active for all steps (colour separation).
+#   --qk_steps_frac [0.0, 1.0]   Q+K injection range (default: all steps).
+#                                 Reduce to [0.0, 0.7] if colour change is weak.
+#   --svd_alpha 1.0              Enable PFB at block 1 for extra identity lock.
+#                                 Start without it; add only if face drifts.
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
@@ -67,12 +60,6 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
-    --color_word blonde \
-    --top_k_frac 0.25 \
-    --mask_build_step 20 \
-    --color_sam2 \
-    --delta_scale 2.5 \
-    --delta_start_step 3 \
     --save_intermediates --intermediate_every 4 \
     --seed 35
 
@@ -85,12 +72,6 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
-    --color_word blue \
-    --top_k_frac 0.3 \
-    --mask_build_step 20 \
-    --color_sam2 \
-    --delta_scale 2.5 \
-    --delta_start_step 3 \
     --save_intermediates --intermediate_every 4 \
     --seed 40
 

@@ -61,6 +61,7 @@ from NewWork.UltimateFlux.policies import (
     BackgroundReplacePolicy,
     FineGrainedAttrPolicy,
     ColorCtrlPolicy,
+    KontextColorPolicy,
     StylePersonalizationPolicy,
 )
 
@@ -110,23 +111,18 @@ def build_policy(cfg: dict):
     if task == "attr_edit":
         inject_layers_raw = cfg.get("inject_layers", None)
         if inject_layers_raw in ("color", "colour"):
-            # ColorCtrl (arXiv:2508.09131): single-stream-only attention editing.
-            # Double-stream blocks (0-18): standard SDPA, untouched.
-            # Single-stream blocks (19-56): manual head-chunked attention with:
-            #   Structure: source v-v pre-softmax scores injected into target.
-            #   Colour:    binary V mask — source V for non-editing region,
-            #              target V for editing region (top_k_frac of tokens).
-            return ColorCtrlPolicy(
-                top_k_frac=cfg.get("top_k_frac", 0.2),
-                qk_frac=cfg.get("qk_frac", 1.0),
-                v_frac=cfg.get("v_frac", 1.0),
-                color_word=cfg.get("color_word", None),
-                chunk_size=cfg.get("chunk_size", 4),
-                mask_build_step=cfg.get("mask_build_step", 5),
-                reweight_scale=cfg.get("reweight_scale", 1.0),
-                ds_key_inject=cfg.get("ds_key_inject", False),
-                use_sam2=cfg.get("color_sam2", False),
-                sam2_model_id=cfg.get("color_sam2_model", "facebook/sam2-hiera-large"),
+            # Kontext-style colour editing: Q+K injection in all 19 double-stream
+            # blocks locks spatial structure (face, car shape); 38 single-stream
+            # blocks run fully free so the edit text ("blonde", "blue") drives
+            # colour via V in the joint attention.  Uses generate_dual_branch.
+            # Optional PFB (svd_alpha > 0): blends source principal features into
+            # edit's residual for extra identity anchoring.
+            return KontextColorPolicy(
+                qk_layers=list(range(N_DOUBLE)),
+                qk_steps_frac=tuple(cfg.get("qk_steps_frac", [0.0, 1.0])),
+                svd_alpha=cfg.get("svd_alpha", 0.0),
+                svd_layers=cfg.get("svd_layers", [1]),
+                svd_steps_frac=tuple(cfg.get("svd_steps_frac", [0.0, 0.25])),
             )
         elif inject_layers_raw == "double_stream":
             # Lock all 19 double-stream (joint text-image) blocks; 38 single-stream free.
@@ -193,9 +189,9 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  source_prompt: {source_prompt}")
     print(f"  edit_prompt:   {edit_prompt}")
 
-    # ColorCtrlPolicy uses masked delta-flow (subtract current colour, add new colour).
-    # All other policies use the standard dual-branch attention injection loop.
-    if isinstance(policy, ColorCtrlPolicy):
+    # ColorCtrlPolicy (legacy) uses masked delta-flow.
+    # All other policies (including KontextColorPolicy) use dual-branch attention injection.
+    if isinstance(policy, ColorCtrlPolicy) and not isinstance(policy, KontextColorPolicy):
         print(f"  [route] generate_masked_delta_flow (delta_scale={delta_scale})")
         src_img, edit_img = generate_masked_delta_flow(
             pipe=pipe,
@@ -305,7 +301,7 @@ def parse_args():
                    help="HuggingFace SAM2 model ID (bg_replace)")
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "double_stream", "tier_a"],
-                   help="attr_edit mode: double_stream=lock 19 joint blocks (colour change), color=ColorCtrl mask-based, tier_a=breed/shape change")
+                   help="attr_edit mode: color=Kontext Q+K injection (colour change), double_stream=K+V in 19 joint blocks, tier_a=breed/shape change")
     p.add_argument("--key_only", action="store_true", default=False,
                    help="double_stream mode: inject K only (not V) — locks spatial layout without locking colour. Default True for double_stream via config.")
     p.add_argument("--reweight_scale", type=float, default=1.0,
@@ -332,6 +328,16 @@ def parse_args():
                    help="ColorCtrl: denoising step at which to build the editing-region mask "
                         "(steps 0..N-1 run freely; mask built at N, ColorCtrl from N..end). "
                         "Larger = more accurate mask but less structure locked early.")
+    p.add_argument("--qk_steps_frac", type=float, nargs=2, default=[0.0, 1.0],
+                   help="color mode: [start end] fraction of steps for Q+K injection. "
+                        "Default all steps. Reduce end (e.g. 0.0 0.7) if colour change is weak.")
+    p.add_argument("--svd_alpha",   type=float, default=0.0,
+                   help="color mode: PFB alpha for optional SVD block hook (0 = disabled). "
+                        "Enable (e.g. 1.0) to blend source structural features into edit's residual.")
+    p.add_argument("--svd_layers",  type=int, nargs="+", default=[1],
+                   help="color mode: block indices for PFB SVD hook (default: [1])")
+    p.add_argument("--svd_steps_frac", type=float, nargs=2, default=[0.0, 0.25],
+                   help="color mode: step fraction for PFB SVD hook (default first 25%)")
     p.add_argument("--color_structure_frac", type=float, default=0.0,
                    help="Unused; kept for backward compat")
     p.add_argument("--inject_frac", type=float, default=0.5,
@@ -341,12 +347,9 @@ def parse_args():
     p.add_argument("--pfb_alpha",   type=float, default=1.0,
                    help="Unused; kept for backward compat")
     p.add_argument("--delta_scale", type=float, default=2.0,
-                   help="color mode: amplification for colour delta (v_edit - v_src). "
-                        "1.0 = clean switch; 2.0 = extrapolate; try 1.5–2.5.")
+                   help="Unused; kept for backward compat (legacy masked-delta-flow)")
     p.add_argument("--delta_start_step", type=int, default=None,
-                   help="color mode: step to branch from source and start delta injection "
-                        "(default: num_steps//3 ≈ 9). Locks identity for steps 0..N-1, "
-                        "gives colour delta for steps N..num_steps-1.")
+                   help="Unused; kept for backward compat (legacy masked-delta-flow)")
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
     p.add_argument("--guidance_scale",type=float, default=3.5)
@@ -414,6 +417,10 @@ def main():
         "mask_build_step":      args.mask_build_step,
         "color_sam2":           args.color_sam2,
         "color_sam2_model":     args.color_sam2_model,
+        "qk_steps_frac":        args.qk_steps_frac,
+        "svd_alpha":            args.svd_alpha,
+        "svd_layers":           args.svd_layers,
+        "svd_steps_frac":       args.svd_steps_frac,
         "color_structure_frac": args.color_structure_frac,
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,

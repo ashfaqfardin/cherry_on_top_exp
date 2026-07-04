@@ -1110,6 +1110,123 @@ class ColorCtrlPolicy(BasePolicy):
         )
 
 
+# ─────────────────────────── Task 5c: Kontext-style colour editing ───────────
+
+class KontextColorPolicy(BasePolicy):
+    """
+    Kontext-style structure-preserving colour editing for FLUX.1-dev.
+
+    Structural Attention Correction (SAC) across all 19 double-stream blocks:
+        Edit-branch image-token Q and K ← source-branch Q and K.
+        Both Q and K are replaced so the edit branch attends to exactly the same
+        spatial positions as the source (locks face geometry, car shape, etc.).
+        Text tokens are kept from the edit branch so the edit prompt ("blonde",
+        "blue") conditions V in the joint attention — colour flows freely.
+
+    Single-stream blocks (19-56): no injection at all.
+        All 38 refinement blocks run with the edit text, allowing the new colour
+        to propagate unobstructed through the appearance-refinement stage.
+
+    Optional PFB (svd_alpha > 0):
+        Forward hook on selected double-stream blocks.
+        h_edit ← Φ(h_src, α) + (h_edit − Φ(h_edit, α))
+        Blends source's principal structural features into the edit's residual,
+        further anchoring identity while preserving the colour change.
+        svd_alpha=0 (default) disables PFB — start here and only enable if
+        identity drifts after pure Q/K injection.
+
+    Parameters
+    ----------
+    qk_layers      : layers where Q+K injection fires (default: all 0-18).
+    qk_steps_frac  : (start, end) fraction of denoising steps. Default all.
+    svd_alpha      : exponential reweighting factor for PFB. 0 = disabled.
+    svd_layers     : blocks for PFB hook. Default [1] (pivotal layer).
+    svd_steps_frac : step fraction for PFB. Default first 25 %.
+    """
+
+    def __init__(
+        self,
+        qk_layers: Optional[List[int]] = None,
+        qk_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        svd_alpha: float = 0.0,
+        svd_layers: Optional[List[int]] = None,
+        svd_steps_frac: Tuple[float, float] = (0.0, 0.25),
+    ):
+        self._qk_layers     = set(qk_layers if qk_layers is not None else range(N_DOUBLE))
+        self.qk_steps_frac  = qk_steps_frac
+        self.svd_alpha      = svd_alpha
+        self._svd_layers    = set(svd_layers if svd_layers is not None else [1])
+        self.svd_steps_frac = svd_steps_frac
+        self._n_steps       = 28
+        self._layer_step: Dict[int, int] = {}
+
+    def pre_generate(self, pipe, num_steps: int = 28, **kwargs):
+        self._n_steps = num_steps
+        self._layer_step = {lid: 0 for lid in self._svd_layers}
+
+    def inject_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: int,
+        step: int,
+        n_steps: int,
+        txt_len: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Single-stream (txt_len=0): skip — edit text drives colour freely.
+        if txt_len == 0:
+            return q, k, v
+        if layer not in self._qk_layers:
+            return q, k, v
+        if not _step_active(step, n_steps, self.qk_steps_frac):
+            return q, k, v
+        if q.shape[0] < 2:
+            return q, k, v
+
+        # Replace edit-branch image-token Q, K with source values.
+        # Text prefix (0:txt_len) stays from the edit branch so the edit prompt
+        # ("blonde", "blue") continues to condition V in the joint attention.
+        q_src, q_edit = q.chunk(2)
+        k_src, k_edit = k.chunk(2)
+        q_edit = q_edit.clone()
+        k_edit = k_edit.clone()
+        q_edit[:, :, txt_len:, :] = q_src[:, :, txt_len:, :]
+        k_edit[:, :, txt_len:, :] = k_src[:, :, txt_len:, :]
+        return torch.cat([q_src, q_edit]), torch.cat([k_src, k_edit]), v
+
+    def get_block_hooks(self) -> Dict[int, Callable]:
+        if self.svd_alpha <= 0.0:
+            return {}
+
+        alpha       = self.svd_alpha
+        svd_frac    = self.svd_steps_frac
+        n_steps_ref = [self._n_steps]
+        layer_step  = self._layer_step
+
+        def make_hook(lid: int) -> Callable:
+            def _hook(module, inp, out):
+                cur = layer_step.get(lid, 0)
+                layer_step[lid] = cur + 1
+                if not _step_active(cur, n_steps_ref[0], svd_frac):
+                    return out
+                is_tuple = isinstance(out, tuple)
+                has_two  = is_tuple and len(out) >= 2
+                h = out[1] if has_two else (out[0] if is_tuple else out)
+                if h.shape[0] < 2:
+                    return out
+                h_src      = h[0:1]
+                h_edit     = h[1:2]
+                h_edit_new = _apply_pfb(h_edit, h_src, alpha)
+                h_out      = torch.cat([h_src, h_edit_new], dim=0)
+                if has_two:
+                    return (out[0], h_out)
+                return (h_out,) + out[1:] if is_tuple else h_out
+            return _hook
+
+        return {lid: make_hook(lid) for lid in self._svd_layers}
+
+
 # ─────────────────────────── Task 7: Style personalization ───────────────────
 
 # Pivotal layer for PFB+SAC: double-stream block 1.

@@ -103,18 +103,12 @@
       "seed": 30
     },
     {
-      "comment": "Masked delta-flow colour editing. Phase 1 (steps 0-19): source-only denoising — no divergence. Mask at step 20: SAM2 point-prompted or attention topk. Phase 2 (steps 20-27): B=3 batch [z_src+src, z_edit+src, z_edit+edit] per step. v_delta = v_edit - v_src is a pure colour signal (structure cancels). z_edit += dt * (v_src + delta_scale * mask * v_delta).",
+      "comment": "Kontext-style colour editing (KontextColorPolicy). SAC in all 19 double-stream blocks: edit image-token Q and K replaced with source Q and K — locks face/object spatial structure. Text Q/K stay from edit branch so edit prompt conditions V freely. Single-stream blocks (19-56) run with no injection — edit text drives colour. Uses generate_dual_branch.",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
-      "color_word": "blonde",
-      "top_k_frac": 0.25,
-      "mask_build_step": 20,
-      "delta_scale": 2.5,
-      "delta_start_step": 3,
-      "color_sam2": true,
       "seed": 35
     },
     {
@@ -123,12 +117,6 @@
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
-      "color_word": "blue",
-      "top_k_frac": 0.3,
-      "mask_build_step": 20,
-      "delta_scale": 2.5,
-      "delta_start_step": 3,
-      "color_sam2": true,
       "seed": 40
     },
     {
