@@ -849,9 +849,11 @@ def generate_masked_delta_flow(
 
     mask_step  = getattr(policy, "mask_build_step", num_steps // 2)
     # delta_start_step: source-only lock for steps 0→N-1; delta injection from N.
-    # Default: num_steps//3 ≈ 9 for 28 steps — locks structure, leaves ~19 colour steps.
+    # FLUX dynamic-shifting concentrates sigma budget in the first few steps.
+    # sigma at step 3 ≈ 0.40;  calibrated: delta_scale = 1/sigma_start for 100% edit.
+    # Default num_steps//9 ≈ 3 — minimal identity lock, full colour window.
     eff_start = (delta_start_step if delta_start_step is not None
-                 else max(0, num_steps // 3))
+                 else max(0, num_steps // 9))
     eff_start = max(0, min(eff_start, num_steps - 1))
 
     try:

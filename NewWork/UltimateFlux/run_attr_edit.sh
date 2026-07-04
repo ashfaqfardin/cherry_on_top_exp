@@ -71,8 +71,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --top_k_frac 0.25 \
     --mask_build_step 20 \
     --color_sam2 \
-    --delta_scale 2.0 \
-    --delta_start_step 9 \
+    --delta_scale 2.5 \
+    --delta_start_step 3 \
     --save_intermediates --intermediate_every 4 \
     --seed 35
 
@@ -89,8 +89,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --top_k_frac 0.3 \
     --mask_build_step 20 \
     --color_sam2 \
-    --delta_scale 2.0 \
-    --delta_start_step 9 \
+    --delta_scale 2.5 \
+    --delta_start_step 3 \
     --save_intermediates --intermediate_every 4 \
     --seed 40
 
