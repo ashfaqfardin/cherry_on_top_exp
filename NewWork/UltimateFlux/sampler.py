@@ -626,6 +626,337 @@ def _build_sam2_mask(
         _fallback_attn_mask(policy, score_map, lats.device)
 
 
+# ──────────────────── Masked delta-flow helpers ───────────────────────────────
+
+class _MaskCaptureAttnProc:
+    """
+    Drop-in attention processor that captures img→text attention scores at the
+    first single-stream block (no encoder_hidden_states).  Every block still runs
+    standard SDPA, so generation quality is unaffected.
+
+    Use with a B=1 (or B=2) probe forward pass.  Scores are always captured from
+    the last batch item, so the edit prompt is item index -1 in both cases.
+    """
+
+    def __init__(self, txt_len: int = 512):
+        self.txt_len      = txt_len
+        self._n_single    = 0
+        self.edit_scores: Optional[torch.Tensor] = None  # (n_img, txt_len) CPU
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ):
+        is_double = encoder_hidden_states is not None
+        B         = hidden_states.shape[0]
+
+        q = attn.to_q(hidden_states)
+        k = attn.to_k(hidden_states)
+        v = attn.to_v(hidden_states)
+        inner = k.shape[-1]
+        hd    = inner // attn.heads
+
+        q = q.view(B, -1, attn.heads, hd).transpose(1, 2)
+        k = k.view(B, -1, attn.heads, hd).transpose(1, 2)
+        v = v.view(B, -1, attn.heads, hd).transpose(1, 2)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states)
+            ek = attn.add_k_proj(encoder_hidden_states)
+            ev = attn.add_v_proj(encoder_hidden_states)
+            eq = eq.view(B, -1, attn.heads, hd).transpose(1, 2)
+            ek = ek.view(B, -1, attn.heads, hd).transpose(1, 2)
+            ev = ev.view(B, -1, attn.heads, hd).transpose(1, 2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            q = torch.cat([eq, q], dim=2)
+            k = torch.cat([ek, k], dim=2)
+            v = torch.cat([ev, v], dim=2)
+
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q, image_rotary_emb)
+            k = apply_rotary_emb(k, image_rotary_emb)
+
+        # Capture img→text scores at the first single-stream block
+        if not is_double and self._n_single == 0:
+            tl    = self.txt_len
+            scale = hd ** -0.5
+            q_img = q[-1:, :, tl:,  :].float()   # last batch item, image tokens
+            k_txt = k[-1:, :, :tl,  :].float()   # last batch item, text tokens
+            raw   = torch.matmul(q_img, k_txt.transpose(-2, -1)) * scale  # (1,H,n_img,n_txt)
+            self.edit_scores = raw.mean(dim=(0, 1)).detach().cpu()         # (n_img, n_txt)
+        if not is_double:
+            self._n_single += 1
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False,
+                                             attn_mask=attention_mask)
+        out = out.transpose(1, 2).reshape(B, -1, attn.heads * hd).to(q.dtype)
+
+        if is_double:
+            enc_out = out[:, :encoder_hidden_states.shape[1]]
+            out     = out[:, encoder_hidden_states.shape[1]:]
+            out     = attn.to_out[0](out)
+            out     = attn.to_out[1](out)
+            enc_out = attn.to_add_out(enc_out)
+            return out, enc_out
+        return out
+
+
+def _build_attn_mask_from_capture(
+    policy,
+    edit_scores: torch.Tensor,    # (n_img, n_txt) CPU
+    txt_len: int,
+    device,
+) -> None:
+    """Set policy._mask from captured img→text attention scores (attention topk)."""
+    color_tok_ids = getattr(policy, "_color_tok_ids", [])
+    n_img = edit_scores.shape[0]
+
+    if color_tok_ids:
+        ids     = [i for i in color_tok_ids if i < txt_len]
+        score   = edit_scores[:, ids].mean(-1) if ids else edit_scores.mean(-1)
+    else:
+        score   = edit_scores.mean(-1)
+
+    k_top    = max(1, int(getattr(policy, "top_k_frac", 0.25) * n_img))
+    edit_idx = score.topk(k_top).indices
+    pres     = torch.ones(n_img, dtype=torch.float32)
+    pres[edit_idx] = 0.0
+    policy._mask       = pres.to(device)
+    policy._mask_built = True
+    focus = "colour-word" if color_tok_ids else "all-text"
+    print(f"  [MaskBuild] attention topk ({focus}): {k_top}/{n_img} editing tokens")
+
+
+@torch.no_grad()
+def generate_masked_delta_flow(
+    pipe: FluxPipeline,
+    policy,
+    source_prompt: str,
+    edit_prompt: str,
+    seed: int = 0,
+    num_steps: int = 28,
+    guidance_scale: float = 3.5,
+    height: int = 1024,
+    width: int = 1024,
+    max_sequence_length: int = 512,
+    device: str = "cuda",
+    delta_scale: float = 2.0,
+    save_intermediates: bool = False,
+    intermediate_out_dir: Optional[str] = None,
+    intermediate_every: int = 4,
+) -> Tuple[Image.Image, Image.Image]:
+    """
+    Two-phase masked delta-flow colour editing.
+
+    "Minus the current colour, add the new colour" in velocity space:
+
+        v_delta = v_edit(z, t) - v_src(z, t)
+            ↑ pure colour signal — structure cancels because both use the same z
+
+        z += dt * ( v_src  +  delta_scale * mask * v_delta )
+                      ↑ identity                ↑ colour injected only in editing region
+
+    Phase 1  (steps 0 → mask_build_step-1):
+        Single-branch source-only denoising.  Both edit and source start identically —
+        no structural divergence before the colour injection begins.
+
+    Mask building  (at step mask_build_step):
+        One probe forward pass with the edit prompt captures img→text attention.
+        SAM2 (if enabled): decode the intermediate image → point-prompted segment.
+        Attention topk (default): top_k_frac tokens most attending to the colour word.
+
+    Phase 2  (steps mask_build_step → num_steps-1):
+        One B=3 batch per step: [z_src+src, z_edit+src, z_edit+edit]
+            v_src_ref, v_src, v_edit = transformer(z_b3, t, prompts)
+        z_src  advances with v_src_ref  (clean source reference).
+        z_edit advances with v_src + delta_scale * mask * (v_edit - v_src).
+
+    Returns (source_image, edit_image).
+    """
+    exec_device = getattr(pipe, "_execution_device", device)
+
+    policy.pre_generate(
+        pipe, device=device, height=height, width=width,
+        num_steps=num_steps, seed=seed,
+        source_prompt=source_prompt, edit_prompt=edit_prompt,
+        max_sequence_length=max_sequence_length, guidance_scale=guidance_scale,
+    )
+
+    # ── Encode prompts ────────────────────────────────────────────────────────
+    def _encode(prompt: str):
+        enc = pipe.encode_prompt(
+            prompt, prompt_2=None, device=exec_device,
+            num_images_per_prompt=1, max_sequence_length=max_sequence_length,
+        )
+        return (enc[0], enc[1], enc[2]) if len(enc) == 3 else (enc[0], enc[2], enc[4])
+
+    src_pe,  src_pp,  src_txt  = _encode(source_prompt)
+    edit_pe, edit_pp, edit_txt = _encode(edit_prompt)
+
+    # ── Initial latent ────────────────────────────────────────────────────────
+    vae_scale = getattr(pipe, "vae_scale_factor", 8)
+    num_ch = pipe.transformer.config.in_channels // 4
+    lat_h  = 2 * (height // (vae_scale * 2))
+    lat_w  = 2 * (width  // (vae_scale * 2))
+
+    gen   = torch.Generator(device=exec_device).manual_seed(seed)
+    raw_z = randn_tensor((1, num_ch, lat_h, lat_w), generator=gen,
+                         device=exec_device, dtype=src_pe.dtype)
+    z_T   = pipe._pack_latents(raw_z, 1, num_ch, lat_h, lat_w)
+    img_ids = pipe._prepare_latent_image_ids(
+        1, lat_h // 2, lat_w // 2, exec_device, src_pe.dtype,
+    )
+    if img_ids.ndim == 3:
+        img_ids = img_ids.squeeze(0)
+
+    # ── Timestep schedule (FLUX.1-dev dynamic shifting) ───────────────────────
+    sched = pipe.scheduler.config
+    if getattr(sched, "use_dynamic_shifting", False):
+        base_seq  = getattr(sched, "base_image_seq_len", 256)
+        max_seq   = getattr(sched, "max_image_seq_len",  4096)
+        base_shft = getattr(sched, "base_shift",         0.5)
+        max_shft  = getattr(sched, "max_shift",          1.15)
+        m   = (max_shft - base_shft) / (max_seq - base_seq)
+        mu  = (lat_h // 2) * (lat_w // 2) * m + (base_shft - m * base_seq)
+        pipe.scheduler.set_timesteps(num_steps, device=exec_device, mu=mu)
+    else:
+        pipe.scheduler.set_timesteps(num_steps, device=exec_device)
+    timesteps    = pipe.scheduler.timesteps
+    sigmas       = pipe.scheduler.sigmas
+    has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
+
+    def _fwd(z: torch.Tensor, i: int, pe, pp) -> torch.Tensor:
+        B = z.shape[0]
+        t = timesteps[i].expand(B)
+        g = torch.full([B], guidance_scale, device=exec_device,
+                       dtype=z.dtype) if has_guidance else None
+        return pipe.transformer(
+            hidden_states=z, timestep=t / 1000.0, guidance=g,
+            pooled_projections=pp, encoder_hidden_states=pe,
+            txt_ids=src_txt, img_ids=img_ids, return_dict=False,
+        )[0]
+
+    mask_step = getattr(policy, "mask_build_step", num_steps // 2)
+
+    # ── Phase 1: source-only denoising ────────────────────────────────────────
+    print(f"[MaskedDeltaFlow] Phase 1: {mask_step} source-only steps…")
+    z = z_T.clone()
+    for i in range(mask_step):
+        z = z + (sigmas[i + 1] - sigmas[i]) * _fwd(z, i, src_pe, src_pp)
+    z_shared = z.clone()    # checkpoint — both branches branch off from here
+
+    # ── Mask building ──────────────────────────────────────────────────────────
+    print(f"[MaskedDeltaFlow] Building mask at step {mask_step}…")
+    from diffusers.models.attention_processor import FluxAttnProcessor2_0
+
+    cap = _MaskCaptureAttnProc(txt_len=max_sequence_length)
+    pipe.transformer.set_attn_processor(cap)
+    try:
+        _fwd(z_shared, mask_step, edit_pe, edit_pp)   # B=1 probe with edit prompt
+    finally:
+        pipe.transformer.set_attn_processor(FluxAttnProcessor2_0())
+
+    use_sam2 = getattr(policy, "use_sam2", False)
+
+    if use_sam2 and cap.edit_scores is not None:
+        import numpy as np
+        img_probe = _decode_latents(pipe, z_shared, height, width)
+        color_ids = getattr(policy, "_color_tok_ids", [])
+        scores    = cap.edit_scores
+        ids       = [k for k in color_ids if k < max_sequence_length]
+        s1d       = scores[:, ids].mean(-1) if ids else scores.mean(-1)
+        h_tok, w_tok = height // 16, width // 16
+        pidx = int(s1d.argmax().item())
+        px   = int((pidx % w_tok + 0.5) * width  / w_tok)
+        py   = int((pidx // w_tok + 0.5) * height / h_tok)
+        try:
+            from sam2.build_sam import build_sam2_hf
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            print(f"  [SAM2] point=({px},{py}), loading {policy.sam2_model_id}…")
+            pred = SAM2ImagePredictor(build_sam2_hf(policy.sam2_model_id,
+                                                    device=str(exec_device)))
+            pred.set_image(np.array(img_probe.convert("RGB")))
+            m_out, s_out, _ = pred.predict(
+                point_coords=np.array([[px, py]]),
+                point_labels=np.array([1]), multimask_output=True,
+            )
+            best = m_out[s_out.argmax()]
+            mpil = Image.fromarray(best.astype(np.uint8) * 255, mode="L")
+            tnp  = np.array(mpil.resize((w_tok, h_tok), Image.NEAREST))
+            pres = torch.from_numpy((tnp < 128).astype(np.float32)).flatten()
+            policy._mask = pres.to(exec_device); policy._mask_built = True
+            print(f"  [SAM2] {int((pres < 0.5).sum())}/{pres.numel()} editing tokens")
+        except Exception as exc:
+            print(f"  [SAM2] failed: {exc} — using attention topk")
+            _build_attn_mask_from_capture(policy, cap.edit_scores,
+                                          max_sequence_length, exec_device)
+    elif cap.edit_scores is not None:
+        _build_attn_mask_from_capture(policy, cap.edit_scores,
+                                      max_sequence_length, exec_device)
+    else:
+        n_img = (lat_h // 2) * (lat_w // 2)
+        k_top = max(1, int(getattr(policy, "top_k_frac", 0.25) * n_img))
+        pres  = torch.ones(n_img, dtype=torch.float32, device=exec_device)
+        pres[n_img // 2 - k_top // 2: n_img // 2 + k_top // 2] = 0.0
+        policy._mask = pres; policy._mask_built = True
+        print(f"  [MaskBuild] fallback centre mask: {k_top}/{n_img} tokens")
+
+    # edit_mask: (1, N, 1) — 1 = editing region, 0 = preserved
+    edit_mask_2d = (1.0 - policy._mask).to(exec_device).view(1, -1, 1)
+
+    # ── Phase 2: interleaved source + masked delta-flow ───────────────────────
+    n2 = num_steps - mask_step
+    print(f"[MaskedDeltaFlow] Phase 2: {n2} steps "
+          f"(delta_scale={delta_scale}, "
+          f"{int(edit_mask_2d.sum().item())} editing tokens)…")
+
+    z_src  = z_shared.clone()
+    z_edit = z_shared.clone()
+    captured: List[Tuple[int, int, torch.Tensor]] = []
+
+    for i in range(mask_step, num_steps):
+        dt = sigmas[i + 1] - sigmas[i]
+
+        # B=3 batch: [z_src+src,  z_edit+src,  z_edit+edit]
+        # v[0] → v_src_ref (advances source reference)
+        # v[1] → v_src     (at z_edit — structural anchor for edit)
+        # v[2] → v_edit    (at z_edit — new colour from edit prompt)
+        # v[2] − v[1] = pure colour delta; structure cancels.
+        z_b3  = torch.cat([z_src,   z_edit,  z_edit])
+        pe_b3 = torch.cat([src_pe,  src_pe,  edit_pe])
+        pp_b3 = torch.cat([src_pp,  src_pp,  edit_pp])
+        v_all = _fwd(z_b3, i, pe_b3, pp_b3)
+        v_src_ref, v_src, v_edit = v_all.chunk(3)
+
+        z_src  = z_src  + dt * v_src_ref
+        z_edit = z_edit + dt * (v_src + delta_scale * edit_mask_2d * (v_edit - v_src))
+
+        if save_intermediates and (
+            i % intermediate_every == 0 or i == num_steps - 1
+        ):
+            captured.append((
+                i, num_steps,
+                torch.cat([z_src.detach().cpu(), z_edit.detach().cpu()]),
+            ))
+
+    src_img  = _decode_latents(pipe, z_src,  height, width)
+    edit_img = _decode_latents(pipe, z_edit, height, width)
+
+    if save_intermediates and intermediate_out_dir:
+        if captured:
+            _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir)
+        _save_color_mask(policy, intermediate_out_dir, height, width)
+
+    return src_img, edit_img
+
+
 @torch.no_grad()
 def generate_p2p(
     pipe: FluxPipeline,

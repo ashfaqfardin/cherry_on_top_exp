@@ -103,18 +103,17 @@
       "seed": 30
     },
     {
-      "comment": "Attention-mask structure-colour separation. (1) Mask: target img→text attention to colour word finds editing region (hair/car). (2) ALL image tokens → source K: same geometry everywhere. (3) Non-editing → source V: face/bg identity locked. Editing → target V: colour free from edit text. SDPA, no loops. ds_key_inject anchors coarse identity in double-stream.",
+      "comment": "Masked delta-flow colour editing. Phase 1 (steps 0-19): source-only denoising — no divergence. Mask at step 20: SAM2 point-prompted or attention topk. Phase 2 (steps 20-27): B=3 batch [z_src+src, z_edit+src, z_edit+edit] per step. v_delta = v_edit - v_src is a pure colour signal (structure cancels). z_edit += dt * (v_src + delta_scale * mask * v_delta).",
       "name": "woman_hair_color",
       "task": "attr_edit",
       "source_prompt": "a woman with black hair",
       "edit_prompt":   "a woman with blonde hair",
       "inject_layers": "color",
-      "qk_frac": 0.72,
-      "v_frac": 1.0,
-      "ds_key_inject": true,
       "color_word": "blonde",
       "top_k_frac": 0.25,
       "mask_build_step": 20,
+      "delta_scale": 2.0,
+      "color_sam2": true,
       "seed": 35
     },
     {
@@ -123,12 +122,11 @@
       "source_prompt": "a red sports car on a road",
       "edit_prompt":   "a blue sports car on a road",
       "inject_layers": "color",
-      "qk_frac": 0.72,
-      "v_frac": 1.0,
-      "ds_key_inject": true,
       "color_word": "blue",
       "top_k_frac": 0.3,
       "mask_build_step": 20,
+      "delta_scale": 2.0,
+      "color_sam2": true,
       "seed": 40
     },
     {

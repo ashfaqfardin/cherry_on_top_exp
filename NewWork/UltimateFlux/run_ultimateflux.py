@@ -51,7 +51,8 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from NewWork.UltimateFlux.sampler import (
-    load_pipeline, generate_dual_branch, TIER_A, TIER_B, N_DOUBLE,
+    load_pipeline, generate_dual_branch, generate_masked_delta_flow,
+    TIER_A, TIER_B, N_DOUBLE,
 )
 from NewWork.UltimateFlux.policies import (
     NonRigidPolicy,
@@ -178,6 +179,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     max_seq_len        = cfg.get("max_sequence_length", 512)
     save_intermediates = cfg.get("save_intermediates", False)
     intermediate_every = cfg.get("intermediate_every", 4)
+    delta_scale        = cfg.get("delta_scale", 2.0)
 
     policy = build_policy(cfg)
 
@@ -190,22 +192,44 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"  source_prompt: {source_prompt}")
     print(f"  edit_prompt:   {edit_prompt}")
 
-    src_img, edit_img = generate_dual_branch(
-        pipe=pipe,
-        policy=policy,
-        source_prompt=source_prompt,
-        edit_prompt=edit_prompt,
-        seed=seed,
-        num_steps=num_steps,
-        guidance_scale=guidance,
-        height=height,
-        width=width,
-        max_sequence_length=max_seq_len,
-        device=device,
-        save_intermediates=save_intermediates,
-        intermediate_out_dir=run_dir if save_intermediates else None,
-        intermediate_every=intermediate_every,
-    )
+    # ColorCtrlPolicy uses masked delta-flow (subtract current colour, add new colour).
+    # All other policies use the standard dual-branch attention injection loop.
+    if isinstance(policy, ColorCtrlPolicy):
+        print(f"  [route] generate_masked_delta_flow (delta_scale={delta_scale})")
+        src_img, edit_img = generate_masked_delta_flow(
+            pipe=pipe,
+            policy=policy,
+            source_prompt=source_prompt,
+            edit_prompt=edit_prompt,
+            seed=seed,
+            num_steps=num_steps,
+            guidance_scale=guidance,
+            height=height,
+            width=width,
+            max_sequence_length=max_seq_len,
+            device=device,
+            delta_scale=delta_scale,
+            save_intermediates=save_intermediates,
+            intermediate_out_dir=run_dir if save_intermediates else None,
+            intermediate_every=intermediate_every,
+        )
+    else:
+        src_img, edit_img = generate_dual_branch(
+            pipe=pipe,
+            policy=policy,
+            source_prompt=source_prompt,
+            edit_prompt=edit_prompt,
+            seed=seed,
+            num_steps=num_steps,
+            guidance_scale=guidance,
+            height=height,
+            width=width,
+            max_sequence_length=max_seq_len,
+            device=device,
+            save_intermediates=save_intermediates,
+            intermediate_out_dir=run_dir if save_intermediates else None,
+            intermediate_every=intermediate_every,
+        )
 
     if save_images:
         src_path  = os.path.join(run_dir, "source.png")
@@ -314,8 +338,9 @@ def parse_args():
                    help="Unused; kept for backward compat")
     p.add_argument("--pfb_alpha",   type=float, default=1.0,
                    help="Unused; kept for backward compat")
-    p.add_argument("--delta_scale", type=float, default=1.5,
-                   help="Unused; kept for backward compat")
+    p.add_argument("--delta_scale", type=float, default=2.0,
+                   help="color mode (masked delta-flow): amplification factor for the colour delta "
+                        "(v_edit - v_src). 1.0 = 1:1 colour change; try 2.0–3.0 for strong colour.")
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
     p.add_argument("--guidance_scale",type=float, default=3.5)

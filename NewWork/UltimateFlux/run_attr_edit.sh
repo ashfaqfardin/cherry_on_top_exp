@@ -67,12 +67,11 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
     --inject_layers color \
-    --qk_frac 0.72 --v_frac 1.0 \
-    --ds_key_inject \
     --color_word blonde \
     --top_k_frac 0.25 \
     --mask_build_step 20 \
     --color_sam2 \
+    --delta_scale 2.0 \
     --save_intermediates --intermediate_every 4 \
     --seed 35
 
@@ -85,12 +84,11 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
     --inject_layers color \
-    --qk_frac 0.72 --v_frac 1.0 \
-    --ds_key_inject \
     --color_word blue \
     --top_k_frac 0.3 \
     --mask_build_step 20 \
     --color_sam2 \
+    --delta_scale 2.0 \
     --save_intermediates --intermediate_every 4 \
     --seed 40
 
