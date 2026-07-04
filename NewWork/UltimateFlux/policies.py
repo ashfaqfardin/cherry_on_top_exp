@@ -748,9 +748,11 @@ class BackgroundReplacePolicy(BasePolicy):
       3. Fallback — TIER_A K,V injection globally; subject is approximately
                     preserved without a precise boundary.
 
-    Masked path (options 1 & 2, FreeFlux approach):
-        Value-only injection inside the fg region at all 57 layers.
-        Subject V values from source are blended in; background V is free.
+    Masked path (options 1 & 2):
+        K+V injection inside the fg region at all 57 layers.
+        V preserves subject colour/texture; K preserves how other tokens attend to
+        the subject — critical for fine-grained subjects (cat faces, fur patterns)
+        against complex backgrounds where V-only injection causes detail drift.
 
     sam2_model_id: HuggingFace model ID for SAM2 (default: sam2-hiera-large).
     """
@@ -799,14 +801,25 @@ class BackgroundReplacePolicy(BasePolicy):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
 
         if self._token_mask is not None:
-            # Masked (FreeFlux approach): value-only injection inside foreground.
-            v_src, v_edit = v.chunk(2)
-            v_edit = v_edit.clone()
-            fg  = self._token_mask.squeeze(0).squeeze(0).to(v.device)  # (L_img,)
+            # K+V injection inside foreground mask.
+            # V preserves colour/texture; K preserves how other tokens attend to the
+            # subject (spatial structure of fine-grained features — fur, face shape).
+            # V-only was insufficient for subjects against complex backgrounds (e.g.
+            # cat in forest) where background tokens attend to subject tokens via K
+            # and a free K caused fine detail drift.
+            fg  = self._token_mask.squeeze(0).squeeze(0).to(k.device)  # (L_img,)
             fg4 = fg.view(1, 1, -1, 1)
+            k_src, k_edit = k.chunk(2)
+            v_src, v_edit = v.chunk(2)
+            k_edit = k_edit.clone()
+            v_edit = v_edit.clone()
+            k_edit[:, :, img_offset:, :] = (
+                k_src[:, :, img_offset:, :] * fg4 + k_edit[:, :, img_offset:, :] * (1 - fg4)
+            )
             v_edit[:, :, img_offset:, :] = (
                 v_src[:, :, img_offset:, :] * fg4 + v_edit[:, :, img_offset:, :] * (1 - fg4)
             )
+            k = torch.cat([k_src, k_edit])
             v = torch.cat([v_src, v_edit])
         else:
             # Fallback (no mask): K,V injection at TIER_A globally.
