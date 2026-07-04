@@ -849,33 +849,51 @@ def generate_masked_delta_flow(
 
     mask_step = getattr(policy, "mask_build_step", num_steps // 2)
 
-    # ── Phase 1: source-only denoising ────────────────────────────────────────
-    print(f"[MaskedDeltaFlow] Phase 1: {mask_step} source-only steps…")
-    z = z_T.clone()
-    for i in range(mask_step):
-        dt = (sigmas[i + 1] - sigmas[i]).to(mdtype)
-        z  = z + dt * _fwd(z, i, src_pe, src_pp)
-    z_shared = z.clone()    # checkpoint — both branches branch off from here
-
-    # ── Mask building ──────────────────────────────────────────────────────────
-    print(f"[MaskedDeltaFlow] Building mask at step {mask_step}…")
     try:
         from diffusers.models.attention_processor import FluxAttnProcessor
     except ImportError:
         from diffusers.models.attention_processor import FluxAttnProcessor2_0 as FluxAttnProcessor
 
-    cap = _MaskCaptureAttnProc(txt_len=max_sequence_length)
-    pipe.transformer.set_attn_processor(cap)
-    try:
-        _fwd(z_shared, mask_step, edit_pe, edit_pp)   # B=1 probe with edit prompt
-    finally:
-        pipe.transformer.set_attn_processor(FluxAttnProcessor())
+    # ── Phase 1: full source run + attention probe at mask_build_step ────────
+    # Running the complete source trajectory (all num_steps) serves two purposes:
+    #   1. Produces a clean, fully-denoised src_img for SAM2 segmentation.
+    #   2. At step mask_build_step, a one-shot probe with the edit prompt captures
+    #      img→text attention that localises the editing region (hair / car body).
+    # Colour information lives in the HIGH-NOISE early timesteps.  The edit run
+    # (Phase 2) therefore starts from z_T and runs ALL num_steps with the delta,
+    # giving the colour signal its full trajectory window to accumulate.
+    print(f"[MaskedDeltaFlow] Phase 1: full source run ({num_steps} steps)…")
+    z   = z_T.clone()
+    cap = None
+    z1_cache: dict = {}   # step → z (CPU tensor) for intermediate grid
 
+    for i in range(num_steps):
+        dt = (sigmas[i + 1] - sigmas[i]).to(mdtype)
+
+        # Probe: one extra B=1 edit-prompt pass to capture attention scores.
+        # Fired exactly once at mask_build_step; does NOT alter z.
+        if i == mask_step and cap is None:
+            _cap = _MaskCaptureAttnProc(txt_len=max_sequence_length)
+            pipe.transformer.set_attn_processor(_cap)
+            try:
+                _fwd(z, i, edit_pe, edit_pp)
+            finally:
+                pipe.transformer.set_attn_processor(FluxAttnProcessor())
+            cap = _cap
+
+        z = z + dt * _fwd(z, i, src_pe, src_pp)
+
+        if save_intermediates and (i % intermediate_every == 0 or i == num_steps - 1):
+            z1_cache[i] = z.detach().cpu()
+
+    src_img = _decode_latents(pipe, z, height, width)
+
+    # ── Mask building on clean source image ───────────────────────────────────
+    print(f"[MaskedDeltaFlow] Building mask from source image (probe at step {mask_step})…")
     use_sam2 = getattr(policy, "use_sam2", False)
 
-    if use_sam2 and cap.edit_scores is not None:
+    if use_sam2 and cap is not None and cap.edit_scores is not None:
         import numpy as np
-        img_probe = _decode_latents(pipe, z_shared, height, width)
         color_ids = getattr(policy, "_color_tok_ids", [])
         scores    = cap.edit_scores
         ids       = [k for k in color_ids if k < max_sequence_length]
@@ -887,10 +905,11 @@ def generate_masked_delta_flow(
         try:
             from sam2.build_sam import build_sam2_hf
             from sam2.sam2_image_predictor import SAM2ImagePredictor
-            print(f"  [SAM2] point=({px},{py}), loading {policy.sam2_model_id}…")
+            print(f"  [SAM2] point=({px},{py}) on clean source image, "
+                  f"loading {policy.sam2_model_id}…")
             pred = SAM2ImagePredictor(build_sam2_hf(policy.sam2_model_id,
                                                     device=str(exec_device)))
-            pred.set_image(np.array(img_probe.convert("RGB")))
+            pred.set_image(np.array(src_img.convert("RGB")))   # clean image!
             m_out, s_out, _ = pred.predict(
                 point_coords=np.array([[px, py]]),
                 point_labels=np.array([1]), multimask_output=True,
@@ -903,9 +922,10 @@ def generate_masked_delta_flow(
             print(f"  [SAM2] {int((pres < 0.5).sum())}/{pres.numel()} editing tokens")
         except Exception as exc:
             print(f"  [SAM2] failed: {exc} — using attention topk")
-            _build_attn_mask_from_capture(policy, cap.edit_scores,
-                                          max_sequence_length, exec_device)
-    elif cap.edit_scores is not None:
+            if cap is not None and cap.edit_scores is not None:
+                _build_attn_mask_from_capture(policy, cap.edit_scores,
+                                              max_sequence_length, exec_device)
+    elif cap is not None and cap.edit_scores is not None:
         _build_attn_mask_from_capture(policy, cap.edit_scores,
                                       max_sequence_length, exec_device)
     else:
@@ -916,47 +936,38 @@ def generate_masked_delta_flow(
         policy._mask = pres; policy._mask_built = True
         print(f"  [MaskBuild] fallback centre mask: {k_top}/{n_img} tokens")
 
-    # edit_mask: (1, N, 1) — 1 = editing region, 0 = preserved
-    # Cast to model dtype so that arithmetic in Phase 2 stays in bfloat16.
+    # edit_mask: (1, N, 1)  1 = editing region  0 = preserved
     edit_mask_2d = (1.0 - policy._mask).to(device=exec_device, dtype=mdtype).view(1, -1, 1)
 
-    # ── Phase 2: interleaved source + masked delta-flow ───────────────────────
-    n2 = num_steps - mask_step
-    print(f"[MaskedDeltaFlow] Phase 2: {n2} steps "
-          f"(delta_scale={delta_scale}, "
+    # ── Phase 2: masked delta-flow for ALL num_steps from z_T ────────────────
+    # Starting from the same z_T means colour-determining early timesteps
+    # receive the full delta signal.  B=2 per step: same z with both prompts.
+    print(f"[MaskedDeltaFlow] Phase 2: delta-flow from z_T "
+          f"({num_steps} steps, delta_scale={delta_scale}, "
           f"{int(edit_mask_2d.sum().item())} editing tokens)…")
 
-    z_src  = z_shared.clone()
-    z_edit = z_shared.clone()
+    z      = z_T.clone()
     captured: List[Tuple[int, int, torch.Tensor]] = []
 
-    for i in range(mask_step, num_steps):
+    for i in range(num_steps):
         dt = (sigmas[i + 1] - sigmas[i]).to(mdtype)
 
-        # B=3 batch: [z_src+src,  z_edit+src,  z_edit+edit]
-        # v[0] → v_src_ref (advances source reference)
-        # v[1] → v_src     (at z_edit — structural anchor for edit)
-        # v[2] → v_edit    (at z_edit — new colour from edit prompt)
-        # v[2] − v[1] = pure colour delta; structure cancels.
-        z_b3  = torch.cat([z_src,   z_edit,  z_edit])
-        pe_b3 = torch.cat([src_pe,  src_pe,  edit_pe])
-        pp_b3 = torch.cat([src_pp,  src_pp,  edit_pp])
-        v_all = _fwd(z_b3, i, pe_b3, pp_b3)
-        v_src_ref, v_src, v_edit = v_all.chunk(3)
+        # B=2: same current z with source + edit prompts.
+        # v_edit − v_src = pure colour delta; structural components cancel.
+        z_b2  = torch.cat([z, z])
+        pe_b2 = torch.cat([src_pe, edit_pe])
+        pp_b2 = torch.cat([src_pp, edit_pp])
+        v_both = _fwd(z_b2, i, pe_b2, pp_b2)
+        v_src, v_edit = v_both.chunk(2)
 
-        z_src  = z_src  + dt * v_src_ref
-        z_edit = z_edit + dt * (v_src + delta_scale * edit_mask_2d * (v_edit - v_src))
+        z = z + dt * (v_src + delta_scale * edit_mask_2d * (v_edit - v_src))
 
-        if save_intermediates and (
-            i % intermediate_every == 0 or i == num_steps - 1
-        ):
-            captured.append((
-                i, num_steps,
-                torch.cat([z_src.detach().cpu(), z_edit.detach().cpu()]),
-            ))
+        if save_intermediates and (i % intermediate_every == 0 or i == num_steps - 1):
+            z_src_frame = z1_cache.get(i, z.detach().cpu())
+            captured.append((i, num_steps,
+                             torch.cat([z_src_frame, z.detach().cpu()])))
 
-    src_img  = _decode_latents(pipe, z_src,  height, width)
-    edit_img = _decode_latents(pipe, z_edit, height, width)
+    edit_img = _decode_latents(pipe, z, height, width)
 
     if save_intermediates and intermediate_out_dir:
         if captured:
