@@ -122,6 +122,7 @@ def build_policy(cfg: dict):
                 k_only_layers=list(range(N_DOUBLE, N_DOUBLE + N_SINGLE)),
                 qk_steps_frac=tuple(cfg.get("qk_steps_frac", [0.0, 1.0])),
                 k_only_steps_frac=tuple(cfg.get("k_only_steps_frac", [0.0, 1.0])),
+                ss_q_steps_frac=tuple(cfg.get("ss_q_steps_frac", [0.0, 0.5])),
                 svd_alpha=cfg.get("svd_alpha", 0.0),
                 svd_layers=cfg.get("svd_layers", [1]),
                 svd_steps_frac=tuple(cfg.get("svd_steps_frac", [0.0, 0.25])),
@@ -333,8 +334,11 @@ def parse_args():
     p.add_argument("--qk_steps_frac", type=float, nargs=2, default=[0.0, 1.0],
                    help="color mode: [start end] fraction of steps for double-stream Q+K injection.")
     p.add_argument("--k_only_steps_frac", type=float, nargs=2, default=[0.0, 1.0],
-                   help="color mode: [start end] fraction of steps for single-stream K-only injection. "
-                        "Reduce end (e.g. 0.0 0.7) if colour change is weak.")
+                   help="color mode: step fraction for single-stream K injection (always-on position lock).")
+    p.add_argument("--ss_q_steps_frac", type=float, nargs=2, default=[0.0, 0.5],
+                   help="color mode: step fraction for single-stream Q injection (identity lock). "
+                        "Default first 50%% of steps. Raise end toward 1.0 for tighter identity; "
+                        "lower end toward 0.0 for stronger colour.")
     p.add_argument("--svd_alpha",   type=float, default=0.0,
                    help="color mode: PFB alpha for optional SVD block hook (0 = disabled). "
                         "Enable (e.g. 1.0) to blend source structural features into edit's residual.")
@@ -423,6 +427,7 @@ def main():
         "color_sam2_model":     args.color_sam2_model,
         "qk_steps_frac":        args.qk_steps_frac,
         "k_only_steps_frac":    args.k_only_steps_frac,
+        "ss_q_steps_frac":      args.ss_q_steps_frac,
         "svd_alpha":            args.svd_alpha,
         "svd_layers":           args.svd_layers,
         "svd_steps_frac":       args.svd_steps_frac,

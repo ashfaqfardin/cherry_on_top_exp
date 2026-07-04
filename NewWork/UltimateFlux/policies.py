@@ -1122,31 +1122,33 @@ class KontextColorPolicy(BasePolicy):
        Edit image-token Q AND K ← source Q and K.
        Text Q/K stay from the edit branch → edit prompt conditions V freely.
 
-    2. Single-stream blocks (19-56) — Q+K injection:
-       Edit image-token Q AND K ← source Q and K.  V is left from edit branch.
-       Q injection prevents the patches from "asking for" edit-coloured features
-       (which causes subtle structural drift), locking the attention query to the
-       source identity.  V from the edit branch still carries the new colour
-       ("blonde", "blue") through all 38 refinement blocks.
+    2. Single-stream blocks (19-56) — graduated injection:
+       • All steps: image K ← source K  (spatial position lock — always on).
+       • First ss_q_steps_frac of steps: image Q ← source Q too.
+         Q lock in early steps prevents edit-conditioned queries from drifting
+         the structure while identity is still forming.
+       • Remaining steps: K-only.  Edit Q is free → edit text can steer V toward
+         the new colour without fighting the source's structural queries.
 
-    This combination preserves identity (face geometry, car shape) while allowing
-    the edit text to drive colour through V at every attention layer.
+    This gives identity lock during structure formation and colour freedom
+    during the appearance-refinement phase where colour actually settles.
 
     Optional PFB (svd_alpha > 0):
         Forward hook at selected double-stream blocks.
         h_edit ← Φ(h_src, α) + (h_edit − Φ(h_edit, α))
-        Adds an extra structural anchor; try only if face still drifts.
 
     Parameters
     ----------
-    qk_layers       : double-stream layers for Q+K injection (default: all 0-18).
-    k_only_layers   : single-stream layers for Q+K injection (default: all 19-56).
-    qk_steps_frac   : step fraction for double-stream Q+K injection.  Default all.
-    k_only_steps_frac: step fraction for single-stream Q+K injection.  Default all.
-                      Reduce end (e.g. 0.0 0.7) if colour change is too weak.
-    svd_alpha       : PFB reweighting factor.  0 = disabled (default).
-    svd_layers      : blocks for PFB hook.  Default [1].
-    svd_steps_frac  : step fraction for PFB.  Default first 25 %.
+    qk_layers         : double-stream layers for Q+K injection (default: 0-18).
+    k_only_layers     : single-stream layers for K (+ early-Q) injection (default: 19-56).
+    qk_steps_frac     : step fraction for double-stream Q+K.  Default all steps.
+    k_only_steps_frac : step fraction for single-stream K injection.  Default all.
+    ss_q_steps_frac   : step fraction for single-stream Q injection.  Default (0, 0.5).
+                        Increase end toward 1.0 for tighter identity; decrease for
+                        stronger colour.
+    svd_alpha         : PFB reweighting factor.  0 = disabled (default).
+    svd_layers        : blocks for PFB hook.  Default [1].
+    svd_steps_frac    : step fraction for PFB.  Default first 25 %.
     """
 
     def __init__(
@@ -1155,16 +1157,18 @@ class KontextColorPolicy(BasePolicy):
         k_only_layers: Optional[List[int]] = None,
         qk_steps_frac: Tuple[float, float] = (0.0, 1.0),
         k_only_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        ss_q_steps_frac: Tuple[float, float] = (0.0, 0.5),
         svd_alpha: float = 0.0,
         svd_layers: Optional[List[int]] = None,
         svd_steps_frac: Tuple[float, float] = (0.0, 0.25),
     ):
-        self._qk_layers       = set(qk_layers if qk_layers is not None
-                                    else range(N_DOUBLE))
-        self._k_only_layers   = set(k_only_layers if k_only_layers is not None
-                                    else range(N_DOUBLE, N_LAYERS))
-        self.qk_steps_frac    = qk_steps_frac
+        self._qk_layers        = set(qk_layers if qk_layers is not None
+                                     else range(N_DOUBLE))
+        self._k_only_layers    = set(k_only_layers if k_only_layers is not None
+                                     else range(N_DOUBLE, N_LAYERS))
+        self.qk_steps_frac     = qk_steps_frac
         self.k_only_steps_frac = k_only_steps_frac
+        self.ss_q_steps_frac   = ss_q_steps_frac
         self.svd_alpha         = svd_alpha
         self._svd_layers       = set(svd_layers if svd_layers is not None else [1])
         self.svd_steps_frac    = svd_steps_frac
@@ -1209,23 +1213,28 @@ class KontextColorPolicy(BasePolicy):
             return torch.cat([q_src, q_edit]), torch.cat([k_src, k_edit]), v
 
         else:
-            # ── Single-stream: Q+K injection ──────────────────────────────��─
-            # txt_len == 0 here; text prefix offset comes from max_sequence_length.
-            # Injecting Q locks the attention queries to the source identity state,
-            # preventing edit-conditioned queries from causing structural drift.
-            # V stays from the edit branch → colour change unaffected.
+            # ── Single-stream: graduated injection ──────────────────────────
+            # K injection active for the full k_only_steps_frac window (always
+            # locks spatial positions).  Q injection active only for the shorter
+            # ss_q_steps_frac window (locks structural queries in early steps,
+            # then releases so edit text can strengthen colour via V in late steps).
             if layer not in self._k_only_layers:
                 return q, k, v
             if not _step_active(step, n_steps, self.k_only_steps_frac):
                 return q, k, v
             img_offset = self._txt_len
-            q_src, q_edit = q.chunk(2)
             k_src, k_edit = k.chunk(2)
-            q_edit = q_edit.clone()
             k_edit = k_edit.clone()
-            q_edit[:, :, img_offset:, :] = q_src[:, :, img_offset:, :]
             k_edit[:, :, img_offset:, :] = k_src[:, :, img_offset:, :]
-            return torch.cat([q_src, q_edit]), torch.cat([k_src, k_edit]), v
+            new_k = torch.cat([k_src, k_edit])
+
+            if _step_active(step, n_steps, self.ss_q_steps_frac):
+                q_src, q_edit = q.chunk(2)
+                q_edit = q_edit.clone()
+                q_edit[:, :, img_offset:, :] = q_src[:, :, img_offset:, :]
+                return torch.cat([q_src, q_edit]), new_k, v
+
+            return q, new_k, v
 
     def get_block_hooks(self) -> Dict[int, Callable]:
         if self.svd_alpha <= 0.0:
