@@ -61,6 +61,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name woman_hair_color \
     --source_prompt "a woman with black hair" \
     --edit_prompt   "a woman with blonde hair" \
+    --ss_q_steps_frac 0.0 0.3 \
     --inject_layers color \
     --save_intermediates --intermediate_every 4 \
     --seed 35
@@ -73,6 +74,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name car_color_change \
     --source_prompt "a red sports car on a road" \
     --edit_prompt   "a blue sports car on a road" \
+    --ss_q_steps_frac 0.0 0.3 \
     --inject_layers color \
     --save_intermediates --intermediate_every 4 \
     --seed 40
