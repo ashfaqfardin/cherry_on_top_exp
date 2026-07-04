@@ -748,35 +748,35 @@ def generate_masked_delta_flow(
     max_sequence_length: int = 512,
     device: str = "cuda",
     delta_scale: float = 2.0,
+    delta_start_step: Optional[int] = None,
     save_intermediates: bool = False,
     intermediate_out_dir: Optional[str] = None,
     intermediate_every: int = 4,
 ) -> Tuple[Image.Image, Image.Image]:
     """
-    Two-phase masked delta-flow colour editing.
+    Three-phase masked delta-flow colour editing.
 
-    "Minus the current colour, add the new colour" in velocity space:
+    Tension: colour lives in HIGH-NOISE early steps; identity lives in those same steps.
+    Solution: source-only lock for the first delta_start_step steps, then delta injection
+    for the rest.  The mask is built on the clean fully-denoised source image (not a
+    noisy intermediate) so SAM2 gets the best possible input.
 
-        v_delta = v_edit(z, t) - v_src(z, t)
-            ↑ pure colour signal — structure cancels because both use the same z
+    Phase 1  (steps 0 → num_steps):
+        Full source-only run from z_T.  Produces clean src_img for SAM2.
+        At step mask_build_step: one B=1 probe with the edit prompt captures
+        img→text attention that localises the editing region.
+        At step delta_start_step (default num_steps//3 ≈ 9): checkpoint z is saved.
 
-        z += dt * ( v_src  +  delta_scale * mask * v_delta )
-                      ↑ identity                ↑ colour injected only in editing region
+    Mask:
+        SAM2 segments src_img using the attention-peak pixel as a point prompt.
+        Fallback: attention topk on captured scores.
 
-    Phase 1  (steps 0 → mask_build_step-1):
-        Single-branch source-only denoising.  Both edit and source start identically —
-        no structural divergence before the colour injection begins.
-
-    Mask building  (at step mask_build_step):
-        One probe forward pass with the edit prompt captures img→text attention.
-        SAM2 (if enabled): decode the intermediate image → point-prompted segment.
-        Attention topk (default): top_k_frac tokens most attending to the colour word.
-
-    Phase 2  (steps mask_build_step → num_steps-1):
-        One B=3 batch per step: [z_src+src, z_edit+src, z_edit+edit]
-            v_src_ref, v_src, v_edit = transformer(z_b3, t, prompts)
-        z_src  advances with v_src_ref  (clean source reference).
-        z_edit advances with v_src + delta_scale * mask * (v_edit - v_src).
+    Phase 2  (steps delta_start_step → num_steps-1):
+        Branch off from the saved checkpoint.  B=2 per step:
+            [z+src, z+edit] → v_src, v_edit
+            z += dt * (v_src + delta_scale * mask * (v_edit − v_src))
+        Steps 0→delta_start_step-1 followed source exactly → identity locked.
+        Steps delta_start_step→num_steps-1 inject colour delta → colour changes.
 
     Returns (source_image, edit_image).
     """
@@ -847,31 +847,37 @@ def generate_masked_delta_flow(
             txt_ids=src_txt, img_ids=img_ids, return_dict=False,
         )[0]
 
-    mask_step = getattr(policy, "mask_build_step", num_steps // 2)
+    mask_step  = getattr(policy, "mask_build_step", num_steps // 2)
+    # delta_start_step: source-only lock for steps 0→N-1; delta injection from N.
+    # Default: num_steps//3 ≈ 9 for 28 steps — locks structure, leaves ~19 colour steps.
+    eff_start = (delta_start_step if delta_start_step is not None
+                 else max(0, num_steps // 3))
+    eff_start = max(0, min(eff_start, num_steps - 1))
 
     try:
         from diffusers.models.attention_processor import FluxAttnProcessor
     except ImportError:
         from diffusers.models.attention_processor import FluxAttnProcessor2_0 as FluxAttnProcessor
 
-    # ── Phase 1: full source run + attention probe at mask_build_step ────────
-    # Running the complete source trajectory (all num_steps) serves two purposes:
-    #   1. Produces a clean, fully-denoised src_img for SAM2 segmentation.
-    #   2. At step mask_build_step, a one-shot probe with the edit prompt captures
-    #      img→text attention that localises the editing region (hair / car body).
-    # Colour information lives in the HIGH-NOISE early timesteps.  The edit run
-    # (Phase 2) therefore starts from z_T and runs ALL num_steps with the delta,
-    # giving the colour signal its full trajectory window to accumulate.
-    print(f"[MaskedDeltaFlow] Phase 1: full source run ({num_steps} steps)…")
-    z   = z_T.clone()
-    cap = None
-    z1_cache: dict = {}   # step → z (CPU tensor) for intermediate grid
+    # ── Phase 1: full source run ───────────────────────────────────────────────
+    # Purposes:
+    #   1. Save checkpoint at eff_start for Phase 2 to branch off from.
+    #   2. Probe at mask_step with edit prompt → attention for SAM2 point.
+    #   3. Continue to completion → clean src_img for SAM2 segmentation.
+    print(f"[MaskedDeltaFlow] Phase 1: source run ({num_steps} steps), "
+          f"checkpoint@{eff_start}, probe@{mask_step}…")
+    z            = z_T.clone()
+    z_checkpoint = None
+    cap          = None
+    z1_cache: dict = {}   # step → z (CPU) for intermediate grid
 
     for i in range(num_steps):
         dt = (sigmas[i + 1] - sigmas[i]).to(mdtype)
 
-        # Probe: one extra B=1 edit-prompt pass to capture attention scores.
-        # Fired exactly once at mask_build_step; does NOT alter z.
+        if i == eff_start:
+            z_checkpoint = z.clone()   # save before this step
+
+        # Probe: one B=1 edit-prompt pass at mask_step — does NOT alter z.
         if i == mask_step and cap is None:
             _cap = _MaskCaptureAttnProc(txt_len=max_sequence_length)
             pipe.transformer.set_attn_processor(_cap)
@@ -889,7 +895,7 @@ def generate_masked_delta_flow(
     src_img = _decode_latents(pipe, z, height, width)
 
     # ── Mask building on clean source image ───────────────────────────────────
-    print(f"[MaskedDeltaFlow] Building mask from source image (probe at step {mask_step})…")
+    print(f"[MaskedDeltaFlow] Building mask from src_img (probe@{mask_step})…")
     use_sam2 = getattr(policy, "use_sam2", False)
 
     if use_sam2 and cap is not None and cap.edit_scores is not None:
@@ -905,11 +911,11 @@ def generate_masked_delta_flow(
         try:
             from sam2.build_sam import build_sam2_hf
             from sam2.sam2_image_predictor import SAM2ImagePredictor
-            print(f"  [SAM2] point=({px},{py}) on clean source image, "
+            print(f"  [SAM2] point=({px},{py}) on clean src_img, "
                   f"loading {policy.sam2_model_id}…")
             pred = SAM2ImagePredictor(build_sam2_hf(policy.sam2_model_id,
                                                     device=str(exec_device)))
-            pred.set_image(np.array(src_img.convert("RGB")))   # clean image!
+            pred.set_image(np.array(src_img.convert("RGB")))
             m_out, s_out, _ = pred.predict(
                 point_coords=np.array([[px, py]]),
                 point_labels=np.array([1]), multimask_output=True,
@@ -938,21 +944,23 @@ def generate_masked_delta_flow(
 
     # edit_mask: (1, N, 1)  1 = editing region  0 = preserved
     edit_mask_2d = (1.0 - policy._mask).to(device=exec_device, dtype=mdtype).view(1, -1, 1)
+    n_delta = num_steps - eff_start
 
-    # ── Phase 2: masked delta-flow for ALL num_steps from z_T ────────────────
-    # Starting from the same z_T means colour-determining early timesteps
-    # receive the full delta signal.  B=2 per step: same z with both prompts.
-    print(f"[MaskedDeltaFlow] Phase 2: delta-flow from z_T "
-          f"({num_steps} steps, delta_scale={delta_scale}, "
+    # ── Phase 2: delta-flow from checkpoint ───────────────────────────────────
+    # Branch off from z_checkpoint (= source at step eff_start).
+    # Steps 0→eff_start-1 were source-only → identity locked.
+    # Steps eff_start→num_steps-1: B=2 masked delta → colour changes.
+    print(f"[MaskedDeltaFlow] Phase 2: delta from step {eff_start} "
+          f"({n_delta} steps, delta_scale={delta_scale}, "
           f"{int(edit_mask_2d.sum().item())} editing tokens)…")
 
-    z      = z_T.clone()
+    z        = (z_checkpoint if z_checkpoint is not None else z_T).clone()
     captured: List[Tuple[int, int, torch.Tensor]] = []
 
-    for i in range(num_steps):
+    for i in range(eff_start, num_steps):
         dt = (sigmas[i + 1] - sigmas[i]).to(mdtype)
 
-        # B=2: same current z with source + edit prompts.
+        # B=2: same z with source + edit prompts.
         # v_edit − v_src = pure colour delta; structural components cancel.
         z_b2  = torch.cat([z, z])
         pe_b2 = torch.cat([src_pe, edit_pe])

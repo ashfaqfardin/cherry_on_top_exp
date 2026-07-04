@@ -180,6 +180,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     save_intermediates = cfg.get("save_intermediates", False)
     intermediate_every = cfg.get("intermediate_every", 4)
     delta_scale        = cfg.get("delta_scale", 2.0)
+    delta_start_step   = cfg.get("delta_start_step", None)
 
     policy = build_policy(cfg)
 
@@ -209,6 +210,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             max_sequence_length=max_seq_len,
             device=device,
             delta_scale=delta_scale,
+            delta_start_step=delta_start_step,
             save_intermediates=save_intermediates,
             intermediate_out_dir=run_dir if save_intermediates else None,
             intermediate_every=intermediate_every,
@@ -339,8 +341,12 @@ def parse_args():
     p.add_argument("--pfb_alpha",   type=float, default=1.0,
                    help="Unused; kept for backward compat")
     p.add_argument("--delta_scale", type=float, default=2.0,
-                   help="color mode (masked delta-flow): amplification factor for the colour delta "
-                        "(v_edit - v_src). 1.0 = 1:1 colour change; try 2.0–3.0 for strong colour.")
+                   help="color mode: amplification for colour delta (v_edit - v_src). "
+                        "1.0 = clean switch; 2.0 = extrapolate; try 1.5–2.5.")
+    p.add_argument("--delta_start_step", type=int, default=None,
+                   help="color mode: step to branch from source and start delta injection "
+                        "(default: num_steps//3 ≈ 9). Locks identity for steps 0..N-1, "
+                        "gives colour delta for steps N..num_steps-1.")
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--num_steps",     type=int, default=28)
     p.add_argument("--guidance_scale",type=float, default=3.5)
@@ -413,6 +419,7 @@ def main():
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
         "delta_scale":          args.delta_scale,
+        "delta_start_step":     args.delta_start_step,
         "seed":               args.seed,
         "num_steps":          args.num_steps,
         "guidance_scale":     args.guidance_scale,

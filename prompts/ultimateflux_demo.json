@@ -113,6 +113,7 @@
       "top_k_frac": 0.25,
       "mask_build_step": 20,
       "delta_scale": 2.0,
+      "delta_start_step": 9,
       "color_sam2": true,
       "seed": 35
     },
@@ -126,6 +127,7 @@
       "top_k_frac": 0.3,
       "mask_build_step": 20,
       "delta_scale": 2.0,
+      "delta_start_step": 9,
       "color_sam2": true,
       "seed": 40
     },
