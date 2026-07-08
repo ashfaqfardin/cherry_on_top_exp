@@ -705,8 +705,8 @@ def _auto_fg_mask_sam2(
         generator = SAM2AutomaticMaskGenerator(
             sam2,
             points_per_side=32,
-            pred_iou_thresh=0.88,
-            stability_score_thresh=0.95,
+            pred_iou_thresh=0.86,
+            stability_score_thresh=0.88,  # lower → keeps whole-body masks
         )
 
         img_np = np.array(source_image.convert("RGB"))
@@ -716,18 +716,42 @@ def _auto_fg_mask_sam2(
             print("[UltimateFlux] SAM2 found no masks in the source image.")
             return None
 
-        # Score each mask: prefer high stability + centred in the image
         H, W = img_np.shape[:2]
+        total_px = H * W
         cx, cy = W / 2.0, H / 2.0
 
         def _score(m):
             bx = m['bbox'][0] + m['bbox'][2] / 2.0
             by = m['bbox'][1] + m['bbox'][3] / 2.0
-            dist_norm = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5 / max(W, H)
-            return m['stability_score'] - dist_norm
+            dist_norm  = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5 / max(W, H)
+            area_frac  = m['area'] / total_px
+            # Reward stability and larger area; penalise off-centre masks.
+            return m['stability_score'] + 0.4 * area_frac - 0.5 * dist_norm
 
         best = max(masks, key=_score)
-        fg   = (best['segmentation'].astype(np.uint8) * 255)
+        best_seg = best['segmentation'].astype(bool)
+        best_area = best_seg.sum()
+
+        # Merge any mask that overlaps ≥20% of the best mask (union partial parts).
+        combined = best_seg.copy()
+        for m in masks:
+            if m is best:
+                continue
+            seg = m['segmentation'].astype(bool)
+            overlap = (seg & best_seg).sum()
+            if overlap >= 0.20 * best_area:
+                combined |= seg
+
+        # Morphological closing: fill small holes so the whole body is covered.
+        try:
+            from scipy.ndimage import binary_fill_holes, binary_closing
+            struct = np.ones((15, 15), dtype=bool)
+            combined = binary_closing(combined, structure=struct)
+            combined = binary_fill_holes(combined)
+        except ImportError:
+            pass  # scipy not installed — skip hole-filling
+
+        fg = (combined.astype(np.uint8) * 255)
         return Image.fromarray(fg)
 
     except Exception as exc:
