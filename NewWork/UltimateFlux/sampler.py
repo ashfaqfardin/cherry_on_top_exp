@@ -523,8 +523,15 @@ def _save_color_mask(policy, out_dir: str, height: int, width: int) -> None:
     import numpy as np
 
     mask = getattr(policy, "_mask", None)
+    invert = True  # ColorCtrlPolicy convention: 0=edit, 1=preserve → invert for white=edit
     if mask is None:
-        return
+        # BackgroundReplacePolicy stores _token_mask: (1,1,L_img), 1=foreground(preserve)
+        token_mask = getattr(policy, "_token_mask", None)
+        if token_mask is None:
+            return
+        mask = token_mask.squeeze()  # (L_img,)
+        # 1=foreground=preserve, 0=background=edit → same convention as ColorCtrlPolicy
+        invert = True
 
     # FLUX packs latents: 1024px → 128px (VAE ÷8) → 64px (÷2 pack) → 64×64 = 4096 tokens
     h_tok = height // 16
@@ -534,7 +541,7 @@ def _save_color_mask(policy, out_dir: str, height: int, width: int) -> None:
         return
 
     # mask: 0 = editing region, 1 = preserved → invert so editing shows white
-    mask_2d   = (1.0 - mask.float().cpu()).reshape(h_tok, w_tok).numpy()
+    mask_2d   = ((1.0 - mask.float().cpu()) if invert else mask.float().cpu()).reshape(h_tok, w_tok).numpy()
     mask_img  = Image.fromarray((mask_2d * 255).astype(np.uint8), mode="L")
     mask_img  = mask_img.resize((width, height), Image.NEAREST)
 
