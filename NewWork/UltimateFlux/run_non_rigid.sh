@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
-# Task 1 — Non-rigid editing (FreeFlux content-similarity layers)
-# Preserves appearance while changing pose / action.
+# Task 1 — Non-rigid editing (two-tier K,V injection)
+#
+# Injection strategy:
+#   Tier 1 — TIER_A (FreeFlux content-similarity layers, both stream types):
+#       Full K,V injection at all steps → subject identity and appearance.
+#   Tier 2 — ALL single-stream layers (19-56):
+#       Full K,V injection at all steps → background scene locked to source.
+#       Single-stream blocks refine texture/detail; injecting here prevents
+#       background drift without affecting pose semantics.
+#   Free double-stream layers [1-6, 11-17] (13 blocks):
+#       Edit prompt drives new pose/action through text-image interaction here.
+#
+# Tuning:
+#   --inject_steps_frac 0.0 0.7   Reduce injection window if pose change is weak.
+#   --no_inject_all_single         Use TIER_A only (FreeFlux original); may drift background.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

@@ -534,30 +534,55 @@ class ObjectAdditionPolicy(BasePolicy):
 
 class NonRigidPolicy(BasePolicy):
     """
-    Freeze appearance via image-token K,V injection at FreeFlux's content-similarity layers.
-    Structure layers (not in inject_layers) are left free, allowing pose/shape changes.
+    Two-tier K,V injection for non-rigid pose/action editing.
 
-    Layer set defaults to TIER_A — FreeFlux's dev-validated content-similarity layers.
+    Tier 1 — TIER_A (content-similarity layers, both double- and single-stream):
+        Full K,V injection at all steps. Matches FreeFlux mutual self-attention
+        control. Preserves subject identity and appearance.
+
+    Tier 2 — ALL single-stream layers (19-56):
+        Full K,V injection at all steps. Single-stream blocks refine texture and
+        background detail; injecting here locks the background scene so it stays
+        pixel-consistent with the source. Does NOT prevent pose change because
+        pose semantics are established in double-stream blocks (text-image joint
+        processing), which are left free except for the TIER_A subset.
+
+    Free layers (13 double-stream blocks not in TIER_A: [1-6, 11-17]):
+        Edit prompt drives new pose/action through text-image interaction here.
+
+    Parameters
+    ----------
+    inject_layers     : TIER_A double+single-stream layers. Default TIER_A.
+    inject_steps_frac : Step window for all injection. Default all steps.
+    inject_all_single : If True (default), also inject ALL single-stream layers.
     """
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        inject_all_single: bool = True,
     ):
-        self.inject_layers = inject_layers if inject_layers is not None else TIER_A
+        self.inject_layers    = set(inject_layers if inject_layers is not None else TIER_A)
         self.inject_steps_frac = inject_steps_frac
-        self._txt_len_single = 512  # updated in pre_generate
+        self.inject_all_single = inject_all_single
+        self._txt_len_single  = 512
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
         self._txt_len_single = max_sequence_length
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        if layer in self.inject_layers and _step_active(step, n_steps, self.inject_steps_frac):
-            # txt_len > 0 for double-stream (sampler sets it from encoder_hidden_states).
-            # txt_len == 0 for single-stream (no separate encoder_hidden_states), but the
-            # hidden_states still carry a text prefix of length _txt_len_single.
-            img_offset = txt_len if txt_len > 0 else self._txt_len_single
+        img_offset = txt_len if txt_len > 0 else self._txt_len_single
+        is_single  = txt_len == 0
+
+        inject = (
+            (layer in self.inject_layers                              # Tier 1: TIER_A
+             and _step_active(step, n_steps, self.inject_steps_frac))
+            or (self.inject_all_single and is_single                  # Tier 2: all single-stream
+                and _step_active(step, n_steps, self.inject_steps_frac))
+        )
+
+        if inject:
             k, v = _kv_full_inject(k, v, img_offset)
         return q, k, v
 

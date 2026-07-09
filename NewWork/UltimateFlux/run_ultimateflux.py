@@ -74,7 +74,8 @@ def build_policy(cfg: dict):
 
     if task == "non_rigid":
         return NonRigidPolicy(
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 0.8])),
+            inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
+            inject_all_single=cfg.get("inject_all_single", True),
         )
 
     if task == "object_add":
@@ -84,7 +85,7 @@ def build_policy(cfg: dict):
         return ObjectAdditionPolicy(
             added_word=cfg.get("added_word", None),
             placement_mask=mask,
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+            inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
             derive_step=cfg.get("derive_step", 7),
             top_k_frac=cfg.get("top_k_frac", 0.15),
         )
@@ -95,7 +96,7 @@ def build_policy(cfg: dict):
             mask = Image.open(cfg["mask_image"]).convert("L")
         return ObjectReplacementPolicy(
             mask=mask,
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 0.9])),
+            inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 0.9),
         )
 
     if task == "bg_replace":
@@ -135,7 +136,7 @@ def build_policy(cfg: dict):
             # key_only=False: inject K+V (stronger structure lock, weaker colour change).
             return FineGrainedAttrPolicy(
                 inject_layers=list(range(N_DOUBLE)),  # _DOUBLE_STREAM: 0-18
-                inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+                inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
                 key_only=cfg.get("key_only", True),
             )
         elif inject_layers_raw == "tier_a":
@@ -144,7 +145,7 @@ def build_policy(cfg: dict):
             inject_layers = None            # default → _PRESERVE_LAYERS, K+V
         return FineGrainedAttrPolicy(
             inject_layers=inject_layers,
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+            inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
         )
 
     if task == "style":
@@ -302,6 +303,14 @@ def parse_args():
                    help="Disable SAM2; fall back to TIER_A global injection (bg_replace)")
     p.add_argument("--sam2_model_id", default="facebook/sam2-hiera-large",
                    help="HuggingFace SAM2 model ID (bg_replace)")
+    p.add_argument("--inject_steps_frac", type=float, nargs=2, default=None,
+                   metavar=("START", "END"),
+                   help="Non-rigid / attr_edit: fraction of denoising steps to apply injection. "
+                        "Default depends on task (non_rigid: 0.0 1.0, attr_edit: 0.0 1.0).")
+    p.add_argument("--inject_all_single", action="store_true", default=True,
+                   help="Non-rigid: also inject K,V at ALL single-stream layers to lock background. Default True.")
+    p.add_argument("--no_inject_all_single", dest="inject_all_single", action="store_false",
+                   help="Non-rigid: only inject at TIER_A layers (disable background locking).")
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "double_stream", "tier_a"],
                    help="attr_edit mode: color=Kontext Q+K injection (colour change), double_stream=K+V in 19 joint blocks, tier_a=breed/shape change")
@@ -413,6 +422,8 @@ def main():
         "fg_mask_image":  args.fg_mask_image,
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
+        "inject_steps_frac":    args.inject_steps_frac,
+        "inject_all_single":    args.inject_all_single,
         "inject_layers":        args.inject_layers,
         "key_only":             args.key_only,
         "reweight_scale":       args.reweight_scale,
