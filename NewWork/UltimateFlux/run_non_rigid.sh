@@ -18,29 +18,25 @@
 #
 #   Reference: FreeFlux run_non_rigid.py  layer_idx=[0,7,8,9,10,18,25,28,37,42,45,50,56]
 #
-# Colour preservation at the attention level (SynPS + Untwisting RoPE inspired):
+# Colour preservation at the attention level (SynPS CVPR 2026, arXiv:2512.14423):
 #
 #   --v_blend 0.3  (default): At the 44 non-TIER_A (position-dependent) layers,
 #   blend 30% source V into edit V: V_edit = 0.3*V_src + 0.7*V_edit_orig.
-#   This is sub-cascade: the 70% edit contribution at every layer prevents the
-#   residual from converging to source; the 30% provides direct colour grounding.
-#   (100% V injection caused cascade; 0% left colour to drift — 30% is the balance.)
+#   V blend does NOT touch K — the Q×K attention pattern stays 100% edit-conditioned,
+#   so the pose change (Q_edit attending differently from Q_src) is preserved.
+#   The 30% V_src provides direct colour grounding at every non-TIER_A layer.
 #
-#   --k_s_lf 0.3  (default): Frequency-aware K blend at non-TIER_A layers.
-#   After RoPE encoding, head dim d=0,1 are high-freq (most spatially sensitive);
-#   d=D-2,D-1 are low-freq (most semantic/content-like). Source K weight interpolates
-#   from 0% at d=0 (no spatial lock) to k_s_lf=30% at d=D-1 (semantic guidance).
-#   Approximates Untwisting RoPE (arXiv:2602.05013) without de-rotation.
+#   WHY NO K BLEND AT NON-TIER_A: Source K at position-dependent layers corrupts
+#   the Q×K attention pattern → attention shifts toward source spatial positions →
+#   model generates source spatial structure → bird doesn't fly.  Only V is blended.
 #
-#   --preserve_color  (opt): Additionally apply Reinhard LAB statistics transfer
-#   post-generation. Use only if v_blend alone is insufficient.
-#
-# Tuning:
-#   --v_blend 0.5         More source colour at non-TIER_A (stronger but riskier).
-#   --v_blend 0.1         Minimal colour injection (more pose freedom).
-#   --k_s_lf 0.0          Disable K blend (V blend only, simpler).
-#   --v_blend 0.0         Disable both (TIER_A K+V only; colour will drift).
-#   --inject_steps_frac 0.08 1.0  Skip first 4 steps for drastic pose changes.
+# Tuning (if pose is suppressed by v_blend):
+#   --v_blend_steps_frac 0.0 0.3   Limit V blend to first 15/50 steps only.
+#                                   Colour is established early; pose develops freely later.
+#   --v_blend 0.1                  Reduce V blend weight (less colour, more pose freedom).
+#   --v_blend 0.0                  Disable V blend entirely (colour will drift).
+#   --preserve_color               Add Reinhard LAB post-processing as fallback.
+#   --inject_steps_frac 0.08 1.0   Skip first 4 TIER_A steps for drastic pose changes.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

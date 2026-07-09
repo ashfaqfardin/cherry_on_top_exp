@@ -625,18 +625,30 @@ class NonRigidPolicy(BasePolicy):
     for high-freq dims and k_s_lf for low-freq dims — semantic content guidance
     without spatial locking.
 
-    v_blend=1.0 / k_s_lf=1.0 (i.e., full injection everywhere) are the failure mode.
-    Safe range: v_blend ∈ [0.1, 0.5], k_s_lf ∈ [0.0, 0.5].
+    WHY K BLEND AT NON-TIER_A IS FORBIDDEN:
+    Untwisting RoPE (arXiv:2602.05013) was designed for style transfer — injecting
+    K from a style reference to retrieve content-similar V.  For NON-RIGID editing,
+    injecting source K at position-dependent layers (even partially, even at
+    low-freq dims) corrupts the Q×K attention pattern, which is the primary driver
+    of the edit pose.  Q_edit × K_src_partial → attention shifts toward source
+    spatial positions → model generates source-like spatial structure → bird doesn't
+    fly.  K is strictly limited to TIER_A layers.
+
+    V blend sub-cascade condition: v_blend=1.0 at all 44 layers collapses to
+    identical output.  Safe range: v_blend ∈ [0.1, 0.5].
 
     Parameters
     ----------
-    inject_layers    : K+V injection layers. Default TIER_A (13 layers).
-    inject_steps_frac: Denoising step window. Default all steps (0.0, 1.0).
-    v_blend          : Source V blend at non-TIER_A layers (0=off, 0.3=default).
-    k_s_lf           : Source K weight for low-freq head dims at non-TIER_A (0=off).
-                       0.0 at high-freq dims always (prevents spatial lock).
-    preserve_color   : Apply Reinhard LAB statistics transfer after generation.
-                       Fallback if v_blend alone is insufficient.
+    inject_layers     : K+V injection layers. Default TIER_A (13 layers).
+    inject_steps_frac : Denoising step window. Default all steps (0.0, 1.0).
+    v_blend           : Source V blend at non-TIER_A layers (0=off, 0.3=default).
+                        Directly grounds edit branch colour from source V without
+                        touching the Q×K attention pattern.
+    v_blend_steps_frac: Step window for non-TIER_A V blend. Default all steps.
+                        Use (0.0, 0.3) to limit V injection to first 15 of 50 steps
+                        if pose is still suppressed with v_blend=0.3.
+    preserve_color    : Apply Reinhard LAB statistics transfer after generation.
+                        Fallback if v_blend alone is insufficient.
     """
 
     def __init__(
@@ -644,19 +656,19 @@ class NonRigidPolicy(BasePolicy):
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
         v_blend: float = 0.3,
-        k_s_lf: float = 0.3,
+        v_blend_steps_frac: Tuple[float, float] = (0.0, 1.0),
         preserve_color: bool = False,
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
-        self.inject_layers     = set(inject_layers if inject_layers is not None
-                                     else TIER_A)
-        self.inject_steps_frac = inject_steps_frac
-        self.v_blend           = v_blend
-        self.k_s_lf            = k_s_lf
-        self.preserve_color    = preserve_color
-        self._txt_len_single   = 512
+        self.inject_layers      = set(inject_layers if inject_layers is not None
+                                      else TIER_A)
+        self.inject_steps_frac  = inject_steps_frac
+        self.v_blend            = v_blend
+        self.v_blend_steps_frac = v_blend_steps_frac
+        self.preserve_color     = preserve_color
+        self._txt_len_single    = 512
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
         self._txt_len_single = max_sequence_length
@@ -670,14 +682,12 @@ class NonRigidPolicy(BasePolicy):
             # TIER_A: full K+V (pose transfer via content-similarity attention)
             k, v = _kv_full_inject(k, v, img_offset)
 
-        elif self.v_blend > 0.0:
-            # Non-TIER_A: partial injection for colour preservation.
-            # K: frequency-aware blend (Untwisting RoPE, arXiv:2602.05013)
-            #    0% at high-freq head dims → no spatial lock
-            #    k_s_lf% at low-freq head dims → semantic/content guidance
-            if self.k_s_lf > 0.0:
-                k = _freq_aware_k_blend(k, img_offset, s_hf=0.0, s_lf=self.k_s_lf)
-            # V: uniform blend — direct colour grounding without cascade
+        elif (self.v_blend > 0.0
+              and _step_active(step, n_steps, self.v_blend_steps_frac)):
+            # Non-TIER_A: V-only partial blend for colour preservation.
+            # K is NEVER injected at non-TIER_A — source K at position-dependent
+            # layers corrupts the Q×K pattern that drives the edit pose.
+            # V blend (30% source) directly grounds colour without spatial locking.
             v_src, v_edit = v.chunk(2)
             v_edit = v_edit.clone()
             v_edit[:, :, img_offset:, :] = (

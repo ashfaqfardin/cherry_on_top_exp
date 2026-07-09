@@ -76,7 +76,7 @@ def build_policy(cfg: dict):
         return NonRigidPolicy(
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
             v_blend=cfg.get("v_blend", 0.3),
-            k_s_lf=cfg.get("k_s_lf", 0.3),
+            v_blend_steps_frac=tuple(cfg["v_blend_steps_frac"]) if cfg.get("v_blend_steps_frac") else (0.0, 1.0),
             preserve_color=cfg.get("preserve_color", False),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
@@ -312,16 +312,17 @@ def parse_args():
                    help="Non-rigid / attr_edit: fraction of denoising steps to apply injection. "
                         "Default depends on task (non_rigid: 0.0 1.0, attr_edit: 0.0 1.0).")
     p.add_argument("--v_blend", type=float, default=0.3,
-                   help="Non-rigid: source V blend at non-TIER_A layers (default 0.3 = 30%%). "
-                        "Injects source colour features into edit branch at the 44 position-dependent "
-                        "layers without full V injection (which causes cascade collapse). "
-                        "Safe range 0.1-0.5. 0 = disabled (TIER_A K+V only). "
-                        "Inspired by SynPS (CVPR 2026) and Untwisting RoPE (arXiv 2602.05013).")
-    p.add_argument("--k_s_lf", type=float, default=0.3,
-                   help="Non-rigid: source K blend at low-freq head dims for non-TIER_A layers "
-                        "(Untwisting RoPE, arXiv 2602.05013). 0 = no K blend. "
-                        "High-freq dims (low head-dim index) always get 0%% source K to avoid spatial lock; "
-                        "low-freq dims get k_s_lf%% for semantic/content guidance. Default 0.3.")
+                   help="Non-rigid: source V blend weight at non-TIER_A layers (default 0.3 = 30%%). "
+                        "V_edit = v_blend*V_src + (1-v_blend)*V_edit_orig. "
+                        "Grounds edit subject colour from source V without touching Q×K (so pose still changes). "
+                        "Safe range 0.1–0.5. 0 = off (TIER_A K+V only, colour drifts). "
+                        "1.0 = cascade collapse. "
+                        "If pose is suppressed, try --v_blend_steps_frac 0.0 0.3 to limit injection to first 30%% of steps.")
+    p.add_argument("--v_blend_steps_frac", type=float, nargs=2, default=None,
+                   metavar=("START", "END"),
+                   help="Non-rigid: step window for non-TIER_A V blend (default: all steps). "
+                        "Use '0.0 0.3' to limit V injection to first 15 of 50 steps. "
+                        "Colour is established early; later steps refine pose without interference.")
     p.add_argument("--preserve_color", dest="preserve_color", action="store_true", default=False,
                    help="Non-rigid: apply Reinhard LAB colour transfer after generation. "
                         "Off by default (v_blend handles colour during generation). "
@@ -448,7 +449,7 @@ def main():
         "sam2_model_id":  args.sam2_model_id,
         "inject_steps_frac":    args.inject_steps_frac,
         "v_blend":              args.v_blend,
-        "k_s_lf":               args.k_s_lf,
+        "v_blend_steps_frac":   args.v_blend_steps_frac,
         "preserve_color":       args.preserve_color,
         "inject_all_single":    args.inject_all_single,
         "bg_steps_frac":        args.bg_steps_frac,
