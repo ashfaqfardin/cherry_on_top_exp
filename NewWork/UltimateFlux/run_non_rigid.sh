@@ -12,8 +12,11 @@
 #       Edit prompt drives new pose/action through text-image interaction here.
 #
 # Tuning:
-#   --inject_steps_frac 0.0 0.7   Reduce injection window if pose change is weak.
-#   --no_inject_all_single         Use TIER_A only (FreeFlux original); may drift background.
+#   --bg_steps_frac 0.5 1.0   Default: background lock starts at step 14/28.
+#                              Raise START (e.g. 0.6 1.0) if pose change is weak.
+#                              Lower START (e.g. 0.3 1.0) if background still drifts.
+#   --no_inject_all_single    Use TIER_A only (FreeFlux original); may lose background.
+#   --inject_steps_frac 0.0 0.8  Shorten TIER_A window if identity is over-locked.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

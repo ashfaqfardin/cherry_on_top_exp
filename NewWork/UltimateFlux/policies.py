@@ -537,24 +537,27 @@ class NonRigidPolicy(BasePolicy):
     Two-tier K,V injection for non-rigid pose/action editing.
 
     Tier 1 — TIER_A (content-similarity layers, both double- and single-stream):
-        Full K,V injection at all steps. Matches FreeFlux mutual self-attention
-        control. Preserves subject identity and appearance.
+        Full K,V injection at ALL steps. Matches FreeFlux mutual self-attention
+        control. Anchors subject identity and appearance throughout denoising.
 
     Tier 2 — ALL single-stream layers (19-56):
-        Full K,V injection at all steps. Single-stream blocks refine texture and
-        background detail; injecting here locks the background scene so it stays
-        pixel-consistent with the source. Does NOT prevent pose change because
-        pose semantics are established in double-stream blocks (text-image joint
-        processing), which are left free except for the TIER_A subset.
+        Full K,V injection starting at bg_steps_frac (default: second half of
+        denoising). Early steps are left free in single-stream so the new pose
+        / action can emerge through all 38 refinement blocks. Once the broad
+        pose structure is committed (mid-denoising), the background is locked
+        by injecting source K,V at all single-stream layers.
 
-    Free layers (13 double-stream blocks not in TIER_A: [1-6, 11-17]):
-        Edit prompt drives new pose/action through text-image interaction here.
+    Free layers at every step:
+        13 double-stream blocks not in TIER_A [1-6, 11-17]. Edit prompt drives
+        new pose through text-image interaction in these blocks.
 
     Parameters
     ----------
-    inject_layers     : TIER_A double+single-stream layers. Default TIER_A.
-    inject_steps_frac : Step window for all injection. Default all steps.
-    inject_all_single : If True (default), also inject ALL single-stream layers.
+    inject_layers     : Content-similarity layers for Tier 1. Default TIER_A.
+    inject_steps_frac : Step window for Tier 1 (TIER_A). Default all steps.
+    inject_all_single : Enable Tier 2 (background lock). Default True.
+    bg_steps_frac     : Step window for Tier 2 (all single-stream). Default
+                        second half (0.5, 1.0) so pose can form in early steps.
     """
 
     def __init__(
@@ -562,11 +565,13 @@ class NonRigidPolicy(BasePolicy):
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
         inject_all_single: bool = True,
+        bg_steps_frac: Tuple[float, float] = (0.5, 1.0),
     ):
-        self.inject_layers    = set(inject_layers if inject_layers is not None else TIER_A)
+        self.inject_layers     = set(inject_layers if inject_layers is not None else TIER_A)
         self.inject_steps_frac = inject_steps_frac
         self.inject_all_single = inject_all_single
-        self._txt_len_single  = 512
+        self.bg_steps_frac     = bg_steps_frac
+        self._txt_len_single   = 512
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
         self._txt_len_single = max_sequence_length
@@ -576,10 +581,10 @@ class NonRigidPolicy(BasePolicy):
         is_single  = txt_len == 0
 
         inject = (
-            (layer in self.inject_layers                              # Tier 1: TIER_A
+            (layer in self.inject_layers                               # Tier 1: TIER_A all steps
              and _step_active(step, n_steps, self.inject_steps_frac))
-            or (self.inject_all_single and is_single                  # Tier 2: all single-stream
-                and _step_active(step, n_steps, self.inject_steps_frac))
+            or (self.inject_all_single and is_single                   # Tier 2: all single-stream
+                and _step_active(step, n_steps, self.bg_steps_frac))  # late steps only
         )
 
         if inject:

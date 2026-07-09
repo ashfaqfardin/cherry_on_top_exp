@@ -76,6 +76,7 @@ def build_policy(cfg: dict):
         return NonRigidPolicy(
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
             inject_all_single=cfg.get("inject_all_single", True),
+            bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.5, 1.0),
         )
 
     if task == "object_add":
@@ -311,6 +312,11 @@ def parse_args():
                    help="Non-rigid: also inject K,V at ALL single-stream layers to lock background. Default True.")
     p.add_argument("--no_inject_all_single", dest="inject_all_single", action="store_false",
                    help="Non-rigid: only inject at TIER_A layers (disable background locking).")
+    p.add_argument("--bg_steps_frac", type=float, nargs=2, default=None,
+                   metavar=("START", "END"),
+                   help="Non-rigid: step window for background-lock (all-single-stream) injection. "
+                        "Default 0.5 1.0 — starts at halfway so early steps can establish the new pose. "
+                        "Lower START for stronger background lock; raise for more pose freedom.")
     p.add_argument("--inject_layers", default=None,
                    choices=["color", "double_stream", "tier_a"],
                    help="attr_edit mode: color=Kontext Q+K injection (colour change), double_stream=K+V in 19 joint blocks, tier_a=breed/shape change")
@@ -424,6 +430,7 @@ def main():
         "sam2_model_id":  args.sam2_model_id,
         "inject_steps_frac":    args.inject_steps_frac,
         "inject_all_single":    args.inject_all_single,
+        "bg_steps_frac":        args.bg_steps_frac,
         "inject_layers":        args.inject_layers,
         "key_only":             args.key_only,
         "reweight_scale":       args.reweight_scale,
