@@ -642,8 +642,9 @@ class NonRigidPolicy(BasePolicy):
         v_blend_steps_frac: Tuple[float, float] = (0.0, 1.0),
         preserve_color: bool = False,
         synps: bool = True,
-        m_min: float = 0.9,
-        m_max: float = 1.0,
+        m_min: float = 0.7,
+        m_max: float = 0.95,
+        static_w: Optional[float] = None,
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
@@ -656,10 +657,11 @@ class NonRigidPolicy(BasePolicy):
         self.synps              = synps
         self.m_min              = m_min
         self.m_max              = m_max
+        self.static_w           = static_w   # when set: bypass M_t, use this w always
         self._txt_len_single    = 512
         # SynPS per-generation state
-        self.current_w: float       = 1.0
-        self._last_step: int        = -1
+        self.current_w: float        = static_w if static_w is not None else 1.0
+        self._last_step: int         = -1
         self._m_scratch: List[float] = []
         # Side-channel state written by sampler before each inject_qkv call
         self._raw_k      = None
@@ -668,7 +670,7 @@ class NonRigidPolicy(BasePolicy):
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
         self._txt_len_single = max_sequence_length
         # Reset SynPS state for each new generation run
-        self.current_w  = 1.0
+        self.current_w  = self.static_w if self.static_w is not None else 1.0
         self._last_step = -1
         self._m_scratch = []
 
@@ -677,12 +679,14 @@ class NonRigidPolicy(BasePolicy):
 
         # Step boundary: finalize M_t from the previous step and update w.
         if step != self._last_step:
-            if self._last_step >= 0 and self.synps and self._m_scratch:
+            if self.static_w is not None:
+                self.current_w = self.static_w           # static override — never change
+            elif self._last_step >= 0 and self.synps and self._m_scratch:
                 M = sum(self._m_scratch) / len(self._m_scratch)
                 if M > self.m_max:
-                    self.current_w = 0.0                              # under-editing
+                    self.current_w = 0.0                 # under-editing → position-agnostic
                 elif M < self.m_min:
-                    self.current_w = 1.0                              # over-editing
+                    self.current_w = 1.0                 # over-editing  → full spatial lock
                 else:
                     self.current_w = (self.m_max - M) / (self.m_max - self.m_min)
             self._m_scratch = []

@@ -79,8 +79,9 @@ def build_policy(cfg: dict):
             v_blend_steps_frac=tuple(cfg["v_blend_steps_frac"]) if cfg.get("v_blend_steps_frac") else (0.0, 1.0),
             preserve_color=cfg.get("preserve_color", False),
             synps=cfg.get("synps", True),
-            m_min=cfg.get("m_min", 0.9),
-            m_max=cfg.get("m_max", 1.0),
+            m_min=cfg.get("m_min", 0.7),
+            m_max=cfg.get("m_max", 0.95),
+            static_w=cfg.get("static_w", None),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )
@@ -320,10 +321,15 @@ def parse_args():
     p.add_argument("--no_synps", dest="synps", action="store_false",
                    help="Non-rigid: disable SynPS; fall back to pure FreeFlux K+V at TIER_A "
                         "(no colour preservation unless --v_blend > 0).")
-    p.add_argument("--m_min", type=float, default=0.9,
-                   help="SynPS: lower M_t threshold — below this, w=1 (full spatial lock). Default 0.9.")
-    p.add_argument("--m_max", type=float, default=1.0,
-                   help="SynPS: upper M_t threshold — above this, w=0 (position-agnostic). Default 1.0.")
+    p.add_argument("--m_min", type=float, default=0.7,
+                   help="SynPS: lower M_t threshold — below this, w=1 (full spatial lock). Default 0.7.")
+    p.add_argument("--m_max", type=float, default=0.95,
+                   help="SynPS: upper M_t threshold — above this, w=0 (position-agnostic). Default 0.95.")
+    p.add_argument("--static_w", type=float, default=None,
+                   help="SynPS: bypass adaptive M_t; use this fixed w at all TIER_A steps. "
+                        "0.0 = fully position-agnostic (max colour retrieval); "
+                        "1.0 = full RoPE (FreeFlux baseline). "
+                        "Try 0.0 first if identity is not fully preserved.")
     p.add_argument("--v_blend", type=float, default=0.0,
                    help="Non-rigid: source V blend weight at non-TIER_A layers (default 0.0 with SynPS on). "
                         "V_edit = v_blend*V_src + (1-v_blend)*V_edit_orig. "
@@ -462,6 +468,7 @@ def main():
         "synps":                args.synps,
         "m_min":                args.m_min,
         "m_max":                args.m_max,
+        "static_w":             args.static_w,
         "v_blend":              args.v_blend,
         "v_blend_steps_frac":   args.v_blend_steps_frac,
         "preserve_color":       args.preserve_color,
