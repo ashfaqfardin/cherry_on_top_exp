@@ -39,7 +39,7 @@
 #
 # Tuning:
 #   --m_min 0.85 --m_max 0.95   Adjust M_t window if w swings too aggressively.
-#   --synps=False --v_blend 0.3 Disable SynPS; use V-only blend fallback.
+#   --no_synps --v_blend 0.3    Disable SynPS; use V-only blend fallback instead.
 #   --preserve_color             Add Reinhard LAB post-processing as last resort.
 #   --inject_steps_frac 0.08 1.0 Skip first 4 TIER_A steps for drastic pose changes.
 set -euo pipefail

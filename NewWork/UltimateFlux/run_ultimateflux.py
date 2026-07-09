@@ -314,13 +314,21 @@ def parse_args():
                    metavar=("START", "END"),
                    help="Non-rigid / attr_edit: fraction of denoising steps to apply injection. "
                         "Default depends on task (non_rigid: 0.0 1.0, attr_edit: 0.0 1.0).")
-    p.add_argument("--v_blend", type=float, default=0.3,
-                   help="Non-rigid: source V blend weight at non-TIER_A layers (default 0.3 = 30%%). "
+    p.add_argument("--synps", dest="synps", action="store_true", default=True,
+                   help="Non-rigid: enable SynPS adaptive w-scaled RoPE injection at TIER_A "
+                        "(CVPR 2026, arXiv:2512.14423). Default on. Replaces v_blend for colour preservation.")
+    p.add_argument("--no_synps", dest="synps", action="store_false",
+                   help="Non-rigid: disable SynPS; fall back to pure FreeFlux K+V at TIER_A "
+                        "(no colour preservation unless --v_blend > 0).")
+    p.add_argument("--m_min", type=float, default=0.9,
+                   help="SynPS: lower M_t threshold — below this, w=1 (full spatial lock). Default 0.9.")
+    p.add_argument("--m_max", type=float, default=1.0,
+                   help="SynPS: upper M_t threshold — above this, w=0 (position-agnostic). Default 1.0.")
+    p.add_argument("--v_blend", type=float, default=0.0,
+                   help="Non-rigid: source V blend weight at non-TIER_A layers (default 0.0 with SynPS on). "
                         "V_edit = v_blend*V_src + (1-v_blend)*V_edit_orig. "
-                        "Grounds edit subject colour from source V without touching Q×K (so pose still changes). "
-                        "Safe range 0.1–0.5. 0 = off (TIER_A K+V only, colour drifts). "
-                        "1.0 = cascade collapse. "
-                        "If pose is suppressed, try --v_blend_steps_frac 0.0 0.3 to limit injection to first 30%% of steps.")
+                        "Only needed when --no_synps; try 0.3 in that case. "
+                        "WARNING: values above 0 at all 44 non-TIER_A layers can suppress pose change.")
     p.add_argument("--v_blend_steps_frac", type=float, nargs=2, default=None,
                    metavar=("START", "END"),
                    help="Non-rigid: step window for non-TIER_A V blend (default: all steps). "
@@ -451,6 +459,9 @@ def main():
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
         "inject_steps_frac":    args.inject_steps_frac,
+        "synps":                args.synps,
+        "m_min":                args.m_min,
+        "m_max":                args.m_max,
         "v_blend":              args.v_blend,
         "v_blend_steps_frac":   args.v_blend_steps_frac,
         "preserve_color":       args.preserve_color,
