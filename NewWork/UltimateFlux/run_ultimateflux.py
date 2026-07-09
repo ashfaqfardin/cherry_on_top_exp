@@ -75,9 +75,12 @@ def build_policy(cfg: dict):
     if task == "non_rigid":
         return NonRigidPolicy(
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
-            v_blend=cfg.get("v_blend", 0.3),
+            v_blend=cfg.get("v_blend", 0.0),
             v_blend_steps_frac=tuple(cfg["v_blend_steps_frac"]) if cfg.get("v_blend_steps_frac") else (0.0, 1.0),
             preserve_color=cfg.get("preserve_color", False),
+            synps=cfg.get("synps", True),
+            m_min=cfg.get("m_min", 0.9),
+            m_max=cfg.get("m_max", 1.0),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )

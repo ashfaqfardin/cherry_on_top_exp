@@ -591,103 +591,116 @@ def _reinhard_color_transfer(edit_img: Image.Image, src_img: Image.Image) -> Ima
 
 class NonRigidPolicy(BasePolicy):
     """
-    K,V injection for non-rigid pose/action editing (FreeFlux mutual self-attention control).
+    K,V injection for non-rigid pose/action editing — FreeFlux + SynPS.
 
-    Injection — TIER_A (pose transfer)
-    ------------------------------------
-    13 content-similarity layers [0,7,8,9,10,18,25,28,37,42,45,50,56]: full K+V.
-    Q from "bird flying" attends to source K,V differently from Q from "bird perched",
-    allowing pose to diverge while keeping coarse appearance from source.
+    Core mechanism (FreeFlux, ICCV 2025):
+    ──────────────────────────────────────
+    TIER_A K+V injection (13 content-similarity layers): Q from "bird flying"
+    attends to source K,V differently → pose diverges while appearance transfers.
+    K is NEVER injected at non-TIER_A (position-dependent) layers — any source K
+    there causes RoPE spatial locking → output frozen to source pose.
 
-    WHY NOT ALL-57 K+V (failure mode 1): Position-dependent layers use high-RoPE keys.
-    Injecting source K there forces each edit token to attend where pos_i ≈ pos_j
-    (RoPE relative-position property) → reconstructs source pixel-by-pixel regardless
-    of prompt.
+    SynPS colour preservation (CVPR 2026, arXiv:2512.14423):
+    ──────────────────────────────────────────────────────────
+    At TIER_A layers, source K is re-encoded with a w-scaled RoPE before injection:
 
-    WHY NOT V-ONLY AT ALL 44 NON-TIER_A (failure mode 2): V injection at every layer
-    causes the same cascade collapse via V channel — each layer's output reads source V;
-    the residual stream is pulled toward source; Q and K computed from that state also
-    become source-like; all 57 layers converge to source.
+        cos_w = w * cos + (1 - w)   # w=0 → identity; w=1 → original
+        sin_w = w * sin
+        K_src_injected = apply_rotary_emb(K_src_raw, (cos_w, sin_w))
 
-    Colour preservation — partial injection at non-TIER_A (v_blend > 0)
-    ---------------------------------------------------------------------
-    Inspired by SynPS (CVPR 2026, arXiv:2512.14423) and Untwisting RoPE
-    (arXiv:2602.05013):
+    w=0 → position-agnostic: edit Q attends to source tokens by content (colour,
+           texture) rather than spatial location → colour is retrieved naturally.
+    w=1 → full RoPE: identical to FreeFlux baseline (spatial lock at TIER_A).
 
-    v_blend (default 0.3): At the remaining 44 non-TIER_A layers, blend source V
-    into edit V — `V_edit = v_blend * V_src + (1-v_blend) * V_edit_orig`.
-    0.3 (30% from source) is sub-cascade: the 70% edit contribution at every layer
-    prevents the residual from converging to source; the 30% anchors subject colour.
-
-    k_s_lf (default 0.3): Frequency-aware K blend at non-TIER_A (Untwisting RoPE).
-    After RoPE is applied, head dimension d=0,1 are highest-frequency (spatial lock),
-    d=D-2,D-1 are lowest-frequency (semantic/content).  We blend source K at weight 0
-    for high-freq dims and k_s_lf for low-freq dims — semantic content guidance
-    without spatial locking.
-
-    WHY K BLEND AT NON-TIER_A IS FORBIDDEN:
-    Untwisting RoPE (arXiv:2602.05013) was designed for style transfer — injecting
-    K from a style reference to retrieve content-similar V.  For NON-RIGID editing,
-    injecting source K at position-dependent layers (even partially, even at
-    low-freq dims) corrupts the Q×K attention pattern, which is the primary driver
-    of the edit pose.  Q_edit × K_src_partial → attention shifts toward source
-    spatial positions → model generates source-like spatial structure → bird doesn't
-    fly.  K is strictly limited to TIER_A layers.
-
-    V blend sub-cascade condition: v_blend=1.0 at all 44 layers collapses to
-    identical output.  Safe range: v_blend ∈ [0.1, 0.5].
+    Adaptive w (per denoising step) via editing measurement M_t:
+        M_t  = mean over TIER_A blocks of (S_img / S_txt)
+        S_img = cos_sim(attn_out_img_src, attn_out_img_edit)
+        S_txt = cos_sim(attn_out_txt_src, attn_out_txt_edit)
+    Piecewise schedule:
+        M_t > m_max (1.0): under-editing → w = 0 (agnostic, colour retrieval)
+        M_t < m_min (0.9): over-editing  → w = 1 (full lock)
+        else:               w = (m_max - M_t) / (m_max - m_min)
+    First step uses w = 1.0 (no prior measurement).
 
     Parameters
     ----------
+    synps             : Enable SynPS adaptive w-scaling (default True).
+    m_min, m_max      : SynPS editing-measurement thresholds (default 0.9, 1.0).
     inject_layers     : K+V injection layers. Default TIER_A (13 layers).
-    inject_steps_frac : Denoising step window. Default all steps (0.0, 1.0).
-    v_blend           : Source V blend at non-TIER_A layers (0=off, 0.3=default).
-                        Directly grounds edit branch colour from source V without
-                        touching the Q×K attention pattern.
-    v_blend_steps_frac: Step window for non-TIER_A V blend. Default all steps.
-                        Use (0.0, 0.3) to limit V injection to first 15 of 50 steps
-                        if pose is still suppressed with v_blend=0.3.
-    preserve_color    : Apply Reinhard LAB statistics transfer after generation.
-                        Fallback if v_blend alone is insufficient.
+    inject_steps_frac : Denoising step window for injection. Default all steps.
+    v_blend           : Source V blend at non-TIER_A layers (default 0.0 with
+                        synps=True; 0.3 recommended if synps=False as fallback).
+    v_blend_steps_frac: Step window for non-TIER_A V blend.
+    preserve_color    : Apply Reinhard LAB post-processing fallback.
     """
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
-        v_blend: float = 0.3,
+        v_blend: float = 0.0,
         v_blend_steps_frac: Tuple[float, float] = (0.0, 1.0),
         preserve_color: bool = False,
+        synps: bool = True,
+        m_min: float = 0.9,
+        m_max: float = 1.0,
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
-        self.inject_layers      = set(inject_layers if inject_layers is not None
-                                      else TIER_A)
+        self.inject_layers      = set(inject_layers if inject_layers is not None else TIER_A)
         self.inject_steps_frac  = inject_steps_frac
         self.v_blend            = v_blend
         self.v_blend_steps_frac = v_blend_steps_frac
         self.preserve_color     = preserve_color
+        self.synps              = synps
+        self.m_min              = m_min
+        self.m_max              = m_max
         self._txt_len_single    = 512
+        # SynPS per-generation state
+        self.current_w: float       = 1.0
+        self._last_step: int        = -1
+        self._m_scratch: List[float] = []
+        # Side-channel state written by sampler before each inject_qkv call
+        self._raw_k      = None
+        self._rotary_emb = None
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
         self._txt_len_single = max_sequence_length
+        # Reset SynPS state for each new generation run
+        self.current_w  = 1.0
+        self._last_step = -1
+        self._m_scratch = []
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
+
+        # Step boundary: finalize M_t from the previous step and update w.
+        if step != self._last_step:
+            if self._last_step >= 0 and self.synps and self._m_scratch:
+                M = sum(self._m_scratch) / len(self._m_scratch)
+                if M > self.m_max:
+                    self.current_w = 0.0                              # under-editing
+                elif M < self.m_min:
+                    self.current_w = 1.0                              # over-editing
+                else:
+                    self.current_w = (self.m_max - M) / (self.m_max - self.m_min)
+            self._m_scratch = []
+            self._last_step = step
+
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
         if layer in self.inject_layers:
-            # TIER_A: full K+V (pose transfer via content-similarity attention)
-            k, v = _kv_full_inject(k, v, img_offset)
+            if self.synps and self._raw_k is not None and self._rotary_emb is not None:
+                k, v = self._synps_inject(k, v, img_offset)
+            else:
+                k, v = _kv_full_inject(k, v, img_offset)
 
         elif (self.v_blend > 0.0
               and _step_active(step, n_steps, self.v_blend_steps_frac)):
-            # Non-TIER_A: V-only partial blend for colour preservation.
-            # K is NEVER injected at non-TIER_A — source K at position-dependent
-            # layers corrupts the Q×K pattern that drives the edit pose.
-            # V blend (30% source) directly grounds colour without spatial locking.
+            # Non-TIER_A V-only partial blend (fallback when synps=False).
+            # K is NEVER injected at non-TIER_A layers.
             v_src, v_edit = v.chunk(2)
             v_edit = v_edit.clone()
             v_edit[:, :, img_offset:, :] = (
@@ -697,6 +710,56 @@ class NonRigidPolicy(BasePolicy):
             v = torch.cat([v_src, v_edit])
 
         return q, k, v
+
+    def _synps_inject(self, k, v, img_offset: int):
+        """
+        SynPS TIER_A injection: re-encode source K with w-scaled RoPE then inject.
+
+        cos_w = w*cos + (1-w), sin_w = w*sin (linear interpolation).
+        Valid for TIER_A because these layers have low RoPE frequency (small angles).
+        Text positions have cos=1, sin=0 so they are unchanged by the scaling.
+        """
+        w = self.current_w
+        k_src_raw, _      = self._raw_k.chunk(2)   # pre-RoPE source K
+        k_src_rope, k_edit_rope = k.chunk(2)        # post-RoPE K
+        v_src, v_edit           = v.chunk(2)
+
+        if w < 1.0 - 1e-6:
+            cos, sin = self._rotary_emb
+            k_src_w = apply_rotary_emb(k_src_raw, (w * cos + (1.0 - w), w * sin))
+        else:
+            k_src_w = k_src_rope   # w=1: already-RoPE-encoded source K
+
+        k_edit_new = k_edit_rope.clone()
+        k_edit_new[:, :, img_offset:, :] = k_src_w[:, :, img_offset:, :]
+
+        v_edit_new = v_edit.clone()
+        v_edit_new[:, :, img_offset:, :] = v_src[:, :, img_offset:, :]
+
+        return torch.cat([k_src_rope, k_edit_new]), torch.cat([v_src, v_edit_new])
+
+    def observe_attn_out(self, out, layer, step, txt_len):
+        """
+        Accumulate per-block editing-measurement m^l_t = S_img / S_txt for SynPS.
+        Called by the sampler after every SDPA; only TIER_A blocks are recorded.
+        """
+        if not self.synps or layer not in self.inject_layers:
+            return
+
+        img_offset = txt_len if txt_len > 0 else self._txt_len_single
+
+        # out: (B, H, L, D) — B=2: index 0 = source, index 1 = edit
+        src = out[0]   # (H, L, D)
+        tgt = out[1]
+
+        def _cos(a, b):
+            af = a.detach().float().flatten()
+            bf = b.detach().float().flatten()
+            return (af @ bf) / (af.norm() * bf.norm() + 1e-8)
+
+        s_txt = _cos(src[:, :txt_len, :], tgt[:, :txt_len, :]).item() if txt_len > 0 else 1.0
+        s_img = _cos(src[:, img_offset:, :], tgt[:, img_offset:, :]).item()
+        self._m_scratch.append(s_img / max(s_txt, 0.01))
 
     def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
         if self.preserve_color:

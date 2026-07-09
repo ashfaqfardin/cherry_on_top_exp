@@ -92,6 +92,20 @@ class BasePolicy:
         """Called once before the denoising loop (style extraction, inversion, …)."""
         pass
 
+    def observe_attn_out(
+        self,
+        out: torch.Tensor,
+        layer: int,
+        step: int,
+        txt_len: int = 0,
+    ) -> None:
+        """
+        Called after SDPA with the raw (B,H,L,D) attention output.
+        Used by SynPS (NonRigidPolicy) to accumulate M_t measurements.
+        Default is a no-op; override in policies that need post-attention state.
+        """
+        pass
+
     def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
         """Called after generation with the decoded PIL images.  Default: no-op."""
         return edit_img
@@ -180,9 +194,13 @@ class UltimateFluxAttnProcessor:
             k = torch.cat([ek, k], dim=2)
             v = torch.cat([ev, v], dim=2)
 
+        # Save pre-RoPE K for SynPS w-scaled injection (accessed via policy._raw_k).
+        k_raw = k
         if image_rotary_emb is not None:
             q = apply_rotary_emb(q, image_rotary_emb)
             k = apply_rotary_emb(k, image_rotary_emb)
+        self.policy._raw_k      = k_raw
+        self.policy._rotary_emb = image_rotary_emb
 
         # ── Policy injection ──────────────────────────────────────────────
         q, k, v = self.policy.inject_qkv(q, k, v, layer, step, self.total_steps, txt_len)
@@ -195,6 +213,8 @@ class UltimateFluxAttnProcessor:
         else:
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False,
                                                  attn_mask=attention_mask)
+        # SynPS: accumulate per-block S_img/S_txt for M_t (no-op for other policies)
+        self.policy.observe_attn_out(out, layer, step, txt_len)
         out = out.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         out = out.to(q.dtype)
 

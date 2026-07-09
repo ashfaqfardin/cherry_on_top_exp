@@ -18,25 +18,30 @@
 #
 #   Reference: FreeFlux run_non_rigid.py  layer_idx=[0,7,8,9,10,18,25,28,37,42,45,50,56]
 #
-# Colour preservation at the attention level (SynPS CVPR 2026, arXiv:2512.14423):
+# Colour preservation — SynPS (CVPR 2026, arXiv:2512.14423):
 #
-#   --v_blend 0.3  (default): At the 44 non-TIER_A (position-dependent) layers,
-#   blend 30% source V into edit V: V_edit = 0.3*V_src + 0.7*V_edit_orig.
-#   V blend does NOT touch K — the Q×K attention pattern stays 100% edit-conditioned,
-#   so the pose change (Q_edit attending differently from Q_src) is preserved.
-#   The 30% V_src provides direct colour grounding at every non-TIER_A layer.
+#   Enabled by default (--synps; pass --no_synps or set "synps":false to disable).
+#
+#   At each TIER_A layer, source K is re-encoded with a w-scaled RoPE before injection:
+#       cos_w = w * cos + (1 - w),  sin_w = w * sin
+#   w=0: position-agnostic → edit Q attends by content (colour, texture), not location.
+#   w=1: full RoPE → identical to FreeFlux baseline (spatial lock at TIER_A).
+#
+#   w is computed adaptively each denoising step from M_t = mean(S_img / S_txt):
+#       M_t > m_max (1.0): under-editing → w=0  (colour retrieval mode)
+#       M_t < m_min (0.9): over-editing  → w=1  (identity lock mode)
+#       else:               w = (m_max - M_t) / (m_max - m_min)
+#   First step starts at w=1.0 (no prior measurement).
 #
 #   WHY NO K BLEND AT NON-TIER_A: Source K at position-dependent layers corrupts
 #   the Q×K attention pattern → attention shifts toward source spatial positions →
-#   model generates source spatial structure → bird doesn't fly.  Only V is blended.
+#   model generates source spatial structure → bird doesn't fly.
 #
-# Tuning (if pose is suppressed by v_blend):
-#   --v_blend_steps_frac 0.0 0.3   Limit V blend to first 15/50 steps only.
-#                                   Colour is established early; pose develops freely later.
-#   --v_blend 0.1                  Reduce V blend weight (less colour, more pose freedom).
-#   --v_blend 0.0                  Disable V blend entirely (colour will drift).
-#   --preserve_color               Add Reinhard LAB post-processing as fallback.
-#   --inject_steps_frac 0.08 1.0   Skip first 4 TIER_A steps for drastic pose changes.
+# Tuning:
+#   --m_min 0.85 --m_max 0.95   Adjust M_t window if w swings too aggressively.
+#   --synps=False --v_blend 0.3 Disable SynPS; use V-only blend fallback.
+#   --preserve_color             Add Reinhard LAB post-processing as last resort.
+#   --inject_steps_frac 0.08 1.0 Skip first 4 TIER_A steps for drastic pose changes.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
