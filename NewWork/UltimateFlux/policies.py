@@ -536,37 +536,45 @@ class NonRigidPolicy(BasePolicy):
     """
     K,V injection for non-rigid pose/action editing (FreeFlux mutual self-attention control).
 
-    Injects source image-token K,V into the edit branch at ALL 57 transformer layers
-    for all denoising steps.  Q is never touched — it comes from the edit branch and
-    carries the "flying bird" (or other pose) text conditioning.
+    Injects source image-token K,V into the edit branch at TIER_A (13 content-similarity)
+    layers for all denoising steps.  Q is never touched — it comes from the edit branch
+    and carries the "flying bird" (or other pose) text conditioning.
 
-    Mechanism: with source K,V at every layer, both branches attend to the same
-    perched-bird content, but "flying bird" Q weights that content differently at each
-    of the 57 × 50 attention calls, cumulatively steering the denoising trajectory
-    toward the new pose.  Using only a subset of layers (e.g. TIER_A) leaves 44 free
-    layers that add uncontrolled noise to this Q-driven signal, killing the effect.
+    Mechanism: TIER_A layers are content-similarity-dependent (low RoPE frequency).
+    In these layers Q from "bird flying" attends to source K,V differently than Q from
+    "bird perched" does, because RoPE position-bias is weak here — the attention score
+    is driven by feature content, not spatial position.  This gives the edit Q enough
+    freedom to steer denoising toward the new pose.
 
-    This matches FreeFlux's default: layer_idx=None → list(range(0, 57)), all steps.
+    WHY NOT ALL 57 LAYERS: Position-dependent layers (the other 44/57) use high-RoPE
+    keys.  When source K (RoPE-encoded at position j) is injected, each edit-branch
+    token i attends most strongly to token j where pos_i ≈ pos_j (RoPE relative-pos
+    property).  This spatially locks every edit token to its source counterpart, forcing
+    the output to be pixel-identical to source regardless of the edit prompt.
+
+    Exact FreeFlux settings (run_non_rigid.py):
+        layer_idx = TIER_A = [0,7,8,9,10,18,25,28,37,42,45,50,56]
+        step_idx  = list(range(0, 50))   # ALL 50 steps
 
     Parameters
     ----------
-    inject_layers     : Layers for K,V injection. Default ALL 57 layers.
-    inject_steps_frac : Step window. Default all steps (0, 1).
-                        Use (0.08, 1.0) to match FreeFlux's start_step=4 default.
+    inject_layers     : Layers for K,V injection. Default TIER_A (13 layers).
+                        Do NOT pass list(range(57)) — that produces identical output.
+    inject_steps_frac : Step window as (start_frac, end_frac). Default all steps (0, 1).
+                        Use (0.08, 1.0) to skip first 4 steps for drastic pose changes
+                        (gives Q more time to diverge from source before injection starts).
     """
-
-    _ALL_LAYERS = list(range(N_LAYERS))   # [0 … 56]
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
-        # kept for backward-compat; ignored in current implementation
+        # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
         self.inject_layers     = set(inject_layers if inject_layers is not None
-                                     else self._ALL_LAYERS)
+                                     else TIER_A)
         self.inject_steps_frac = inject_steps_frac
         self._txt_len_single   = 512
 

@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 # Task 1 — Non-rigid editing (FreeFlux mutual self-attention control)
 #
-# Injection strategy — matching FreeFlux's default (layer_idx=None → all 57 layers):
-#   ALL 57 layers: K,V injection at ALL denoising steps.
+# Injection strategy — TIER_A (13 content-similarity layers), all 50 steps:
+#   Source image-token K,V are copied into the edit branch at TIER_A layers only.
+#   Q is never touched; it comes from the edit branch ("bird flying") and drives
+#   the pose change by attending to source K,V differently than source Q does.
 #
-#   Mechanism: Q is never injected — it comes from the edit branch and carries the
-#   "flying bird" text conditioning.  With source K,V at every layer, both branches
-#   attend to the same perched-bird content, but the edit Q weights it differently
-#   at each of 57 × 50 attention calls, cumulatively steering denoising toward the
-#   new pose.  Injecting fewer layers (e.g. TIER_A only) leaves uncontrolled layers
-#   that disrupt this Q-driven signal and kill the pose-change effect.
+#   WHY TIER_A AND NOT ALL 57 LAYERS:
+#   TIER_A layers are content-similarity-dependent (low RoPE frequency).  In these
+#   layers, attention is driven by feature similarity, not spatial position.  The
+#   edit Q therefore has freedom to attend differently from source Q.
+#
+#   The other 44 layers are position-dependent (high RoPE).  Injecting source K
+#   there causes each edit token to attend mostly to its spatially-identical source
+#   token (RoPE relative-position property), producing output pixel-identical to
+#   source regardless of the edit prompt.  This is why ALL-57 fails.
+#
+#   Reference: FreeFlux run_non_rigid.py  layer_idx=[0,7,8,9,10,18,25,28,37,42,45,50,56]
 #
 # Tuning:
-#   --inject_steps_frac 0.08 1.0  Skip first 4 steps (FreeFlux's start_step=4 default).
+#   --inject_steps_frac 0.08 1.0  Skip first 4 steps (gives Q more divergence time).
 #   --inject_steps_frac 0.0  0.8  Shorten window if background drifts too much.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
