@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # Task 1 — Non-rigid editing (FreeFlux mutual self-attention control)
 #
-# FreeFlux-validated settings (ICCV 2025):
+# Injection strategy:
 #   TIER_A layers (13 content-similarity layers: 0,7,8,9,10,18,25,28,37,42,45,50,56):
-#       Full K,V injection at ALL steps.
-#   Steps: 50  — REQUIRED.  At 28 steps the free layers (44/57) do not accumulate
-#       enough signal to shift the edit branch's pose against TIER_A anchoring.
-#       50 steps gives 44 free-layer × 50 iterations vs 44 × 28, a 78% increase.
+#       K-ONLY injection at ALL 50 steps.
+#
+#   Why K-only (not K,V):  V injection resets the edit branch's content to source at
+#   every TIER_A layer every step — flying features can never accumulate because they
+#   are overwritten before they compound.  K-only keeps V free to develop the new pose
+#   (flying) while K from source directs attention toward content-similar positions
+#   (same bird species, structural consistency).
+#
+#   Steps: 50 — gives V enough iterations to accumulate the pose change.
 #
 # Tuning:
-#   --inject_steps_frac 0.15 1.0  Skip first ~8 steps (FreeFlux default start_step=4
-#                                 out of 50). Helps if the edit is still too weak.
-#   --inject_all_single          Add K-only injection at ALL single-stream layers.
-#                                Use only if background drifts; K-only locks WHERE
-#                                without locking V content, so pose can still emerge.
+#   --inject_steps_frac 0.0 0.8   Shorten injection window if edit is too weak.
+#   --inject_all_single           Add K,V at ALL single-stream layers for stronger
+#                                 background lock (at some cost to single-stream freedom).
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

@@ -534,28 +534,24 @@ class ObjectAdditionPolicy(BasePolicy):
 
 class NonRigidPolicy(BasePolicy):
     """
-    K,V injection for non-rigid pose/action editing (FreeFlux mutual self-attention control).
+    K-only injection for non-rigid pose/action editing at TIER_A content-similarity layers.
 
-    Default: inject source image-token K,V at TIER_A (content-similarity layers) for
-    ALL denoising steps. TIER_A is the exact layer set FreeFlux validates for FLUX.1-dev
-    non-rigid editing — low-RoPE-frequency layers that encode WHAT things look like
-    without encoding WHERE they are. This preserves subject identity and background
-    appearance while the 13 free double-stream blocks [1-6, 11-17] let the edit prompt
-    drive the new pose.
-
-    Optional: inject_all_single=True adds K-only injection at ALL single-stream layers.
-    K-only anchors spatial attention positions (background layout) without overriding
-    content (V stays from edit branch), so the pose can still emerge. Use this if the
-    background still drifts after the default run; it trades some edit strength for
-    background stability.
+    Why K-only (not K,V):
+      V injection resets the edit branch's content to source at every TIER_A layer on
+      every step — no matter how many steps you run, flying features cannot accumulate
+      because they are overwritten before they compound.  K-only lets V develop freely
+      under the edit prompt (flying pose emerges over steps) while K from source keeps
+      attention pointing at content-similar positions (same bird species, structural
+      consistency, partial background overlap).
 
     Parameters
     ----------
-    inject_layers     : Content-similarity layers (K,V). Default TIER_A.
+    inject_layers     : Content-similarity layers (K-only). Default TIER_A.
     inject_steps_frac : Step window for TIER_A injection. Default all steps (0, 1).
-    inject_all_single : If True, add K-only injection at all single-stream layers.
-                        Default False. Enable with --inject_all_single if background drifts.
-    bg_steps_frac     : Step window for all-single-stream K injection. Default all steps.
+    inject_all_single : If True, add K,V injection at ALL single-stream layers for
+                        stronger background preservation (at the cost of some edit
+                        freedom in single-stream).  Default False.
+    bg_steps_frac     : Step window for all-single-stream injection. Default all steps.
     """
 
     def __init__(
@@ -579,12 +575,12 @@ class NonRigidPolicy(BasePolicy):
         is_single  = txt_len == 0
 
         if layer in self.inject_layers and _step_active(step, n_steps, self.inject_steps_frac):
-            # TIER_A: full K,V — identity and appearance (FreeFlux validated)
-            k, v = _kv_full_inject(k, v, img_offset)
-        elif self.inject_all_single and is_single and _step_active(step, n_steps, self.bg_steps_frac):
-            # All single-stream: K-only — background spatial position lock without
-            # content override, so pose can still propagate through V
+            # TIER_A: K-only — structural consistency (WHERE) without content lock (WHAT).
+            # V stays from the edit branch so flying/pose features accumulate over steps.
             k, v = _k_only_inject(k, v, img_offset)
+        elif self.inject_all_single and is_single and _step_active(step, n_steps, self.bg_steps_frac):
+            # All single-stream: K,V — strong background lock.
+            k, v = _kv_full_inject(k, v, img_offset)
 
         return q, k, v
 
