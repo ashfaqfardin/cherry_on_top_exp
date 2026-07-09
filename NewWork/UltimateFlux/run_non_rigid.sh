@@ -53,14 +53,24 @@
 #   steps refine pose-specific high-frequency detail free from the source anchor.
 #
 # Tuning:
-#   --m_min 0.70 --m_max 0.95        Adjust M_t window if w swings too aggressively.
-#   --no_synps --v_blend 0.3         Disable SynPS; use V-only blend fallback instead.
-#   --preserve_color                  Add Reinhard LAB post-processing as last resort.
-#   --inject_steps_frac 0.08 1.0     Skip first 4 TIER_A steps for drastic pose changes.
-#   --identity_guidance               Enable FFT latent colour anchor (complementary to SynPS).
-#   --identity_strength 0.3          Blend strength for FFT low-freq anchor (0=off, 1=full).
-#   --identity_steps_frac 0.0 0.5   Step window for FFT anchor (default: first half only).
-#   --low_freq_cutoff 0.1            Fraction of FFT spatial freqs treated as "low" (default 10%).
+#
+#   Pose not changing at all (injection anchoring too strongly):
+#     --inject_steps_frac 0.06 0.80   Skip first 3 steps (pose skeleton forms free) +
+#                                      stop at 80% (last 10 steps refine pose free).
+#     --static_w 0.0                   Force position-agnostic every step; bypasses M_t.
+#                                      Best for subtle pose changes where M_t stays high.
+#
+#   Identity not preserved (appearance drifting):
+#     --m_min 0.70 --m_max 0.95        Widen M_t window for more adaptive w variation.
+#     --static_w 0.0                   Pull colour by content similarity, not position.
+#     --identity_guidance               FFT latent colour anchor (complementary to SynPS).
+#     --identity_strength 0.3          FFT blend strength (0=off, 1=full source colour).
+#     --identity_steps_frac 0.0 0.4   Limit FFT anchor to first 40% of steps.
+#     --low_freq_cutoff 0.1            10% of FFT freqs = global colour only (safe default).
+#
+#   Fallback (SynPS not helping):
+#     --no_synps --v_blend 0.3         V-only blend at non-TIER_A layers (no K injection).
+#     --preserve_color                  Reinhard LAB post-processing as last resort.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -72,6 +82,9 @@ W=1024
 
 echo "=== Task 1: Non-rigid editing ==="
 
+# Bird: drastic pose change (perched→flying) — skip first 3 steps so the model
+# lays down the flying skeleton before TIER_A injection anchors appearance.
+# Stop at 80% so the last 10 steps refine pose without K,V pulling it back.
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -80,9 +93,14 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name bird_perch_to_fly \
     --source_prompt "a bird perched on a branch" \
     --edit_prompt   "a bird flying away from the branch" \
-    --identity_guidance --identity_strength 0.3 \
+    --inject_steps_frac 0.06 0.80 \
+    --identity_guidance --identity_strength 0.3 --identity_steps_frac 0.0 0.4 \
     --seed 42
 
+# Cat: subtle pose change (sitting→lying) — M_t stays high for similar poses,
+# keeping SynPS w near 1.0 (spatial lock). static_w 0.0 forces position-agnostic
+# retrieval every step so source colour is pulled by content, not position.
+# Inject only first 70% of steps; last 15 steps are free for pose refinement.
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -91,9 +109,14 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name cat_sit_to_lie \
     --source_prompt "a cat sitting on a wooden floor" \
     --edit_prompt   "a cat lying down on a wooden floor" \
-    --identity_guidance --identity_strength 0.3 \
+    --inject_steps_frac 0.0 0.70 \
+    --static_w 0.0 \
+    --identity_guidance --identity_strength 0.25 --identity_steps_frac 0.0 0.35 \
     --seed 42
 
+# Dog: moderate pose change (standing→jumping) — same static_w 0.0 strategy as
+# cat to avoid SynPS w stalling at 1.0. Slightly wider injection window than cat
+# since the appearance difference (jumping vs standing) is more pronounced.
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -102,7 +125,9 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name dog_standing_to_jumping \
     --source_prompt "a golden retriever standing in a park" \
     --edit_prompt   "a golden retriever jumping in a park" \
-    --identity_guidance --identity_strength 0.3 \
+    --inject_steps_frac 0.0 0.75 \
+    --static_w 0.0 \
+    --identity_guidance --identity_strength 0.25 --identity_steps_frac 0.0 0.35 \
     --seed 7
 
 echo "=== Non-rigid editing complete. Results in results/ultimateflux/ ==="
