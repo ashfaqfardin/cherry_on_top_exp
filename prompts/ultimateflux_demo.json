@@ -18,22 +18,19 @@
       "name": "bird_perch_to_fly",
       "task": "non_rigid",
       "source_prompt": "a bird perched on a branch",
-      "edit_prompt":   "a bird flying away from the branch",
-      "inject_steps_frac": [0.0, 1.0]
+      "edit_prompt":   "a bird flying away from the branch"
     },
     {
       "name": "cat_sit_to_lie",
       "task": "non_rigid",
       "source_prompt": "a cat sitting on a wooden floor",
-      "edit_prompt":   "a cat lying down on a wooden floor",
-      "inject_steps_frac": [0.0, 1.0]
+      "edit_prompt":   "a cat lying down on a wooden floor"
     },
     {
       "name": "dog_standing_to_jumping",
       "task": "non_rigid",
       "source_prompt": "a golden retriever standing in a park",
       "edit_prompt":   "a golden retriever jumping in a park",
-      "inject_steps_frac": [0.0, 1.0],
       "seed": 7
     },
 

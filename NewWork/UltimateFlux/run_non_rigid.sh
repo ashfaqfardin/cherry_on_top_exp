@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
-# Task 1 — Non-rigid editing (two-tier K,V injection)
+# Task 1 — Non-rigid editing (FreeFlux mutual self-attention control)
 #
-# Injection strategy:
-#   Tier 1 — TIER_A (FreeFlux content-similarity layers, both stream types):
-#       Full K,V injection at all steps → subject identity and appearance.
-#   Tier 2 — ALL single-stream layers (19-56):
-#       Full K,V injection at all steps → background scene locked to source.
-#       Single-stream blocks refine texture/detail; injecting here prevents
-#       background drift without affecting pose semantics.
-#   Free double-stream layers [1-6, 11-17] (13 blocks):
-#       Edit prompt drives new pose/action through text-image interaction here.
+# Default injection strategy (FreeFlux-validated for FLUX.1-dev):
+#   TIER_A layers (13 content-similarity layers, layers 0,7,8,9,10,18,25,28,37,42,45,50,56):
+#       Full K,V injection at ALL 28 steps — preserves subject identity and background.
+#       Low-RoPE-frequency layers encode WHAT without WHERE, so appearance is anchored
+#       while the 13 free double-stream blocks [1-6, 11-17] let the edit prompt drive
+#       the new pose through text-image interaction.
 #
 # Tuning:
-#   --bg_steps_frac 0.5 1.0   Default: background lock starts at step 14/28.
-#                              Raise START (e.g. 0.6 1.0) if pose change is weak.
-#                              Lower START (e.g. 0.3 1.0) if background still drifts.
-#   --no_inject_all_single    Use TIER_A only (FreeFlux original); may lose background.
-#   --inject_steps_frac 0.0 0.8  Shorten TIER_A window if identity is over-locked.
+#   --inject_all_single          Add K-only injection at ALL single-stream layers.
+#                                Use if background still drifts after the default run.
+#                                K-only locks attention positions (WHERE) without
+#                                overriding content (V stays from edit branch), so
+#                                pose can still emerge.
+#   --inject_steps_frac 0.0 0.8  Shorten TIER_A window if the edit is too weak.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

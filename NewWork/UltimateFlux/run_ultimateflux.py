@@ -75,8 +75,8 @@ def build_policy(cfg: dict):
     if task == "non_rigid":
         return NonRigidPolicy(
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
-            inject_all_single=cfg.get("inject_all_single", True),
-            bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.5, 1.0),
+            inject_all_single=cfg.get("inject_all_single", False),
+            bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )
 
     if task == "object_add":

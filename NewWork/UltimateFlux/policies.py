@@ -534,38 +534,36 @@ class ObjectAdditionPolicy(BasePolicy):
 
 class NonRigidPolicy(BasePolicy):
     """
-    Two-tier K,V injection for non-rigid pose/action editing.
+    K,V injection for non-rigid pose/action editing (FreeFlux mutual self-attention control).
 
-    Tier 1 — TIER_A (content-similarity layers, both double- and single-stream):
-        Full K,V injection at ALL steps. Matches FreeFlux mutual self-attention
-        control. Anchors subject identity and appearance throughout denoising.
+    Default: inject source image-token K,V at TIER_A (content-similarity layers) for
+    ALL denoising steps. TIER_A is the exact layer set FreeFlux validates for FLUX.1-dev
+    non-rigid editing — low-RoPE-frequency layers that encode WHAT things look like
+    without encoding WHERE they are. This preserves subject identity and background
+    appearance while the 13 free double-stream blocks [1-6, 11-17] let the edit prompt
+    drive the new pose.
 
-    Tier 2 — ALL single-stream layers (19-56):
-        Full K,V injection starting at bg_steps_frac (default: second half of
-        denoising). Early steps are left free in single-stream so the new pose
-        / action can emerge through all 38 refinement blocks. Once the broad
-        pose structure is committed (mid-denoising), the background is locked
-        by injecting source K,V at all single-stream layers.
-
-    Free layers at every step:
-        13 double-stream blocks not in TIER_A [1-6, 11-17]. Edit prompt drives
-        new pose through text-image interaction in these blocks.
+    Optional: inject_all_single=True adds K-only injection at ALL single-stream layers.
+    K-only anchors spatial attention positions (background layout) without overriding
+    content (V stays from edit branch), so the pose can still emerge. Use this if the
+    background still drifts after the default run; it trades some edit strength for
+    background stability.
 
     Parameters
     ----------
-    inject_layers     : Content-similarity layers for Tier 1. Default TIER_A.
-    inject_steps_frac : Step window for Tier 1 (TIER_A). Default all steps.
-    inject_all_single : Enable Tier 2 (background lock). Default True.
-    bg_steps_frac     : Step window for Tier 2 (all single-stream). Default
-                        second half (0.5, 1.0) so pose can form in early steps.
+    inject_layers     : Content-similarity layers (K,V). Default TIER_A.
+    inject_steps_frac : Step window for TIER_A injection. Default all steps (0, 1).
+    inject_all_single : If True, add K-only injection at all single-stream layers.
+                        Default False. Enable with --inject_all_single if background drifts.
+    bg_steps_frac     : Step window for all-single-stream K injection. Default all steps.
     """
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
-        inject_all_single: bool = True,
-        bg_steps_frac: Tuple[float, float] = (0.5, 1.0),
+        inject_all_single: bool = False,
+        bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
         self.inject_layers     = set(inject_layers if inject_layers is not None else TIER_A)
         self.inject_steps_frac = inject_steps_frac
@@ -580,15 +578,14 @@ class NonRigidPolicy(BasePolicy):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
         is_single  = txt_len == 0
 
-        inject = (
-            (layer in self.inject_layers                               # Tier 1: TIER_A all steps
-             and _step_active(step, n_steps, self.inject_steps_frac))
-            or (self.inject_all_single and is_single                   # Tier 2: all single-stream
-                and _step_active(step, n_steps, self.bg_steps_frac))  # late steps only
-        )
-
-        if inject:
+        if layer in self.inject_layers and _step_active(step, n_steps, self.inject_steps_frac):
+            # TIER_A: full K,V — identity and appearance (FreeFlux validated)
             k, v = _kv_full_inject(k, v, img_offset)
+        elif self.inject_all_single and is_single and _step_active(step, n_steps, self.bg_steps_frac):
+            # All single-stream: K-only — background spatial position lock without
+            # content override, so pose can still propagate through V
+            k, v = _k_only_inject(k, v, img_offset)
+
         return q, k, v
 
 
