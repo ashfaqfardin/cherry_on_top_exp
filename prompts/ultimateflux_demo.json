@@ -14,23 +14,26 @@
   "runs": [
 
     {
-      "comment": "── Task 1: Non-rigid editing ──────────────────────────────────────────",
+      "comment": "── Task 1: Non-rigid editing (num_steps=50 required — FreeFlux validated at 50 steps) ──",
       "name": "bird_perch_to_fly",
       "task": "non_rigid",
       "source_prompt": "a bird perched on a branch",
-      "edit_prompt":   "a bird flying away from the branch"
+      "edit_prompt":   "a bird flying away from the branch",
+      "num_steps": 50
     },
     {
       "name": "cat_sit_to_lie",
       "task": "non_rigid",
       "source_prompt": "a cat sitting on a wooden floor",
-      "edit_prompt":   "a cat lying down on a wooden floor"
+      "edit_prompt":   "a cat lying down on a wooden floor",
+      "num_steps": 50
     },
     {
       "name": "dog_standing_to_jumping",
       "task": "non_rigid",
       "source_prompt": "a golden retriever standing in a park",
       "edit_prompt":   "a golden retriever jumping in a park",
+      "num_steps": 50,
       "seed": 7
     },
 

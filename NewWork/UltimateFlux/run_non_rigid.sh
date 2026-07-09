@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 # Task 1 — Non-rigid editing (FreeFlux mutual self-attention control)
 #
-# Default injection strategy (FreeFlux-validated for FLUX.1-dev):
-#   TIER_A layers (13 content-similarity layers, layers 0,7,8,9,10,18,25,28,37,42,45,50,56):
-#       Full K,V injection at ALL 28 steps — preserves subject identity and background.
-#       Low-RoPE-frequency layers encode WHAT without WHERE, so appearance is anchored
-#       while the 13 free double-stream blocks [1-6, 11-17] let the edit prompt drive
-#       the new pose through text-image interaction.
+# FreeFlux-validated settings (ICCV 2025):
+#   TIER_A layers (13 content-similarity layers: 0,7,8,9,10,18,25,28,37,42,45,50,56):
+#       Full K,V injection at ALL steps.
+#   Steps: 50  — REQUIRED.  At 28 steps the free layers (44/57) do not accumulate
+#       enough signal to shift the edit branch's pose against TIER_A anchoring.
+#       50 steps gives 44 free-layer × 50 iterations vs 44 × 28, a 78% increase.
 #
 # Tuning:
+#   --inject_steps_frac 0.15 1.0  Skip first ~8 steps (FreeFlux default start_step=4
+#                                 out of 50). Helps if the edit is still too weak.
 #   --inject_all_single          Add K-only injection at ALL single-stream layers.
-#                                Use if background still drifts after the default run.
-#                                K-only locks attention positions (WHERE) without
-#                                overriding content (V stays from edit branch), so
-#                                pose can still emerge.
-#   --inject_steps_frac 0.0 0.8  Shorten TIER_A window if the edit is too weak.
+#                                Use only if background drifts; K-only locks WHERE
+#                                without locking V content, so pose can still emerge.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
 MODEL="black-forest-labs/FLUX.1-dev"
-STEPS=28
+STEPS=50
 CFG=3.5
 H=1024
 W=1024
