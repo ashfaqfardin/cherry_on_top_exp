@@ -54,23 +54,28 @@
 #
 # Tuning:
 #
-#   Pose not changing at all (injection anchoring too strongly):
-#     --inject_steps_frac 0.06 0.80   Skip first 3 steps (pose skeleton forms free) +
-#                                      stop at 80% (last 10 steps refine pose free).
-#     --static_w 0.0                   Force position-agnostic every step; bypasses M_t.
-#                                      Best for subtle pose changes where M_t stays high.
+#   Identity not preserved (colour of subject / background drifting):
+#     Key insight: inject_steps_frac and v_blend_steps_frac are INDEPENDENT windows.
+#     TIER_A K,V injection covers the main appearance anchor.
+#     V-only blend at non-TIER_A fires even after inject window closes, catching
+#     the final appearance-refinement steps that were previously completely free.
 #
-#   Identity not preserved (appearance drifting):
-#     --m_min 0.70 --m_max 0.95        Widen M_t window for more adaptive w variation.
-#     --static_w 0.0                   Pull colour by content similarity, not position.
-#     --identity_guidance               FFT latent colour anchor (complementary to SynPS).
-#     --identity_strength 0.3          FFT blend strength (0=off, 1=full source colour).
-#     --identity_steps_frac 0.0 0.4   Limit FFT anchor to first 40% of steps.
-#     --low_freq_cutoff 0.1            10% of FFT freqs = global colour only (safe default).
+#     --inject_steps_frac 0.06 0.92   TIER_A K,V for 86% of steps.
+#     --v_blend 0.25 --v_blend_steps_frac 0.0 1.0
+#                                      Non-TIER_A V blend for ALL steps (including
+#                                      the final 4 steps after TIER_A stops).
+#     --identity_guidance --identity_strength 0.4 --identity_steps_frac 0.0 0.65
+#                                      FFT low-freq latent anchor for first 65% of steps.
+#     --static_w 0.0                   Max colour retrieval; bypass adaptive M_t.
+#                                      Use for subtle poses where M_t stays high.
 #
-#   Fallback (SynPS not helping):
-#     --no_synps --v_blend 0.3         V-only blend at non-TIER_A layers (no K injection).
-#     --preserve_color                  Reinhard LAB post-processing as last resort.
+#   Pose not changing (still):
+#     --inject_steps_frac 0.10 0.90   Skip more early steps; pose skeleton forms first.
+#     --static_w 0.0                   Force position-agnostic; prevents TIER_A spatial lock.
+#
+#   Fallback (SynPS not helping / debugging):
+#     --no_synps                        Disable SynPS; raw FreeFlux K+V at TIER_A.
+#     --preserve_color                  Reinhard LAB post-processing (last resort).
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -82,9 +87,14 @@ W=1024
 
 echo "=== Task 1: Non-rigid editing ==="
 
-# Bird: drastic pose change (perched→flying) — skip first 3 steps so the model
-# lays down the flying skeleton before TIER_A injection anchors appearance.
-# Stop at 80% so the last 10 steps refine pose without K,V pulling it back.
+# Bird: drastic pose change (perched→flying).
+#   inject_steps_frac 0.06 0.92: skip 3 steps for flying skeleton, then inject
+#     TIER_A K,V for 46 steps — extended from 0.80 so appearance-refinement
+#     steps are covered (was cutting off too early → colour drift in last 10 steps).
+#   v_blend 0.25 all steps: V-only blend at non-TIER_A for ALL 50 steps.
+#     Now decoupled from inject window (code fix) so it covers steps 46-49 where
+#     TIER_A injection is off — these were the main source of colour drift.
+#   identity_guidance: FFT low-freq latent anchor, first 65% of steps.
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -93,14 +103,17 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name bird_perch_to_fly \
     --source_prompt "a bird perched on a branch" \
     --edit_prompt   "a bird flying away from the branch" \
-    --inject_steps_frac 0.06 0.80 \
-    --identity_guidance --identity_strength 0.3 --identity_steps_frac 0.0 0.4 \
+    --inject_steps_frac 0.06 0.92 \
+    --v_blend 0.25 --v_blend_steps_frac 0.0 1.0 \
+    --identity_guidance --identity_strength 0.4 --identity_steps_frac 0.0 0.65 \
     --seed 42
 
-# Cat: subtle pose change (sitting→lying) — M_t stays high for similar poses,
-# keeping SynPS w near 1.0 (spatial lock). static_w 0.0 forces position-agnostic
-# retrieval every step so source colour is pulled by content, not position.
-# Inject only first 70% of steps; last 15 steps are free for pose refinement.
+# Cat: subtle pose change (sitting→lying).
+#   static_w 0.0: bypass M_t adaptive schedule — for similar poses M_t stays
+#     high, keeping SynPS w ≈ 1.0 (spatial lock). Forcing w=0 makes retrieval
+#     purely content-based (colour/texture) rather than position-based.
+#   inject_steps_frac 0.0 0.92: 3 extra free steps at end (was 0.70 — too short).
+#   v_blend 0.25 all steps: covers steps 46-49 where TIER_A is off.
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -109,14 +122,13 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name cat_sit_to_lie \
     --source_prompt "a cat sitting on a wooden floor" \
     --edit_prompt   "a cat lying down on a wooden floor" \
-    --inject_steps_frac 0.0 0.70 \
+    --inject_steps_frac 0.0 0.92 \
     --static_w 0.0 \
-    --identity_guidance --identity_strength 0.25 --identity_steps_frac 0.0 0.35 \
+    --v_blend 0.25 --v_blend_steps_frac 0.0 1.0 \
+    --identity_guidance --identity_strength 0.4 --identity_steps_frac 0.0 0.65 \
     --seed 42
 
-# Dog: moderate pose change (standing→jumping) — same static_w 0.0 strategy as
-# cat to avoid SynPS w stalling at 1.0. Slightly wider injection window than cat
-# since the appearance difference (jumping vs standing) is more pronounced.
+# Dog: moderate pose change (standing→jumping). Same strategy as cat.
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
     --device cuda --cache_dir ./models --save_images \
@@ -125,9 +137,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name dog_standing_to_jumping \
     --source_prompt "a golden retriever standing in a park" \
     --edit_prompt   "a golden retriever jumping in a park" \
-    --inject_steps_frac 0.0 0.75 \
+    --inject_steps_frac 0.0 0.92 \
     --static_w 0.0 \
-    --identity_guidance --identity_strength 0.25 --identity_steps_frac 0.0 0.35 \
+    --v_blend 0.25 --v_blend_steps_frac 0.0 1.0 \
+    --identity_guidance --identity_strength 0.4 --identity_steps_frac 0.0 0.65 \
     --seed 7
 
 echo "=== Non-rigid editing complete. Results in results/ultimateflux/ ==="

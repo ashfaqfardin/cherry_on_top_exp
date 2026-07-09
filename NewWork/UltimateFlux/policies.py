@@ -769,18 +769,26 @@ class NonRigidPolicy(BasePolicy):
             self._m_scratch = []
             self._last_step = step
 
-        if not _step_active(step, n_steps, self.inject_steps_frac):
+        # These two windows are independent: TIER_A K,V injection and non-TIER_A V blend
+        # each have their own step range.  The early return only fires when BOTH are off.
+        inject_active = _step_active(step, n_steps, self.inject_steps_frac)
+        vblend_active = (self.v_blend > 0.0
+                         and _step_active(step, n_steps, self.v_blend_steps_frac))
+
+        if not inject_active and not vblend_active:
             return q, k, v
 
         if layer in self.inject_layers:
-            if self.synps and self._raw_k is not None and self._rotary_emb is not None:
-                k, v = self._synps_inject(k, v, img_offset)
-            else:
-                k, v = _kv_full_inject(k, v, img_offset)
-
-        elif (self.v_blend > 0.0
-              and _step_active(step, n_steps, self.v_blend_steps_frac)):
-            # Non-TIER_A V-only partial blend (fallback when synps=False).
+            # TIER_A: K+V injection — only when inject window is active.
+            if inject_active:
+                if self.synps and self._raw_k is not None and self._rotary_emb is not None:
+                    k, v = self._synps_inject(k, v, img_offset)
+                else:
+                    k, v = _kv_full_inject(k, v, img_offset)
+        elif vblend_active:
+            # Non-TIER_A: V-only blend — independent of inject window.
+            # Fires even when inject window is closed (final free steps),
+            # giving a colour anchor without touching Q×K (no pose suppression).
             # K is NEVER injected at non-TIER_A layers.
             v_src, v_edit = v.chunk(2)
             v_edit = v_edit.clone()
