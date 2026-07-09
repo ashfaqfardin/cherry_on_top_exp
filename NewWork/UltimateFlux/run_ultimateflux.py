@@ -75,7 +75,9 @@ def build_policy(cfg: dict):
     if task == "non_rigid":
         return NonRigidPolicy(
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
-            preserve_color=cfg.get("preserve_color", True),
+            v_blend=cfg.get("v_blend", 0.3),
+            k_s_lf=cfg.get("k_s_lf", 0.3),
+            preserve_color=cfg.get("preserve_color", False),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )
@@ -309,10 +311,21 @@ def parse_args():
                    metavar=("START", "END"),
                    help="Non-rigid / attr_edit: fraction of denoising steps to apply injection. "
                         "Default depends on task (non_rigid: 0.0 1.0, attr_edit: 0.0 1.0).")
-    p.add_argument("--no_preserve_color", dest="preserve_color", action="store_false", default=True,
-                   help="Non-rigid: disable post-processing Reinhard LAB colour transfer. "
-                        "By default source colour statistics are matched to the edit image after generation. "
-                        "Disable to allow the model full colour freedom (colour may drift from source).")
+    p.add_argument("--v_blend", type=float, default=0.3,
+                   help="Non-rigid: source V blend at non-TIER_A layers (default 0.3 = 30%%). "
+                        "Injects source colour features into edit branch at the 44 position-dependent "
+                        "layers without full V injection (which causes cascade collapse). "
+                        "Safe range 0.1-0.5. 0 = disabled (TIER_A K+V only). "
+                        "Inspired by SynPS (CVPR 2026) and Untwisting RoPE (arXiv 2602.05013).")
+    p.add_argument("--k_s_lf", type=float, default=0.3,
+                   help="Non-rigid: source K blend at low-freq head dims for non-TIER_A layers "
+                        "(Untwisting RoPE, arXiv 2602.05013). 0 = no K blend. "
+                        "High-freq dims (low head-dim index) always get 0%% source K to avoid spatial lock; "
+                        "low-freq dims get k_s_lf%% for semantic/content guidance. Default 0.3.")
+    p.add_argument("--preserve_color", dest="preserve_color", action="store_true", default=False,
+                   help="Non-rigid: apply Reinhard LAB colour transfer after generation. "
+                        "Off by default (v_blend handles colour during generation). "
+                        "Enable as an additional fallback if v_blend alone is insufficient.")
     p.add_argument("--inject_all_single", action="store_true", default=True,
                    help="Non-rigid: also inject K,V at ALL single-stream layers to lock background. Default True.")
     p.add_argument("--no_inject_all_single", dest="inject_all_single", action="store_false",
@@ -434,6 +447,8 @@ def main():
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
         "inject_steps_frac":    args.inject_steps_frac,
+        "v_blend":              args.v_blend,
+        "k_s_lf":               args.k_s_lf,
         "preserve_color":       args.preserve_color,
         "inject_all_single":    args.inject_all_single,
         "bg_steps_frac":        args.bg_steps_frac,

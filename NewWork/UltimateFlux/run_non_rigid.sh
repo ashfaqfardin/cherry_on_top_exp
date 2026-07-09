@@ -18,19 +18,29 @@
 #
 #   Reference: FreeFlux run_non_rigid.py  layer_idx=[0,7,8,9,10,18,25,28,37,42,45,50,56]
 #
-# Colour preservation (preserve_color=True, default):
-#   After generation, a Reinhard LAB statistics transfer is applied: the edit
-#   image's per-channel LAB mean and std are matched to the source's.  This
-#   corrects subject colour (bird/cat) without affecting the attention mechanism,
-#   so there is no risk of the cascade collapse that V-injection at all 44 layers
-#   would cause (V at all layers forces the residual toward source at every block,
-#   cascading the hidden state to source regardless of the edit prompt).
-#   Disable with --no_preserve_color if you want the model to generate a new colour.
+# Colour preservation at the attention level (SynPS + Untwisting RoPE inspired):
+#
+#   --v_blend 0.3  (default): At the 44 non-TIER_A (position-dependent) layers,
+#   blend 30% source V into edit V: V_edit = 0.3*V_src + 0.7*V_edit_orig.
+#   This is sub-cascade: the 70% edit contribution at every layer prevents the
+#   residual from converging to source; the 30% provides direct colour grounding.
+#   (100% V injection caused cascade; 0% left colour to drift — 30% is the balance.)
+#
+#   --k_s_lf 0.3  (default): Frequency-aware K blend at non-TIER_A layers.
+#   After RoPE encoding, head dim d=0,1 are high-freq (most spatially sensitive);
+#   d=D-2,D-1 are low-freq (most semantic/content-like). Source K weight interpolates
+#   from 0% at d=0 (no spatial lock) to k_s_lf=30% at d=D-1 (semantic guidance).
+#   Approximates Untwisting RoPE (arXiv:2602.05013) without de-rotation.
+#
+#   --preserve_color  (opt): Additionally apply Reinhard LAB statistics transfer
+#   post-generation. Use only if v_blend alone is insufficient.
 #
 # Tuning:
-#   --inject_steps_frac 0.08 1.0  Skip first 4 steps (gives Q more divergence time).
-#   --inject_steps_frac 0.0  0.8  Shorten window if background drifts too much.
-#   --no_preserve_color           Let the model choose its own colour.
+#   --v_blend 0.5         More source colour at non-TIER_A (stronger but riskier).
+#   --v_blend 0.1         Minimal colour injection (more pose freedom).
+#   --k_s_lf 0.0          Disable K blend (V blend only, simpler).
+#   --v_blend 0.0         Disable both (TIER_A K+V only; colour will drift).
+#   --inject_steps_frac 0.08 1.0  Skip first 4 steps for drastic pose changes.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

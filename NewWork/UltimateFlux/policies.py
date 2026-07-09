@@ -532,6 +532,37 @@ class ObjectAdditionPolicy(BasePolicy):
 
 # ─────────────────────────── Task 1: Non-rigid ───────────────────────────────
 
+def _freq_aware_k_blend(k: torch.Tensor, img_offset: int, s_hf: float, s_lf: float) -> torch.Tensor:
+    """
+    Blend source image-token K into edit K with frequency-aware per-dimension weights.
+
+    Approximates Untwisting RoPE (arXiv:2602.05013) without requiring de-rotation:
+    After RoPE is applied, the head dimension d encodes RoPE frequency — low d
+    (pairs 0,1) are highest-frequency (most spatially sensitive), high d (pairs
+    D-2,D-1) are lowest-frequency (most content/semantically sensitive).
+
+    By blending 0% at high-freq dims and s_lf% at low-freq dims, the edit
+    branch's attention at non-TIER_A layers is guided by source *content* (colour,
+    texture) rather than source *position* — avoiding spatial locking while still
+    pulling colour from source.
+
+    s_hf: blend weight at high-freq dimensions (0 = no injection → no spatial lock)
+    s_lf: blend weight at low-freq dimensions (partial source → semantic guidance)
+    """
+    k_src, k_edit = k.chunk(2)
+    D = k_src.shape[-1]
+    d = torch.arange(D, device=k_src.device, dtype=k_src.dtype)
+    # pair_norm: 0.0 at d=0,1 (highest freq), 1.0 at d=D-2,D-1 (lowest freq)
+    pair_norm = (d // 2) / max(D // 2 - 1, 1)
+    w = (s_hf + (s_lf - s_hf) * pair_norm).view(1, 1, 1, D)
+    k_edit = k_edit.clone()
+    k_edit[:, :, img_offset:, :] = (
+        w * k_src[:, :, img_offset:, :]
+        + (1.0 - w) * k_edit[:, :, img_offset:, :]
+    )
+    return torch.cat([k_src, k_edit])
+
+
 def _reinhard_color_transfer(edit_img: Image.Image, src_img: Image.Image) -> Image.Image:
     """
     Transfer source image colour statistics onto edit image (Reinhard et al.).
@@ -562,51 +593,59 @@ class NonRigidPolicy(BasePolicy):
     """
     K,V injection for non-rigid pose/action editing (FreeFlux mutual self-attention control).
 
-    Injection (generation)
-    ----------------------
-    TIER_A (13 content-similarity / low-RoPE layers): full K+V injection.
-      These layers are content-driven, not position-driven.  Q from "bird flying"
-      attends to source K,V differently from Q from "bird perched," allowing the
-      pose to diverge while keeping coarse appearance features from source.
+    Injection — TIER_A (pose transfer)
+    ------------------------------------
+    13 content-similarity layers [0,7,8,9,10,18,25,28,37,42,45,50,56]: full K+V.
+    Q from "bird flying" attends to source K,V differently from Q from "bird perched",
+    allowing pose to diverge while keeping coarse appearance from source.
 
-    WHY NOT ALL-57 K+V: Position-dependent layers use high-RoPE keys.  Injecting
-    source K there forces each edit token to attend where pos_i ≈ pos_j → edit
-    reconstructs source pixel-by-pixel regardless of the edit prompt.
+    WHY NOT ALL-57 K+V (failure mode 1): Position-dependent layers use high-RoPE keys.
+    Injecting source K there forces each edit token to attend where pos_i ≈ pos_j
+    (RoPE relative-position property) → reconstructs source pixel-by-pixel regardless
+    of prompt.
 
-    WHY NOT V-ONLY AT ALL NON-TIER_A: V injection at every layer collapses the
-    same way.  Each layer's output reads source V; the residual stream is pulled
-    toward source features; Q and K computed from that residual also become
-    source-like; the cascade converges to source regardless of prompt.  The model
-    needs free non-TIER_A layers to generate new pose-specific features (spread
-    wings, different body contour) that don't exist in source V.
+    WHY NOT V-ONLY AT ALL 44 NON-TIER_A (failure mode 2): V injection at every layer
+    causes the same cascade collapse via V channel — each layer's output reads source V;
+    the residual stream is pulled toward source; Q and K computed from that state also
+    become source-like; all 57 layers converge to source.
 
-    Colour preservation (post-processing)
-    --------------------------------------
-    preserve_color=True (default): after generation, apply Reinhard LAB statistics
-    transfer from source to edit.  Matches the edit image's per-channel LAB mean
-    and std to the source's — corrects bird/cat colour without affecting generation.
-    This is a post-process and cannot cause cascade collapse.
+    Colour preservation — partial injection at non-TIER_A (v_blend > 0)
+    ---------------------------------------------------------------------
+    Inspired by SynPS (CVPR 2026, arXiv:2512.14423) and Untwisting RoPE
+    (arXiv:2602.05013):
 
-    Exact FreeFlux settings (run_non_rigid.py):
-        layer_idx = TIER_A = [0,7,8,9,10,18,25,28,37,42,45,50,56]
-        step_idx  = list(range(0, 50))   # ALL 50 steps
+    v_blend (default 0.3): At the remaining 44 non-TIER_A layers, blend source V
+    into edit V — `V_edit = v_blend * V_src + (1-v_blend) * V_edit_orig`.
+    0.3 (30% from source) is sub-cascade: the 70% edit contribution at every layer
+    prevents the residual from converging to source; the 30% anchors subject colour.
+
+    k_s_lf (default 0.3): Frequency-aware K blend at non-TIER_A (Untwisting RoPE).
+    After RoPE is applied, head dimension d=0,1 are highest-frequency (spatial lock),
+    d=D-2,D-1 are lowest-frequency (semantic/content).  We blend source K at weight 0
+    for high-freq dims and k_s_lf for low-freq dims — semantic content guidance
+    without spatial locking.
+
+    v_blend=1.0 / k_s_lf=1.0 (i.e., full injection everywhere) are the failure mode.
+    Safe range: v_blend ∈ [0.1, 0.5], k_s_lf ∈ [0.0, 0.5].
 
     Parameters
     ----------
-    inject_layers    : Layers for K+V injection. Default TIER_A (13 layers).
-                       Never pass list(range(57)) — identical output.
-    inject_steps_frac: Step window (start_frac, end_frac). Default all steps (0, 1).
-                       Use (0.08, 1.0) to skip first 4 steps for drastic pose changes.
-    preserve_color   : Apply Reinhard LAB colour transfer in post_process (default True).
-                       Corrects edit subject colour to match source without affecting
-                       the attention mechanism.
+    inject_layers    : K+V injection layers. Default TIER_A (13 layers).
+    inject_steps_frac: Denoising step window. Default all steps (0.0, 1.0).
+    v_blend          : Source V blend at non-TIER_A layers (0=off, 0.3=default).
+    k_s_lf           : Source K weight for low-freq head dims at non-TIER_A (0=off).
+                       0.0 at high-freq dims always (prevents spatial lock).
+    preserve_color   : Apply Reinhard LAB statistics transfer after generation.
+                       Fallback if v_blend alone is insufficient.
     """
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
-        preserve_color: bool = True,
+        v_blend: float = 0.3,
+        k_s_lf: float = 0.3,
+        preserve_color: bool = False,
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
@@ -614,6 +653,8 @@ class NonRigidPolicy(BasePolicy):
         self.inject_layers     = set(inject_layers if inject_layers is not None
                                      else TIER_A)
         self.inject_steps_frac = inject_steps_frac
+        self.v_blend           = v_blend
+        self.k_s_lf            = k_s_lf
         self.preserve_color    = preserve_color
         self._txt_len_single   = 512
 
@@ -622,8 +663,29 @@ class NonRigidPolicy(BasePolicy):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-        if layer in self.inject_layers and _step_active(step, n_steps, self.inject_steps_frac):
+        if not _step_active(step, n_steps, self.inject_steps_frac):
+            return q, k, v
+
+        if layer in self.inject_layers:
+            # TIER_A: full K+V (pose transfer via content-similarity attention)
             k, v = _kv_full_inject(k, v, img_offset)
+
+        elif self.v_blend > 0.0:
+            # Non-TIER_A: partial injection for colour preservation.
+            # K: frequency-aware blend (Untwisting RoPE, arXiv:2602.05013)
+            #    0% at high-freq head dims → no spatial lock
+            #    k_s_lf% at low-freq head dims → semantic/content guidance
+            if self.k_s_lf > 0.0:
+                k = _freq_aware_k_blend(k, img_offset, s_hf=0.0, s_lf=self.k_s_lf)
+            # V: uniform blend — direct colour grounding without cascade
+            v_src, v_edit = v.chunk(2)
+            v_edit = v_edit.clone()
+            v_edit[:, :, img_offset:, :] = (
+                self.v_blend * v_src[:, :, img_offset:, :]
+                + (1.0 - self.v_blend) * v_edit[:, :, img_offset:, :]
+            )
+            v = torch.cat([v_src, v_edit])
+
         return q, k, v
 
     def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
