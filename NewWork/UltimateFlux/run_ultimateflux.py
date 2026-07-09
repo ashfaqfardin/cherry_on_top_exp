@@ -92,6 +92,7 @@ def build_policy(cfg: dict):
             fg_mask=fg_mask,
             use_sam2=cfg.get("use_sam2_nonrigid", False),
             sam2_model_id=cfg.get("sam2_model_id", "facebook/sam2-hiera-large"),
+            bg_dilate=cfg.get("bg_dilate", 6),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )
@@ -350,6 +351,11 @@ def parse_args():
                         "Activates KV-Edit masked mode automatically.")
     p.add_argument("--no_use_sam2_nonrigid", dest="use_sam2_nonrigid", action="store_false",
                    help="Non-rigid: disable SAM2 auto-segmentation (default: off).")
+    p.add_argument("--bg_dilate", type=int, default=6,
+                   help="Non-rigid masked mode: token-space dilation radius for soft bg composite. "
+                        "Expands the 'safe fg' zone so the edited pose can extend beyond the "
+                        "source mask boundary without ghost traces (default 6 = ~96px at 1024px). "
+                        "Increase if ghost traces remain; decrease for tighter bg lock.")
     p.add_argument("--identity_guidance", dest="identity_guidance",
                    action="store_true", default=False,
                    help="Non-rigid: after each denoising step, blend low-frequency FFT components "
@@ -505,6 +511,7 @@ def main():
         "inject_steps_frac":    args.inject_steps_frac,
         "fg_mask":              args.fg_mask,
         "use_sam2_nonrigid":    args.use_sam2_nonrigid,
+        "bg_dilate":            args.bg_dilate,
         "synps":                args.synps,
         "m_min":                args.m_min,
         "m_max":                args.m_max,

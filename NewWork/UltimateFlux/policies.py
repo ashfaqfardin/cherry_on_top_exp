@@ -712,6 +712,7 @@ class NonRigidPolicy(BasePolicy):
         fg_mask: Optional[Image.Image] = None,
         use_sam2: bool = False,
         sam2_model_id: str = "facebook/sam2-hiera-large",
+        bg_dilate: int = 6,   # token-space dilation radius for soft bg composite
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
@@ -732,6 +733,7 @@ class NonRigidPolicy(BasePolicy):
         self.raw_fg_mask         = fg_mask
         self.use_sam2            = use_sam2
         self.sam2_model_id       = sam2_model_id
+        self.bg_dilate           = bg_dilate
         self._txt_len_single     = 512
         # SynPS per-generation state
         self.current_w: float        = static_w if static_w is not None else 1.0
@@ -957,22 +959,52 @@ class NonRigidPolicy(BasePolicy):
         self._m_scratch.append(s_img / max(s_txt, 0.01))
 
     def post_step(self, latents, step, n_steps):
-        # 1. FFT colour anchor for foreground identity (runs first; bg gets overwritten below)
+        # FFT colour anchor for foreground identity.
         if self.identity_guidance and _step_active(step, n_steps, self.identity_steps_frac):
             latents = _freq_identity_guidance(
                 latents, self._lat_h, self._lat_w, self._lat_C,
                 self.identity_strength, self.low_freq_cutoff,
             )
 
-        # 2. Hard background compositing (KV-Edit inversion-free analogue).
-        # Source branch (latents[0]) tracks the source trajectory at every timestep.
-        # Overwriting edit bg tokens with source bg tokens gives pixel-perfect
-        # background preservation at the latent level — complementary to the K,V
-        # injection in inject_qkv which works at the attention level.
+        # Background latent compositing (masked mode only).
+        #
+        # WHY NO HARD BINARY COMPOSITE:
+        # The fg mask is computed from the SOURCE object position.  After pose
+        # change the object extends into new positions that the mask labels as
+        # background.  Hard-replacing those positions with source latent erases
+        # the new limbs/wings and leaves a ghost of the original pose.
+        #
+        # Instead we use a soft composite with a DILATED and BLURRED fg mask:
+        #   • Dilation (max-pool, radius bg_dilate tokens) expands the "safe fg"
+        #     zone so the new pose has room to extend beyond the source boundary.
+        #   • Gaussian blur (avg-pool) smooths the boundary so there is no hard
+        #     seam between composited background and free foreground.
+        #   • Alpha=1 → keep edit latent (fg & extended zone).
+        #     Alpha=0 → composite source latent (far background, unchanged).
+        #
+        # Background preservation is primarily handled at the attention level in
+        # _masked_inject_qkv (bg tokens always receive source K,V at all 57
+        # layers); this soft composite is a supplementary anchor for far bg only.
         if self._fg_token_mask is not None:
+            th = self._lat_h // 2
+            tw = self._lat_w // 2
+            fg_2d = (self._fg_token_mask
+                     .reshape(th, tw)
+                     .float()
+                     .to(latents.device)
+                     .unsqueeze(0).unsqueeze(0))   # (1,1,th,tw)
+
+            # Dilate: give the edited object room to extend beyond source boundary
+            dil = self.bg_dilate
+            fg_dil = F.max_pool2d(fg_2d, kernel_size=2*dil+1, stride=1, padding=dil)
+
+            # Blur: smooth the boundary to avoid seams
+            fg_soft = F.avg_pool2d(fg_dil, kernel_size=5, stride=1, padding=2)
+
+            alpha = fg_soft.reshape(th * tw, 1)    # (S, 1) — 1=keep edit, 0=composite src
             latents = latents.clone()
-            bg = ~self._fg_token_mask.to(latents.device)   # (n_img,) bool
-            latents[1, bg, :] = latents[0, bg, :]
+            # latents: (2, S, C_packed)
+            latents[1] = alpha * latents[1] + (1.0 - alpha) * latents[0]
 
         return latents
 
