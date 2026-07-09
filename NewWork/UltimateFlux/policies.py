@@ -708,6 +708,10 @@ class NonRigidPolicy(BasePolicy):
         identity_strength: float = 0.3,
         identity_steps_frac: Tuple[float, float] = (0.0, 0.5),
         low_freq_cutoff: float = 0.1,
+        # KV-Edit masked mode: segment subject → bg frozen, fg free to change pose
+        fg_mask: Optional[Image.Image] = None,
+        use_sam2: bool = False,
+        sam2_model_id: str = "facebook/sam2-hiera-large",
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
@@ -720,12 +724,15 @@ class NonRigidPolicy(BasePolicy):
         self.synps              = synps
         self.m_min              = m_min
         self.m_max              = m_max
-        self.static_w           = static_w   # when set: bypass M_t, use this w always
-        self.identity_guidance    = identity_guidance
-        self.identity_strength    = identity_strength
-        self.identity_steps_frac  = identity_steps_frac
-        self.low_freq_cutoff      = low_freq_cutoff
-        self._txt_len_single    = 512
+        self.static_w           = static_w
+        self.identity_guidance   = identity_guidance
+        self.identity_strength   = identity_strength
+        self.identity_steps_frac = identity_steps_frac
+        self.low_freq_cutoff     = low_freq_cutoff
+        self.raw_fg_mask         = fg_mask
+        self.use_sam2            = use_sam2
+        self.sam2_model_id       = sam2_model_id
+        self._txt_len_single     = 512
         # SynPS per-generation state
         self.current_w: float        = static_w if static_w is not None else 1.0
         self._last_step: int         = -1
@@ -737,40 +744,85 @@ class NonRigidPolicy(BasePolicy):
         self._lat_h: int = 128
         self._lat_w: int = 128
         self._lat_C: int = 16
+        # KV-Edit: foreground token mask — (n_img,) bool, True = subject (editable)
+        self._fg_token_mask: Optional[torch.Tensor] = None
 
-    def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
+    def pre_generate(
+        self, pipe,
+        max_sequence_length: int = 512,
+        device: str = "cuda",
+        height: int = 1024,
+        width: int = 1024,
+        num_steps: int = 28,
+        seed: int = 0,
+        source_prompt: str = "",
+        guidance_scale: float = 3.5,
+        **kwargs,
+    ):
         self._txt_len_single = max_sequence_length
-        # Reset SynPS state for each new generation run
         self.current_w  = self.static_w if self.static_w is not None else 1.0
         self._last_step = -1
         self._m_scratch = []
-        # Capture latent spatial dims for post_step FFT guidance
-        height = kwargs.get('height', 1024)
-        width  = kwargs.get('width',  1024)
         self._lat_h = height // 8
         self._lat_w = width  // 8
-        self._lat_C = pipe.transformer.config.in_channels // 4  # 16 for FLUX
+        self._lat_C = pipe.transformer.config.in_channels // 4
+
+        # ── KV-Edit mask setup ────────────────────────────────────────────────
+        self._fg_token_mask = None
+        raw_mask = self.raw_fg_mask
+
+        if raw_mask is None and self.use_sam2:
+            print("[NonRigid] Generating source preview for SAM2 segmentation…")
+            src_img = _generate_source_preview(
+                pipe, source_prompt, seed, height, width,
+                num_steps, guidance_scale, max_sequence_length, device,
+            )
+            if src_img is not None:
+                print("[NonRigid] Running SAM2 automatic segmentation…")
+                raw_mask = _auto_fg_mask_sam2(
+                    src_img, device=device, sam2_model_id=self.sam2_model_id)
+                if raw_mask is None:
+                    print("[NonRigid] SAM2 found no mask — falling back to global TIER_A mode.")
+            else:
+                print("[NonRigid] Source preview failed — no mask.")
+
+        if raw_mask is not None:
+            # Token grid: each token = 2×2 patch of the latent (H//8 × W//8)
+            th = height // 16
+            tw = width  // 16
+            mask_np = np.array(raw_mask.convert("L").resize((tw, th), Image.NEAREST))
+            self._fg_token_mask = torch.tensor(
+                mask_np > 127, dtype=torch.bool
+            ).reshape(th * tw)
+            n_fg  = int(self._fg_token_mask.sum())
+            n_tot = th * tw
+            print(f"[NonRigid] KV-Edit mask: {n_fg}/{n_tot} foreground tokens "
+                  f"({100 * n_fg // n_tot}%)")
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
 
-        # Step boundary: finalize M_t from the previous step and update w.
+        # Step boundary: finalize M_t and update SynPS w.
         if step != self._last_step:
             if self.static_w is not None:
-                self.current_w = self.static_w           # static override — never change
+                self.current_w = self.static_w
             elif self._last_step >= 0 and self.synps and self._m_scratch:
                 M = sum(self._m_scratch) / len(self._m_scratch)
                 if M > self.m_max:
-                    self.current_w = 0.0                 # under-editing → position-agnostic
+                    self.current_w = 0.0
                 elif M < self.m_min:
-                    self.current_w = 1.0                 # over-editing  → full spatial lock
+                    self.current_w = 1.0
                 else:
                     self.current_w = (self.m_max - M) / (self.m_max - self.m_min)
             self._m_scratch = []
             self._last_step = step
 
-        # These two windows are independent: TIER_A K,V injection and non-TIER_A V blend
-        # each have their own step range.  The early return only fires when BOTH are off.
+        # ── Masked mode (KV-Edit): subject segmented ─────────────────────────
+        if self._fg_token_mask is not None:
+            return self._masked_inject_qkv(q, k, v, layer, img_offset,
+                                           _step_active(step, n_steps, self.inject_steps_frac))
+
+        # ── Global mode (no mask) ─────────────────────────────────────────────
         inject_active = _step_active(step, n_steps, self.inject_steps_frac)
         vblend_active = (self.v_blend > 0.0
                          and _step_active(step, n_steps, self.v_blend_steps_frac))
@@ -779,17 +831,12 @@ class NonRigidPolicy(BasePolicy):
             return q, k, v
 
         if layer in self.inject_layers:
-            # TIER_A: K+V injection — only when inject window is active.
             if inject_active:
                 if self.synps and self._raw_k is not None and self._rotary_emb is not None:
                     k, v = self._synps_inject(k, v, img_offset)
                 else:
                     k, v = _kv_full_inject(k, v, img_offset)
         elif vblend_active:
-            # Non-TIER_A: V-only blend — independent of inject window.
-            # Fires even when inject window is closed (final free steps),
-            # giving a colour anchor without touching Q×K (no pose suppression).
-            # K is NEVER injected at non-TIER_A layers.
             v_src, v_edit = v.chunk(2)
             v_edit = v_edit.clone()
             v_edit[:, :, img_offset:, :] = (
@@ -800,28 +847,81 @@ class NonRigidPolicy(BasePolicy):
 
         return q, k, v
 
+    def _masked_inject_qkv(self, q, k, v, layer, img_offset, inject_active):
+        """
+        KV-Edit (ICCV 2025, arXiv:2502.17363) adapted for pose editing.
+
+        Three-zone attention injection based on subject mask:
+
+          Background tokens  (all 57 layers, all 50 steps):
+              K_edit[bg] = K_src[bg],  V_edit[bg] = V_src[bg]
+              → Background is pixel-locked.  Every attention head in every layer
+                sees the same key/value it would see if the source were being
+                denoised — so background tokens converge to source appearance.
+
+          Foreground tokens at TIER_A  (when inject_active):
+              K_edit[fg] = SynPS(K_src_raw[fg], w)
+              V_edit[fg] = V_src[fg]
+              → Subject appearance (colour, texture) is anchored via SynPS.
+                w=0 → position-agnostic retrieval (strongest colour anchor).
+                w=1 → full RoPE (FreeFlux baseline).
+
+          Foreground tokens at non-TIER_A  (all steps):
+              K_edit[fg], V_edit[fg] remain unchanged  (edit branch values)
+              → Subject is completely free.  Edit Q from "bird flying" drives
+                the attention pattern at position-dependent layers without any
+                source K competing — pose changes naturally.
+        """
+        fg    = self._fg_token_mask.to(k.device)          # (n_img,) bool
+        bg    = ~fg
+        bg_abs = img_offset + bg.nonzero(as_tuple=True)[0]  # absolute seq positions
+        fg_abs = img_offset + fg.nonzero(as_tuple=True)[0]
+
+        k = k.clone()
+        v = v.clone()
+
+        # ── Background: always inject source K,V ─────────────────────────────
+        k[1, :, bg_abs, :] = k[0, :, bg_abs, :]
+        v[1, :, bg_abs, :] = v[0, :, bg_abs, :]
+
+        # ── Foreground at TIER_A: SynPS appearance anchor ────────────────────
+        if layer in self.inject_layers and inject_active:
+            if self.synps and self._raw_k is not None and self._rotary_emb is not None:
+                w = self.current_w
+                k_src_raw = self._raw_k[0:1]   # (1, H, L, D) pre-RoPE source
+                if w < 1.0 - 1e-6:
+                    cos, sin = self._rotary_emb
+                    # Apply w-scaled RoPE to full source K, then pick fg positions.
+                    # Full-tensor apply_rotary_emb avoids slicing cos/sin shapes.
+                    k_src_w = apply_rotary_emb(k_src_raw, (w * cos + (1.0 - w), w * sin))
+                else:
+                    k_src_w = k[0:1]   # already-RoPE source K
+                k[1:2, :, fg_abs, :] = k_src_w[0:1, :, fg_abs, :]
+            else:
+                k[1, :, fg_abs, :] = k[0, :, fg_abs, :]
+            v[1, :, fg_abs, :] = v[0, :, fg_abs, :]
+
+        # Foreground at non-TIER_A: edit K,V unchanged — pose is free.
+        return q, k, v
+
     def _synps_inject(self, k, v, img_offset: int):
         """
         SynPS TIER_A injection: re-encode source K with w-scaled RoPE then inject.
-
-        cos_w = w*cos + (1-w), sin_w = w*sin (linear interpolation).
-        Valid for TIER_A because these layers have low RoPE frequency (small angles).
-        Text positions have cos=1, sin=0 so they are unchanged by the scaling.
+        Used in global (no-mask) mode.  Masked mode uses _masked_inject_qkv instead.
         """
         w = self.current_w
-        k_src_raw, _      = self._raw_k.chunk(2)   # pre-RoPE source K
-        k_src_rope, k_edit_rope = k.chunk(2)        # post-RoPE K
+        k_src_raw, _            = self._raw_k.chunk(2)
+        k_src_rope, k_edit_rope = k.chunk(2)
         v_src, v_edit           = v.chunk(2)
 
         if w < 1.0 - 1e-6:
             cos, sin = self._rotary_emb
             k_src_w = apply_rotary_emb(k_src_raw, (w * cos + (1.0 - w), w * sin))
         else:
-            k_src_w = k_src_rope   # w=1: already-RoPE-encoded source K
+            k_src_w = k_src_rope
 
         k_edit_new = k_edit_rope.clone()
         k_edit_new[:, :, img_offset:, :] = k_src_w[:, :, img_offset:, :]
-
         v_edit_new = v_edit.clone()
         v_edit_new[:, :, img_offset:, :] = v_src[:, :, img_offset:, :]
 
@@ -829,16 +929,16 @@ class NonRigidPolicy(BasePolicy):
 
     def observe_attn_out(self, out, layer, step, txt_len):
         """
-        Accumulate per-block editing-measurement m^l_t = S_img / S_txt for SynPS.
-        Called by the sampler after every SDPA; only TIER_A blocks are recorded.
+        Accumulate M_t = S_img / S_txt for SynPS adaptive w.
+        In masked mode, similarity is measured on foreground tokens only —
+        background tokens always have identical K,V (source injected), which
+        would otherwise push S_img artificially high and keep w near 0 forever.
         """
         if not self.synps or layer not in self.inject_layers:
             return
 
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-
-        # out: (B, H, L, D) — B=2: index 0 = source, index 1 = edit
-        src = out[0]   # (H, L, D)
+        src = out[0]
         tgt = out[1]
 
         def _cos(a, b):
@@ -847,18 +947,34 @@ class NonRigidPolicy(BasePolicy):
             return (af @ bf) / (af.norm() * bf.norm() + 1e-8)
 
         s_txt = _cos(src[:, :txt_len, :], tgt[:, :txt_len, :]).item() if txt_len > 0 else 1.0
-        s_img = _cos(src[:, img_offset:, :], tgt[:, img_offset:, :]).item()
+
+        if self._fg_token_mask is not None:
+            fg_abs = img_offset + self._fg_token_mask.to(out.device).nonzero(as_tuple=True)[0]
+            s_img = _cos(src[:, fg_abs, :], tgt[:, fg_abs, :]).item()
+        else:
+            s_img = _cos(src[:, img_offset:, :], tgt[:, img_offset:, :]).item()
+
         self._m_scratch.append(s_img / max(s_txt, 0.01))
 
     def post_step(self, latents, step, n_steps):
-        if not self.identity_guidance:
-            return latents
-        if not _step_active(step, n_steps, self.identity_steps_frac):
-            return latents
-        return _freq_identity_guidance(
-            latents, self._lat_h, self._lat_w, self._lat_C,
-            self.identity_strength, self.low_freq_cutoff,
-        )
+        # 1. FFT colour anchor for foreground identity (runs first; bg gets overwritten below)
+        if self.identity_guidance and _step_active(step, n_steps, self.identity_steps_frac):
+            latents = _freq_identity_guidance(
+                latents, self._lat_h, self._lat_w, self._lat_C,
+                self.identity_strength, self.low_freq_cutoff,
+            )
+
+        # 2. Hard background compositing (KV-Edit inversion-free analogue).
+        # Source branch (latents[0]) tracks the source trajectory at every timestep.
+        # Overwriting edit bg tokens with source bg tokens gives pixel-perfect
+        # background preservation at the latent level — complementary to the K,V
+        # injection in inject_qkv which works at the attention level.
+        if self._fg_token_mask is not None:
+            latents = latents.clone()
+            bg = ~self._fg_token_mask.to(latents.device)   # (n_img,) bool
+            latents[1, bg, :] = latents[0, bg, :]
+
+        return latents
 
     def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
         if self.preserve_color:

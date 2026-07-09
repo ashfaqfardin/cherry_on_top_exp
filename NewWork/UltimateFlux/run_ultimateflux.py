@@ -73,6 +73,9 @@ def build_policy(cfg: dict):
     task = cfg.get("task", "non_rigid")
 
     if task == "non_rigid":
+        fg_mask = None
+        if cfg.get("fg_mask"):
+            fg_mask = Image.open(cfg["fg_mask"]).convert("L")
         return NonRigidPolicy(
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
             v_blend=cfg.get("v_blend", 0.0),
@@ -86,6 +89,9 @@ def build_policy(cfg: dict):
             identity_strength=cfg.get("identity_strength", 0.3),
             identity_steps_frac=tuple(cfg["identity_steps_frac"]) if cfg.get("identity_steps_frac") else (0.0, 0.5),
             low_freq_cutoff=cfg.get("low_freq_cutoff", 0.1),
+            fg_mask=fg_mask,
+            use_sam2=cfg.get("use_sam2_nonrigid", False),
+            sam2_model_id=cfg.get("sam2_model_id", "facebook/sam2-hiera-large"),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )
@@ -334,6 +340,16 @@ def parse_args():
                         "0.0 = fully position-agnostic (max colour retrieval); "
                         "1.0 = full RoPE (FreeFlux baseline). "
                         "Try 0.0 first if identity is not fully preserved.")
+    p.add_argument("--fg_mask", default=None,
+                   help="Non-rigid: path to foreground mask image (white=subject to edit). "
+                        "Activates KV-Edit masked mode. If omitted and --use_sam2_nonrigid, "
+                        "SAM2 auto-segments the subject from a source preview.")
+    p.add_argument("--use_sam2_nonrigid", action="store_true", default=False,
+                   help="Non-rigid: auto-segment subject with SAM2 before generation. "
+                        "Generates a source preview, runs SAM2, builds a foreground mask. "
+                        "Activates KV-Edit masked mode automatically.")
+    p.add_argument("--no_use_sam2_nonrigid", dest="use_sam2_nonrigid", action="store_false",
+                   help="Non-rigid: disable SAM2 auto-segmentation (default: off).")
     p.add_argument("--identity_guidance", dest="identity_guidance",
                    action="store_true", default=False,
                    help="Non-rigid: after each denoising step, blend low-frequency FFT components "
@@ -487,6 +503,8 @@ def main():
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
         "inject_steps_frac":    args.inject_steps_frac,
+        "fg_mask":              args.fg_mask,
+        "use_sam2_nonrigid":    args.use_sam2_nonrigid,
         "synps":                args.synps,
         "m_min":                args.m_min,
         "m_max":                args.m_max,
