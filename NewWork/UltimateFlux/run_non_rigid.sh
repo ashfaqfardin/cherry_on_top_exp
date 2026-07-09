@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
 # Task 1 — Non-rigid editing (FreeFlux mutual self-attention control)
 #
-# Injection strategy:
-#   TIER_A layers (13 content-similarity layers: 0,7,8,9,10,18,25,28,37,42,45,50,56):
-#       K-ONLY injection at ALL 50 steps.
+# Injection strategy — matching FreeFlux's default (layer_idx=None → all 57 layers):
+#   ALL 57 layers: K,V injection at ALL denoising steps.
 #
-#   Why K-only (not K,V):  V injection resets the edit branch's content to source at
-#   every TIER_A layer every step — flying features can never accumulate because they
-#   are overwritten before they compound.  K-only keeps V free to develop the new pose
-#   (flying) while K from source directs attention toward content-similar positions
-#   (same bird species, structural consistency).
-#
-#   Steps: 50 — gives V enough iterations to accumulate the pose change.
+#   Mechanism: Q is never injected — it comes from the edit branch and carries the
+#   "flying bird" text conditioning.  With source K,V at every layer, both branches
+#   attend to the same perched-bird content, but the edit Q weights it differently
+#   at each of 57 × 50 attention calls, cumulatively steering denoising toward the
+#   new pose.  Injecting fewer layers (e.g. TIER_A only) leaves uncontrolled layers
+#   that disrupt this Q-driven signal and kill the pose-change effect.
 #
 # Tuning:
-#   --inject_steps_frac 0.0 0.8   Shorten injection window if edit is too weak.
-#   --inject_all_single           Add K,V at ALL single-stream layers for stronger
-#                                 background lock (at some cost to single-stream freedom).
+#   --inject_steps_frac 0.08 1.0  Skip first 4 steps (FreeFlux's start_step=4 default).
+#   --inject_steps_frac 0.0  0.8  Shorten window if background drifts too much.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

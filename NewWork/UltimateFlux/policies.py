@@ -534,37 +534,40 @@ class ObjectAdditionPolicy(BasePolicy):
 
 class NonRigidPolicy(BasePolicy):
     """
-    K-only injection for non-rigid pose/action editing at TIER_A content-similarity layers.
+    K,V injection for non-rigid pose/action editing (FreeFlux mutual self-attention control).
 
-    Why K-only (not K,V):
-      V injection resets the edit branch's content to source at every TIER_A layer on
-      every step — no matter how many steps you run, flying features cannot accumulate
-      because they are overwritten before they compound.  K-only lets V develop freely
-      under the edit prompt (flying pose emerges over steps) while K from source keeps
-      attention pointing at content-similar positions (same bird species, structural
-      consistency, partial background overlap).
+    Injects source image-token K,V into the edit branch at ALL 57 transformer layers
+    for all denoising steps.  Q is never touched — it comes from the edit branch and
+    carries the "flying bird" (or other pose) text conditioning.
+
+    Mechanism: with source K,V at every layer, both branches attend to the same
+    perched-bird content, but "flying bird" Q weights that content differently at each
+    of the 57 × 50 attention calls, cumulatively steering the denoising trajectory
+    toward the new pose.  Using only a subset of layers (e.g. TIER_A) leaves 44 free
+    layers that add uncontrolled noise to this Q-driven signal, killing the effect.
+
+    This matches FreeFlux's default: layer_idx=None → list(range(0, 57)), all steps.
 
     Parameters
     ----------
-    inject_layers     : Content-similarity layers (K-only). Default TIER_A.
-    inject_steps_frac : Step window for TIER_A injection. Default all steps (0, 1).
-    inject_all_single : If True, add K,V injection at ALL single-stream layers for
-                        stronger background preservation (at the cost of some edit
-                        freedom in single-stream).  Default False.
-    bg_steps_frac     : Step window for all-single-stream injection. Default all steps.
+    inject_layers     : Layers for K,V injection. Default ALL 57 layers.
+    inject_steps_frac : Step window. Default all steps (0, 1).
+                        Use (0.08, 1.0) to match FreeFlux's start_step=4 default.
     """
+
+    _ALL_LAYERS = list(range(N_LAYERS))   # [0 … 56]
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        # kept for backward-compat; ignored in current implementation
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
     ):
-        self.inject_layers     = set(inject_layers if inject_layers is not None else TIER_A)
+        self.inject_layers     = set(inject_layers if inject_layers is not None
+                                     else self._ALL_LAYERS)
         self.inject_steps_frac = inject_steps_frac
-        self.inject_all_single = inject_all_single
-        self.bg_steps_frac     = bg_steps_frac
         self._txt_len_single   = 512
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
@@ -572,14 +575,8 @@ class NonRigidPolicy(BasePolicy):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-        is_single  = txt_len == 0
 
         if layer in self.inject_layers and _step_active(step, n_steps, self.inject_steps_frac):
-            # TIER_A: K-only — structural consistency (WHERE) without content lock (WHAT).
-            # V stays from the edit branch so flying/pose features accumulate over steps.
-            k, v = _k_only_inject(k, v, img_offset)
-        elif self.inject_all_single and is_single and _step_active(step, n_steps, self.bg_steps_frac):
-            # All single-stream: K,V — strong background lock.
             k, v = _kv_full_inject(k, v, img_offset)
 
         return q, k, v
