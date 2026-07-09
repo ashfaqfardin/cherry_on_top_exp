@@ -75,7 +75,7 @@ def build_policy(cfg: dict):
     if task == "non_rigid":
         return NonRigidPolicy(
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
-            preserve_v_all=cfg.get("preserve_v_all", True),
+            preserve_color=cfg.get("preserve_color", True),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )
@@ -309,10 +309,10 @@ def parse_args():
                    metavar=("START", "END"),
                    help="Non-rigid / attr_edit: fraction of denoising steps to apply injection. "
                         "Default depends on task (non_rigid: 0.0 1.0, attr_edit: 0.0 1.0).")
-    p.add_argument("--no_preserve_v", dest="preserve_v_all", action="store_false", default=True,
-                   help="Non-rigid: disable V injection at non-TIER_A layers. "
-                        "By default source V is injected at all 57 layers to preserve colour/texture. "
-                        "Disable to allow the model full colour freedom (colour will drift from source).")
+    p.add_argument("--no_preserve_color", dest="preserve_color", action="store_false", default=True,
+                   help="Non-rigid: disable post-processing Reinhard LAB colour transfer. "
+                        "By default source colour statistics are matched to the edit image after generation. "
+                        "Disable to allow the model full colour freedom (colour may drift from source).")
     p.add_argument("--inject_all_single", action="store_true", default=True,
                    help="Non-rigid: also inject K,V at ALL single-stream layers to lock background. Default True.")
     p.add_argument("--no_inject_all_single", dest="inject_all_single", action="store_false",
@@ -434,7 +434,7 @@ def main():
         "use_sam2":       args.use_sam2,
         "sam2_model_id":  args.sam2_model_id,
         "inject_steps_frac":    args.inject_steps_frac,
-        "preserve_v_all":       args.preserve_v_all,
+        "preserve_color":       args.preserve_color,
         "inject_all_single":    args.inject_all_single,
         "bg_steps_frac":        args.bg_steps_frac,
         "inject_layers":        args.inject_layers,

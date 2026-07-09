@@ -18,16 +18,19 @@
 #
 #   Reference: FreeFlux run_non_rigid.py  layer_idx=[0,7,8,9,10,18,25,28,37,42,45,50,56]
 #
-# Colour preservation (preserve_v_all=True, default):
-#   Source image-token V is also injected at the 44 non-TIER_A layers.
-#   K is NOT injected there — only V.  This preserves the subject's colour/texture
-#   without causing spatial locking (injecting K at those layers would).
-#   Disable with --no_preserve_v if you want the model to generate a new colour.
+# Colour preservation (preserve_color=True, default):
+#   After generation, a Reinhard LAB statistics transfer is applied: the edit
+#   image's per-channel LAB mean and std are matched to the source's.  This
+#   corrects subject colour (bird/cat) without affecting the attention mechanism,
+#   so there is no risk of the cascade collapse that V-injection at all 44 layers
+#   would cause (V at all layers forces the residual toward source at every block,
+#   cascading the hidden state to source regardless of the edit prompt).
+#   Disable with --no_preserve_color if you want the model to generate a new colour.
 #
 # Tuning:
 #   --inject_steps_frac 0.08 1.0  Skip first 4 steps (gives Q more divergence time).
 #   --inject_steps_frac 0.0  0.8  Shorten window if background drifts too much.
-#   --no_preserve_v               Let the model choose its own colour.
+#   --no_preserve_color           Let the model choose its own colour.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

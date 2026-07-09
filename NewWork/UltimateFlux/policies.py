@@ -532,26 +532,60 @@ class ObjectAdditionPolicy(BasePolicy):
 
 # ─────────────────────────── Task 1: Non-rigid ───────────────────────────────
 
+def _reinhard_color_transfer(edit_img: Image.Image, src_img: Image.Image) -> Image.Image:
+    """
+    Transfer source image colour statistics onto edit image (Reinhard et al.).
+
+    Matches the per-channel mean and std of edit's LAB representation to source's.
+    Preserves the edit image's spatial structure (flying pose) while correcting the
+    colour to match the source (bird/cat species colour).
+
+    Used as post-processing for NonRigidPolicy — does NOT affect the attention
+    mechanism, so it cannot cause cascade collapse or identical-output failures.
+    """
+    src  = np.array(src_img.convert("RGB")).astype(np.float32) / 255.0
+    edit = np.array(edit_img.convert("RGB")).astype(np.float32) / 255.0
+    src_lab  = _rgb_to_lab(src)
+    edit_lab = _rgb_to_lab(edit)
+    result_lab = edit_lab.copy()
+    for c in range(3):
+        s_mean = src_lab[..., c].mean()
+        s_std  = src_lab[..., c].std() + 1e-6
+        e_mean = edit_lab[..., c].mean()
+        e_std  = edit_lab[..., c].std() + 1e-6
+        result_lab[..., c] = (edit_lab[..., c] - e_mean) * (s_std / e_std) + s_mean
+    rgb = np.clip(_lab_to_rgb(result_lab), 0.0, 1.0)
+    return Image.fromarray((rgb * 255).astype(np.uint8))
+
+
 class NonRigidPolicy(BasePolicy):
     """
     K,V injection for non-rigid pose/action editing (FreeFlux mutual self-attention control).
 
-    Injection layers
-    ----------------
-    TIER_A (13 content-similarity layers): full K+V injection.
-      These layers have low RoPE frequency — attention is driven by feature content,
-      not spatial position.  Q from "bird flying" attends to source K,V differently
-      than Q from "bird perched" does, allowing the pose to diverge.
+    Injection (generation)
+    ----------------------
+    TIER_A (13 content-similarity / low-RoPE layers): full K+V injection.
+      These layers are content-driven, not position-driven.  Q from "bird flying"
+      attends to source K,V differently from Q from "bird perched," allowing the
+      pose to diverge while keeping coarse appearance features from source.
 
-    Remaining 44 position-dependent layers: V-only injection (preserve_v_all=True).
-      Injecting K here would spatially lock each edit token to its source counterpart
-      (via RoPE relative-position, causing identical output — the failure mode).
-      Injecting V only preserves the source appearance features (colour, texture) while
-      leaving the attention pattern (QK^T) free to express the new pose.
+    WHY NOT ALL-57 K+V: Position-dependent layers use high-RoPE keys.  Injecting
+    source K there forces each edit token to attend where pos_i ≈ pos_j → edit
+    reconstructs source pixel-by-pixel regardless of the edit prompt.
 
-    WHY NOT ALL-57 K+V: Position-dependent layers use high-RoPE keys.  Source K at
-    position j forces edit token i to attend mainly where pos_i ≈ pos_j → edit branch
-    reconstructs source pixel-by-pixel regardless of prompt.
+    WHY NOT V-ONLY AT ALL NON-TIER_A: V injection at every layer collapses the
+    same way.  Each layer's output reads source V; the residual stream is pulled
+    toward source features; Q and K computed from that residual also become
+    source-like; the cascade converges to source regardless of prompt.  The model
+    needs free non-TIER_A layers to generate new pose-specific features (spread
+    wings, different body contour) that don't exist in source V.
+
+    Colour preservation (post-processing)
+    --------------------------------------
+    preserve_color=True (default): after generation, apply Reinhard LAB statistics
+    transfer from source to edit.  Matches the edit image's per-channel LAB mean
+    and std to the source's — corrects bird/cat colour without affecting generation.
+    This is a post-process and cannot cause cascade collapse.
 
     Exact FreeFlux settings (run_non_rigid.py):
         layer_idx = TIER_A = [0,7,8,9,10,18,25,28,37,42,45,50,56]
@@ -560,20 +594,19 @@ class NonRigidPolicy(BasePolicy):
     Parameters
     ----------
     inject_layers    : Layers for K+V injection. Default TIER_A (13 layers).
-                       Never pass list(range(57)) — that produces identical output.
+                       Never pass list(range(57)) — identical output.
     inject_steps_frac: Step window (start_frac, end_frac). Default all steps (0, 1).
                        Use (0.08, 1.0) to skip first 4 steps for drastic pose changes.
-    preserve_v_all   : If True (default), also inject source image-token V at the
-                       remaining 44 non-TIER_A layers.  This preserves the subject's
-                       colour and texture during generation.  Disable (False) to allow
-                       the model full freedom in those layers, but colour will drift.
+    preserve_color   : Apply Reinhard LAB colour transfer in post_process (default True).
+                       Corrects edit subject colour to match source without affecting
+                       the attention mechanism.
     """
 
     def __init__(
         self,
         inject_layers: Optional[List[int]] = None,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
-        preserve_v_all: bool = True,
+        preserve_color: bool = True,
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
@@ -581,7 +614,7 @@ class NonRigidPolicy(BasePolicy):
         self.inject_layers     = set(inject_layers if inject_layers is not None
                                      else TIER_A)
         self.inject_steps_frac = inject_steps_frac
-        self.preserve_v_all    = preserve_v_all
+        self.preserve_color    = preserve_color
         self._txt_len_single   = 512
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
@@ -589,21 +622,14 @@ class NonRigidPolicy(BasePolicy):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-
-        if not _step_active(step, n_steps, self.inject_steps_frac):
-            return q, k, v
-
-        if layer in self.inject_layers:
-            # TIER_A: full K+V injection (pose transfer + appearance)
+        if layer in self.inject_layers and _step_active(step, n_steps, self.inject_steps_frac):
             k, v = _kv_full_inject(k, v, img_offset)
-        elif self.preserve_v_all:
-            # Non-TIER_A: V-only injection to preserve colour without spatial locking
-            v_src, v_edit = v.chunk(2)
-            v_edit = v_edit.clone()
-            v_edit[:, :, img_offset:, :] = v_src[:, :, img_offset:, :]
-            v = torch.cat([v_src, v_edit])
-
         return q, k, v
+
+    def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
+        if self.preserve_color:
+            return _reinhard_color_transfer(edit_img, src_img)
+        return edit_img
 
 
 # ─────────────────────────── Task 3: Object replacement ──────────────────────
