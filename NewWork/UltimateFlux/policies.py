@@ -589,6 +589,64 @@ def _reinhard_color_transfer(edit_img: Image.Image, src_img: Image.Image) -> Ima
     return Image.fromarray((rgb * 255).astype(np.uint8))
 
 
+def _freq_identity_guidance(
+    latents: torch.Tensor,
+    lat_h: int, lat_w: int, C: int,
+    strength: float,
+    low_freq_cutoff: float,
+) -> torch.Tensor:
+    """
+    Frequency-selective identity guidance for non-rigid editing.
+
+    Unpacks FLUX packed latents (B=2, S, C_packed) to spatial (B, C, H, W),
+    applies FFT, blends only the low-frequency components of the SOURCE latent
+    into the EDIT latent by `strength`, then repacks.
+
+    Low-frequency components encode global colour and smooth gradients.
+    High-frequency components (pose edges, fine texture) are untouched.
+
+    The linear blend cos_w/sin_w interpolation in SynPS handles TIER_A content
+    alignment; this function corrects the POST-STEP latent in the frequency domain,
+    giving a complementary colour anchor that accumulates across denoising steps.
+    """
+    B = latents.shape[0]
+    dtype = latents.dtype
+
+    # Unpack: (B, S, C_packed) → (B, C, lat_h, lat_w)
+    spatial = (
+        latents.float()
+        .view(B, lat_h // 2, lat_w // 2, C, 2, 2)
+        .permute(0, 3, 1, 4, 2, 5)
+        .reshape(B, C, lat_h, lat_w)
+    )
+    z_src  = spatial[0:1]   # (1, C, H, W)
+    z_edit = spatial[1:2]
+
+    fft_src  = torch.fft.rfft2(z_src)
+    fft_edit = torch.fft.rfft2(z_edit)
+
+    # Cutoff in FFT-output dims: rfft2 gives (H, W//2+1)
+    h_cut = max(1, int(lat_h * low_freq_cutoff))
+    w_cut = max(1, int((lat_w // 2 + 1) * low_freq_cutoff))
+
+    fft_edit = fft_edit.clone()
+    fft_edit[:, :, :h_cut, :w_cut] = (
+        (1.0 - strength) * fft_edit[:, :, :h_cut, :w_cut]
+        + strength       * fft_src[:, :, :h_cut, :w_cut]
+    )
+
+    z_edit_new = torch.fft.irfft2(fft_edit, s=(lat_h, lat_w))
+    spatial_new = torch.cat([z_src, z_edit_new], dim=0).to(dtype)
+
+    # Repack: (B, C, lat_h, lat_w) → (B, S, C_packed)
+    return (
+        spatial_new
+        .view(B, C, lat_h // 2, 2, lat_w // 2, 2)
+        .permute(0, 2, 4, 1, 3, 5)
+        .reshape(B, (lat_h // 2) * (lat_w // 2), C * 4)
+    )
+
+
 class NonRigidPolicy(BasePolicy):
     """
     K,V injection for non-rigid pose/action editing — FreeFlux + SynPS.
@@ -645,6 +703,11 @@ class NonRigidPolicy(BasePolicy):
         m_min: float = 0.7,
         m_max: float = 0.95,
         static_w: Optional[float] = None,
+        # Identity frequency guidance
+        identity_guidance: bool = False,
+        identity_strength: float = 0.3,
+        identity_steps_frac: Tuple[float, float] = (0.0, 0.5),
+        low_freq_cutoff: float = 0.1,
         # kept for backward-compat; ignored
         inject_all_single: bool = False,
         bg_steps_frac: Tuple[float, float] = (0.0, 1.0),
@@ -658,6 +721,10 @@ class NonRigidPolicy(BasePolicy):
         self.m_min              = m_min
         self.m_max              = m_max
         self.static_w           = static_w   # when set: bypass M_t, use this w always
+        self.identity_guidance    = identity_guidance
+        self.identity_strength    = identity_strength
+        self.identity_steps_frac  = identity_steps_frac
+        self.low_freq_cutoff      = low_freq_cutoff
         self._txt_len_single    = 512
         # SynPS per-generation state
         self.current_w: float        = static_w if static_w is not None else 1.0
@@ -666,6 +733,10 @@ class NonRigidPolicy(BasePolicy):
         # Side-channel state written by sampler before each inject_qkv call
         self._raw_k      = None
         self._rotary_emb = None
+        # Latent dims captured in pre_generate for post_step
+        self._lat_h: int = 128
+        self._lat_w: int = 128
+        self._lat_C: int = 16
 
     def pre_generate(self, pipe, max_sequence_length: int = 512, **kwargs):
         self._txt_len_single = max_sequence_length
@@ -673,6 +744,12 @@ class NonRigidPolicy(BasePolicy):
         self.current_w  = self.static_w if self.static_w is not None else 1.0
         self._last_step = -1
         self._m_scratch = []
+        # Capture latent spatial dims for post_step FFT guidance
+        height = kwargs.get('height', 1024)
+        width  = kwargs.get('width',  1024)
+        self._lat_h = height // 8
+        self._lat_w = width  // 8
+        self._lat_C = pipe.transformer.config.in_channels // 4  # 16 for FLUX
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
@@ -764,6 +841,16 @@ class NonRigidPolicy(BasePolicy):
         s_txt = _cos(src[:, :txt_len, :], tgt[:, :txt_len, :]).item() if txt_len > 0 else 1.0
         s_img = _cos(src[:, img_offset:, :], tgt[:, img_offset:, :]).item()
         self._m_scratch.append(s_img / max(s_txt, 0.01))
+
+    def post_step(self, latents, step, n_steps):
+        if not self.identity_guidance:
+            return latents
+        if not _step_active(step, n_steps, self.identity_steps_frac):
+            return latents
+        return _freq_identity_guidance(
+            latents, self._lat_h, self._lat_w, self._lat_C,
+            self.identity_strength, self.low_freq_cutoff,
+        )
 
     def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
         if self.preserve_color:

@@ -28,20 +28,39 @@
 #   w=1: full RoPE → identical to FreeFlux baseline (spatial lock at TIER_A).
 #
 #   w is computed adaptively each denoising step from M_t = mean(S_img / S_txt):
-#       M_t > m_max (1.0): under-editing → w=0  (colour retrieval mode)
-#       M_t < m_min (0.9): over-editing  → w=1  (identity lock mode)
-#       else:               w = (m_max - M_t) / (m_max - m_min)
+#       M_t > m_max (0.95): under-editing → w=0  (colour retrieval mode)
+#       M_t < m_min (0.70): over-editing  → w=1  (identity lock mode)
+#       else:                w = (m_max - M_t) / (m_max - m_min)
 #   First step starts at w=1.0 (no prior measurement).
 #
 #   WHY NO K BLEND AT NON-TIER_A: Source K at position-dependent layers corrupts
 #   the Q×K attention pattern → attention shifts toward source spatial positions →
 #   model generates source spatial structure → bird doesn't fly.
 #
+# Identity guidance — FFT frequency-selective latent blending:
+#
+#   Enabled with --identity_guidance.  After each denoising step in the first
+#   identity_steps_frac of steps, the edit latent's low-frequency FFT components
+#   are blended toward the source latent's:
+#       fft_edit[:h_cut, :w_cut] = (1-s)*fft_edit + s*fft_src
+#   Low-freq components (cutoff controlled by --low_freq_cutoff) encode global
+#   colour and smooth gradients.  High-freq components (pose edges, fine texture)
+#   are untouched.  This gives a complementary colour anchor at the latent level
+#   that accumulates across steps — SynPS anchors at the attention level, this
+#   anchors at the latent level.
+#
+#   Active in first 50% of steps only (--identity_steps_frac 0.0 0.5).  Later
+#   steps refine pose-specific high-frequency detail free from the source anchor.
+#
 # Tuning:
-#   --m_min 0.85 --m_max 0.95   Adjust M_t window if w swings too aggressively.
-#   --no_synps --v_blend 0.3    Disable SynPS; use V-only blend fallback instead.
-#   --preserve_color             Add Reinhard LAB post-processing as last resort.
-#   --inject_steps_frac 0.08 1.0 Skip first 4 TIER_A steps for drastic pose changes.
+#   --m_min 0.70 --m_max 0.95        Adjust M_t window if w swings too aggressively.
+#   --no_synps --v_blend 0.3         Disable SynPS; use V-only blend fallback instead.
+#   --preserve_color                  Add Reinhard LAB post-processing as last resort.
+#   --inject_steps_frac 0.08 1.0     Skip first 4 TIER_A steps for drastic pose changes.
+#   --identity_guidance               Enable FFT latent colour anchor (complementary to SynPS).
+#   --identity_strength 0.3          Blend strength for FFT low-freq anchor (0=off, 1=full).
+#   --identity_steps_frac 0.0 0.5   Step window for FFT anchor (default: first half only).
+#   --low_freq_cutoff 0.1            Fraction of FFT spatial freqs treated as "low" (default 10%).
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -61,6 +80,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name bird_perch_to_fly \
     --source_prompt "a bird perched on a branch" \
     --edit_prompt   "a bird flying away from the branch" \
+    --identity_guidance --identity_strength 0.3 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -71,6 +91,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name cat_sit_to_lie \
     --source_prompt "a cat sitting on a wooden floor" \
     --edit_prompt   "a cat lying down on a wooden floor" \
+    --identity_guidance --identity_strength 0.3 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -81,6 +102,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name dog_standing_to_jumping \
     --source_prompt "a golden retriever standing in a park" \
     --edit_prompt   "a golden retriever jumping in a park" \
+    --identity_guidance --identity_strength 0.3 \
     --seed 7
 
 echo "=== Non-rigid editing complete. Results in results/ultimateflux/ ==="

@@ -82,6 +82,10 @@ def build_policy(cfg: dict):
             m_min=cfg.get("m_min", 0.7),
             m_max=cfg.get("m_max", 0.95),
             static_w=cfg.get("static_w", None),
+            identity_guidance=cfg.get("identity_guidance", False),
+            identity_strength=cfg.get("identity_strength", 0.3),
+            identity_steps_frac=tuple(cfg["identity_steps_frac"]) if cfg.get("identity_steps_frac") else (0.0, 0.5),
+            low_freq_cutoff=cfg.get("low_freq_cutoff", 0.1),
             inject_all_single=cfg.get("inject_all_single", False),
             bg_steps_frac=tuple(cfg["bg_steps_frac"]) if cfg.get("bg_steps_frac") else (0.0, 1.0),
         )
@@ -330,6 +334,24 @@ def parse_args():
                         "0.0 = fully position-agnostic (max colour retrieval); "
                         "1.0 = full RoPE (FreeFlux baseline). "
                         "Try 0.0 first if identity is not fully preserved.")
+    p.add_argument("--identity_guidance", dest="identity_guidance",
+                   action="store_true", default=False,
+                   help="Non-rigid: after each denoising step, blend low-frequency FFT components "
+                        "of source latent into edit latent to anchor global colour. "
+                        "Complementary to SynPS — SynPS acts at attention level, this acts at latent level.")
+    p.add_argument("--no_identity_guidance", dest="identity_guidance", action="store_false",
+                   help="Non-rigid: disable FFT identity guidance (default).")
+    p.add_argument("--identity_strength", type=float, default=0.3,
+                   help="Non-rigid: FFT blend strength (0=no effect, 1=full source colour). Default 0.3.")
+    p.add_argument("--identity_steps_frac", type=float, nargs=2, default=[0.0, 0.5],
+                   metavar=("START", "END"),
+                   help="Non-rigid: step window for FFT identity guidance. "
+                        "Default first 50%% of steps — colour anchor active early, "
+                        "high-freq pose detail refined freely in later steps.")
+    p.add_argument("--low_freq_cutoff", type=float, default=0.1,
+                   help="Non-rigid: fraction of FFT spatial frequencies treated as low-freq "
+                        "(0.1 = lowest 10%% = global colour/brightness). Higher = more structure "
+                        "transferred, but may suppress pose change.")
     p.add_argument("--v_blend", type=float, default=0.0,
                    help="Non-rigid: source V blend weight at non-TIER_A layers (default 0.0 with SynPS on). "
                         "V_edit = v_blend*V_src + (1-v_blend)*V_edit_orig. "
@@ -469,6 +491,10 @@ def main():
         "m_min":                args.m_min,
         "m_max":                args.m_max,
         "static_w":             args.static_w,
+        "identity_guidance":    args.identity_guidance,
+        "identity_strength":    args.identity_strength,
+        "identity_steps_frac":  args.identity_steps_frac,
+        "low_freq_cutoff":      args.low_freq_cutoff,
         "v_blend":              args.v_blend,
         "v_blend_steps_frac":   args.v_blend_steps_frac,
         "preserve_color":       args.preserve_color,

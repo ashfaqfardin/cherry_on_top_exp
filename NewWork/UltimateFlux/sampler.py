@@ -106,6 +106,20 @@ class BasePolicy:
         """
         pass
 
+    def post_step(
+        self,
+        latents: torch.Tensor,
+        step: int,
+        n_steps: int,
+    ) -> torch.Tensor:
+        """
+        Called after each denoising step with packed latents (B, S, C_packed).
+        B=2: index 0 = source branch, index 1 = edit branch.
+        Return the (possibly modified) latents.
+        Default is a no-op; override for per-step latent guidance.
+        """
+        return latents
+
     def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
         """Called after generation with the decoded PIL images.  Default: no-op."""
         return edit_img
@@ -329,17 +343,22 @@ def generate_dual_branch(
             block = pipe.transformer.single_transformer_blocks[block_idx - N_DOUBLE]
         handles.append(block.register_forward_hook(hook_fn))
 
-    # The step-end callback serves two purposes:
-    #   1. SAM2 mask building: decode edit latent → segment → set policy._mask
-    #   2. Intermediate capture: store latents for grid visualisation
-    # Always enable when either feature is active.
-    use_sam2_mask  = getattr(policy, "use_sam2", False)
-    needs_callback = save_intermediates or use_sam2_mask
+    # The step-end callback serves three purposes:
+    #   1. Policy post_step: per-step latent guidance (identity, etc.)
+    #   2. SAM2 mask building: decode edit latent → segment → set policy._mask
+    #   3. Intermediate capture: store latents for grid visualisation
+    use_sam2_mask    = getattr(policy, "use_sam2", False)
+    use_post_step    = type(policy).post_step is not BasePolicy.post_step
+    needs_callback   = save_intermediates or use_sam2_mask or use_post_step
 
     captured: List[Tuple[int, int, torch.Tensor]] = []
 
     def _capture(pipe_ref, step_index, timestep, callback_kwargs):
         lats = callback_kwargs["latents"]
+
+        # Per-step latent guidance (identity frequency blending, etc.)
+        lats = policy.post_step(lats, step_index, num_steps)
+        callback_kwargs["latents"] = lats
 
         # SAM2: fires as soon as attention scores are stored (after mask_build_step)
         if (use_sam2_mask
