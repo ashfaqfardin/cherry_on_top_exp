@@ -984,53 +984,28 @@ class NonRigidPolicy(BasePolicy):
         self._m_scratch.append(s_img / max(s_txt, 0.01))
 
     def post_step(self, latents, step, n_steps):
-        # FFT colour anchor for foreground identity.
+        # FFT colour anchor for foreground identity (optional, disabled by default).
         if self.identity_guidance and _step_active(step, n_steps, self.identity_steps_frac):
             latents = _freq_identity_guidance(
                 latents, self._lat_h, self._lat_w, self._lat_C,
                 self.identity_strength, self.low_freq_cutoff,
             )
 
-        # Background latent compositing (masked mode only).
+        # Latent compositing is intentionally DISABLED.
         #
-        # WHY NO HARD BINARY COMPOSITE:
-        # The fg mask is computed from the SOURCE object position.  After pose
-        # change the object extends into new positions that the mask labels as
-        # background.  Hard-replacing those positions with source latent erases
-        # the new limbs/wings and leaves a ghost of the original pose.
+        # Compositing latents[1][bg] = latents[0][bg] at every denoising step
+        # pastes the SOURCE BRANCH LATENT into the edit branch background.
+        # But latents[0] is the source branch which is generating the FULL source
+        # image (including the sitting cat / perched bird at their original positions).
+        # That complete source image then appears in the edit's background as a
+        # visible overlay → the classic "one image on top of another" artifact.
         #
-        # Instead we use a soft composite with a DILATED and BLURRED fg mask:
-        #   • Dilation (max-pool, radius bg_dilate tokens) expands the "safe fg"
-        #     zone so the new pose has room to extend beyond the source boundary.
-        #   • Gaussian blur (avg-pool) smooths the boundary so there is no hard
-        #     seam between composited background and free foreground.
-        #   • Alpha=1 → keep edit latent (fg & extended zone).
-        #     Alpha=0 → composite source latent (far background, unchanged).
-        #
-        # Background preservation is primarily handled at the attention level in
-        # _masked_inject_qkv (bg tokens always receive source K,V at all 57
-        # layers); this soft composite is a supplementary anchor for far bg only.
-        if self._fg_token_mask is not None:
-            th = self._lat_h // 2
-            tw = self._lat_w // 2
-            fg_2d = (self._fg_token_mask
-                     .reshape(th, tw)
-                     .float()
-                     .to(latents.device)
-                     .unsqueeze(0).unsqueeze(0))   # (1,1,th,tw)
-
-            # Dilate: give the edited object room to extend beyond source boundary
-            dil = self.bg_dilate
-            fg_dil = F.max_pool2d(fg_2d, kernel_size=2*dil+1, stride=1, padding=dil)
-
-            # Blur: smooth the boundary to avoid seams
-            fg_soft = F.avg_pool2d(fg_dil, kernel_size=5, stride=1, padding=2)
-
-            alpha = fg_soft.reshape(th * tw, 1)    # (S, 1) — 1=keep edit, 0=composite src
-            latents = latents.clone()
-            # latents: (2, S, C_packed)
-            latents[1] = alpha * latents[1] + (1.0 - alpha) * latents[0]
-
+        # Background preservation is handled entirely at the attention level:
+        # _masked_inject_qkv injects source K,V for bg tokens at all TIER_A layers
+        # (the 13 content-similarity layers identified by FreeFlux).  This anchors
+        # the background content through cross-token attention without the
+        # paste artifact.  This matches the original FreeFlux non-rigid pipeline
+        # which uses no latent compositing at all.
         return latents
 
     def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:

@@ -43,11 +43,13 @@
 #   --static_w 0.0   fully position-agnostic K at TIER_A → strongest colour retrieval.
 #   Adaptive w available via --m_min / --m_max (default: 0.7 / 0.95).
 #
-# Post-step soft composite:
-#   --bg_dilate 15   dilate fg mask 15 tokens (~240px) before alpha-blending source bg
-#                    latent into edit latent.  Large value needed for large pose changes
-#                    (wings, jumping) so new limbs that extend beyond the source mask
-#                    boundary are not composited over.  Reduce to 6 for small edits.
+# Post-step latent compositing: DISABLED (bg_dilate parameter is ignored for non-rigid).
+#
+# Compositing latents[1][bg] = latents[0][bg] pasted the source branch into the edit
+# background.  Since latents[0] is a full source image (sitting cat included), this
+# showed the source pose as an overlay on the edit → the "one image on top of another"
+# artifact.  Background is now preserved purely through TIER_A K,V injection in
+# attention, matching FreeFlux's original non-rigid pipeline (no compositing needed).
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
