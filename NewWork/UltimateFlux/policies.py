@@ -868,57 +868,67 @@ class NonRigidPolicy(BasePolicy):
         """
         KV-Edit (ICCV 2025, arXiv:2502.17363) adapted for pose editing.
 
-        Three-zone attention injection based on subject mask:
+        Two-zone attention injection (TIER_A only; non-TIER_A fully free):
 
-          Background tokens  (all 57 layers, all 50 steps):
-              K_edit[bg] = K_src[bg],  V_edit[bg] = V_src[bg]
-              → Background is pixel-locked.  Every attention head in every layer
-                sees the same key/value it would see if the source were being
-                denoised — so background tokens converge to source appearance.
+          TIER_A layers only (13 content-similarity, low-RoPE-frequency blocks):
+              Background tokens:
+                  K_edit[bg] = K_src[bg],  V_edit[bg] = V_src[bg]
+                  → Content anchor: at TIER_A attention is feature-driven, not
+                    position-driven.  Tells the edit branch "what the bg looks
+                    like" without spatially locking any token to its source grid
+                    position.  Background pixels restored by post_step compositing.
+              Foreground tokens (when inject_active):
+                  K_edit[fg] = SynPS(K_src_raw[fg], w),  V_edit[fg] = V_src[fg]
+                  → Appearance anchor: w=0 position-agnostic (max colour lock),
+                    w=1 full RoPE (FreeFlux baseline).
 
-          Foreground tokens at TIER_A  (when inject_active):
-              K_edit[fg] = SynPS(K_src_raw[fg], w)
-              V_edit[fg] = V_src[fg]
-              → Subject appearance (colour, texture) is anchored via SynPS.
-                w=0 → position-agnostic retrieval (strongest colour anchor).
-                w=1 → full RoPE (FreeFlux baseline).
-
-          Foreground tokens at non-TIER_A  (all steps):
-              K_edit[fg], V_edit[fg] remain unchanged  (edit branch values)
-              → Subject is completely free.  Edit Q from "bird flying" drives
-                the attention pattern at position-dependent layers without any
-                source K competing — pose changes naturally.
+          Non-TIER_A layers (44 position-sensitive, high-RoPE-frequency blocks):
+              All tokens completely free — no injection at all.
+              → Any source K at these layers would RoPE-lock tokens to their
+                source positions, preventing limbs/wings from extending into
+                background space.  Edit Q from "bird flying" freely restructures
+                the spatial attention pattern.  post_step soft composite then
+                restores far-background latents after each denoising step.
         """
-        fg    = self._fg_token_mask.to(k.device)          # (n_img,) bool
-        bg    = ~fg
-        bg_abs = img_offset + bg.nonzero(as_tuple=True)[0]  # absolute seq positions
+        fg     = self._fg_token_mask.to(k.device)          # (n_img,) bool
+        bg     = ~fg
+        bg_abs = img_offset + bg.nonzero(as_tuple=True)[0]
         fg_abs = img_offset + fg.nonzero(as_tuple=True)[0]
 
         k = k.clone()
         v = v.clone()
 
-        # ── Background: always inject source K,V ─────────────────────────────
-        k[1, :, bg_abs, :] = k[0, :, bg_abs, :]
-        v[1, :, bg_abs, :] = v[0, :, bg_abs, :]
-
-        # ── Foreground at TIER_A: SynPS appearance anchor ────────────────────
-        if layer in self.inject_layers and inject_active:
-            if self.synps and self._raw_k is not None and self._rotary_emb is not None:
-                w = self.current_w
-                k_src_raw = self._raw_k[0:1]   # (1, H, L, D) pre-RoPE source
-                if w < 1.0 - 1e-6:
-                    cos, sin = self._rotary_emb
-                    # Apply w-scaled RoPE to full source K, then pick fg positions.
-                    # Full-tensor apply_rotary_emb avoids slicing cos/sin shapes.
-                    k_src_w = apply_rotary_emb(k_src_raw, (w * cos + (1.0 - w), w * sin))
+        if layer in self.inject_layers:
+            # TIER_A (content-similarity, low RoPE frequency):
+            # ── Background: source K,V as appearance anchor ───────────────────
+            # At TIER_A attention is driven by feature content, not spatial
+            # position.  Injecting source K,V here tells the edit branch "what
+            # the background looks like" without spatially locking it — so new
+            # limbs/wings can still extend into background space at non-TIER_A.
+            k[1, :, bg_abs, :] = k[0, :, bg_abs, :]
+            v[1, :, bg_abs, :] = v[0, :, bg_abs, :]
+            # ── Foreground: SynPS appearance anchor ───────────────────────────
+            if inject_active:
+                if self.synps and self._raw_k is not None and self._rotary_emb is not None:
+                    w = self.current_w
+                    k_src_raw = self._raw_k[0:1]
+                    if w < 1.0 - 1e-6:
+                        cos, sin = self._rotary_emb
+                        k_src_w = apply_rotary_emb(
+                            k_src_raw, (w * cos + (1.0 - w), w * sin))
+                    else:
+                        k_src_w = k[0:1]
+                    k[1:2, :, fg_abs, :] = k_src_w[0:1, :, fg_abs, :]
                 else:
-                    k_src_w = k[0:1]   # already-RoPE source K
-                k[1:2, :, fg_abs, :] = k_src_w[0:1, :, fg_abs, :]
-            else:
-                k[1, :, fg_abs, :] = k[0, :, fg_abs, :]
-            v[1, :, fg_abs, :] = v[0, :, fg_abs, :]
+                    k[1, :, fg_abs, :] = k[0, :, fg_abs, :]
+                v[1, :, fg_abs, :] = v[0, :, fg_abs, :]
 
-        # Foreground at non-TIER_A: edit K,V unchanged — pose is free.
+        # Non-TIER_A (position-sensitive, high RoPE frequency): ALL tokens free.
+        # No source K,V injection here — injecting source K at position-dependent
+        # layers spatially locks tokens to source positions.  Extended limbs/wings
+        # that move into background space need these layers completely free so the
+        # edit prompt ("flying", "jumping") can restructure spatial attention.
+        # Background pixel preservation is handled by post_step soft compositing.
         return q, k, v
 
     def _synps_inject(self, k, v, img_offset: int):

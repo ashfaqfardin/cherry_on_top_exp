@@ -16,18 +16,20 @@
 #   3. --use_sam2_nonrigid              SAM2 automatic segmentation fallback.
 #                                       Requires: pip install sam2
 #
-# Three-zone attention injection:
+# Attention injection (TIER_A only; non-TIER_A completely free):
 #
-#   Background tokens  (all 57 layers, all 50 steps):
-#       K_edit[bg] ← K_src[bg],  V_edit[bg] ← V_src[bg]
-#       Background is pixel-locked at the attention level.
+#   TIER_A layers (13 content-similarity, low-RoPE-freq):
+#       Background:   K_edit[bg] ← K_src[bg],  V_edit[bg] ← V_src[bg]
+#                     Content anchor only — no spatial lock.
+#       Foreground:   K_edit[fg] ← SynPS(K_src_raw[fg], w)   appearance anchor
+#                     V_edit[fg] ← V_src[fg]
 #
-#   Foreground tokens at TIER_A  (13 content-similarity layers, inject window):
-#       K_edit[fg] ← SynPS(K_src_raw[fg], w)   appearance anchor
-#       V_edit[fg] ← V_src[fg]
+#   Non-TIER_A layers (44 position-sensitive, high-RoPE-freq):
+#       ALL tokens free — no injection.
+#       Injecting source K here would RoPE-lock tokens to source positions,
+#       preventing wings/limbs from extending into background space.
 #
-#   Foreground tokens at non-TIER_A  (44 position-dependent layers):
-#       K_edit[fg], V_edit[fg] unchanged — pose is completely free.
+#   Background restoration: post_step soft compositing (dilated alpha blend).
 #
 # SynPS:
 #   --static_w 0.0   fully position-agnostic K at TIER_A → strongest colour retrieval.
