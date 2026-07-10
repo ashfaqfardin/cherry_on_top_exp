@@ -1457,6 +1457,32 @@ def _concept_attention_mask(
     n_fg = int((saliency >= topk_val).sum())
     print(f"[ConceptMask] '{subject_noun}': {n_fg}/{n_img} fg tokens "
           f"({100 * n_fg // n_img}%), captures={proc._n_cap}")
+
+    # ── Debug: save mask + saliency heatmap to disk ───────────────────────────
+    try:
+        import os
+        debug_dir = os.path.join("results", "ultimateflux", "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        slug = subject_noun.replace(" ", "_")
+
+        # Binary mask (white = foreground)
+        mask_path = os.path.join(debug_dir, f"mask_{slug}.jpg")
+        mask_pil.convert("RGB").save(mask_path, quality=95)
+
+        # Continuous saliency heatmap (brighter = more concept-like)
+        sal_np   = saliency.numpy()
+        sal_norm = ((sal_np - sal_np.min()) / (sal_np.ptp() + 1e-8) * 255).astype(np.uint8)
+        heat_pil = Image.fromarray(sal_norm.reshape(th, tw), mode="L")
+        heat_pil = heat_pil.resize((width, height), Image.NEAREST)
+        heat_path = os.path.join(debug_dir, f"saliency_{slug}.jpg")
+        heat_pil.convert("RGB").save(heat_path, quality=95)
+
+        print(f"[ConceptMask] saved mask  → {mask_path}")
+        print(f"[ConceptMask] saved heatmap → {heat_path}")
+    except Exception as _e:
+        print(f"[ConceptMask] debug save failed: {_e}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     return mask_pil
 
 
