@@ -24,20 +24,24 @@
 # inverted (background appeared more similar to contaminated "bird" text vector
 # than the bird body itself) causing the copy-paste double-image artifact.
 #
-# Attention injection (TIER_A only; non-TIER_A completely free):
+# Attention injection (three-zone, no latent compositing):
 #
-#   TIER_A layers (13 content-similarity, low-RoPE-freq):
-#       Background:   K_edit[bg] ← K_src[bg],  V_edit[bg] ← V_src[bg]
-#                     Content anchor only — no spatial lock.
-#       Foreground:   K_edit[fg] ← SynPS(K_src_raw[fg], w)   appearance anchor
-#                     V_edit[fg] ← V_src[fg]
+#   ALL 57 layers — Background tokens only:
+#       K_edit[bg] ← K_src[bg],  V_edit[bg] ← V_src[bg]
+#       At TIER_A: feature-driven content anchor (appearance).
+#       At non-TIER_A: RoPE spatially locks bg tokens to source positions.
+#       Combined → full spatial + content background preservation.
 #
-#   Non-TIER_A layers (44 position-sensitive, high-RoPE-freq):
-#       ALL tokens free — no injection.
-#       Injecting source K here would RoPE-lock tokens to source positions,
-#       preventing wings/limbs from extending into background space.
+#   TIER_A layers (13 content-similarity, low-RoPE-freq) — Foreground:
+#       K_edit[fg] ← SynPS(K_src_raw[fg], w)   position-agnostic appearance anchor
+#       V_edit[fg] ← V_src[fg]
 #
-#   Background restoration: post_step soft compositing (dilated alpha blend).
+#   Non-TIER_A layers (44 position-sensitive, high-RoPE-freq) — Foreground:
+#       K unchanged — Q×K stays edit-conditioned; pose change is free.
+#       V blended: V_edit[fg] = v_blend*V_src[fg] + (1-v_blend)*V_edit[fg]
+#       Grounds subject colour without blocking limb/wing extension.
+#       StableFlow sensitivity analysis shows MM-DiT layers 1-2 (most vital
+#       for object colour) are non-TIER_A — V blend covers these exactly.
 #
 # SynPS:
 #   --static_w 0.0   fully position-agnostic K at TIER_A → strongest colour retrieval.
@@ -72,6 +76,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a bird flying away from the branch" \
     --subject_noun  "bird" \
     --static_w 0.0 \
+    --v_blend 0.3 \
     --bg_dilate 15 \
     --seed 42
 
@@ -86,6 +91,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a cat lying down on a wooden floor" \
     --subject_noun  "cat" \
     --static_w 0.0 \
+    --v_blend 0.3 \
     --bg_dilate 15 \
     --seed 42
 
@@ -100,6 +106,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a golden retriever jumping in a park" \
     --subject_noun  "retriever" \
     --static_w 0.0 \
+    --v_blend 0.3 \
     --bg_dilate 15 \
     --seed 7
 
