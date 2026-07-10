@@ -1279,6 +1279,12 @@ class _DAAmAttnProcessor:
         encoder_hidden_states=None,
         attention_mask=None,
         image_rotary_emb=None,
+        # Explicit named params so inspect.signature passes them without warnings:
+        step_index=None,
+        index_block=None,
+        mm_copy_blocks=None,
+        single_copy_blocks=None,
+        attention_store=None,
     ):
         is_double = encoder_hidden_states is not None
         cur_layer = self._cur_layer
@@ -1344,8 +1350,9 @@ class _DAAmAttnProcessor:
             self._cur_layer = (self._cur_layer + 1) % self.n_layers_total
             return out, enc_out
 
-        out = attn.to_out[0](out)
-        out = attn.to_out[1](out)
+        # Single-stream blocks (FluxSingleTransformerBlock) use Attention(pre_only=True)
+        # which has no to_out layer — the block applies proj_out externally after
+        # concatenating attn_output with mlp_hidden_states.  Return directly.
         self._cur_layer = (self._cur_layer + 1) % self.n_layers_total
         return out
 
