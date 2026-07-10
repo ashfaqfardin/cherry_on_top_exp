@@ -710,6 +710,7 @@ class NonRigidPolicy(BasePolicy):
         low_freq_cutoff: float = 0.1,
         # KV-Edit masked mode: segment subject → bg frozen, fg free to change pose
         fg_mask: Optional[Image.Image] = None,
+        subject_noun: Optional[str] = None,       # ConceptAttention mask (no SAM2 needed)
         use_sam2: bool = False,
         sam2_model_id: str = "facebook/sam2-hiera-large",
         bg_dilate: int = 6,   # token-space dilation radius for soft bg composite
@@ -731,6 +732,7 @@ class NonRigidPolicy(BasePolicy):
         self.identity_steps_frac = identity_steps_frac
         self.low_freq_cutoff     = low_freq_cutoff
         self.raw_fg_mask         = fg_mask
+        self.subject_noun        = subject_noun
         self.use_sam2            = use_sam2
         self.sam2_model_id       = sam2_model_id
         self.bg_dilate           = bg_dilate
@@ -769,18 +771,31 @@ class NonRigidPolicy(BasePolicy):
         self._lat_w = width  // 8
         self._lat_C = pipe.transformer.config.in_channels // 4
 
-        # ── KV-Edit mask setup ────────────────────────────────────────────────
+        # ── KV-Edit mask setup ─────────────────────────────────────────────────
+        # Priority:
+        #   1. User-supplied fg_mask              (highest quality)
+        #   2. ConceptAttention (subject_noun)    (semantic, no external model)
+        #   3. SAM2 automatic segmentation        (geometric fallback)
         self._fg_token_mask = None
         raw_mask = self.raw_fg_mask
 
+        if raw_mask is None and self.subject_noun:
+            print(f"[NonRigid] ConceptAttention mask for '{self.subject_noun}' "
+                  f"(arXiv:2502.04320, layers 8-17)…")
+            raw_mask = _concept_attention_mask(
+                pipe, source_prompt, self.subject_noun, seed,
+                height, width, num_steps, guidance_scale, max_sequence_length, device,
+            )
+            if raw_mask is None:
+                print("[NonRigid] ConceptAttention failed — trying SAM2 fallback.")
+
         if raw_mask is None and self.use_sam2:
-            print("[NonRigid] Generating source preview for SAM2 segmentation…")
+            print("[NonRigid] SAM2 automatic segmentation…")
             src_img = _generate_source_preview(
                 pipe, source_prompt, seed, height, width,
                 num_steps, guidance_scale, max_sequence_length, device,
             )
             if src_img is not None:
-                print("[NonRigid] Running SAM2 automatic segmentation…")
                 raw_mask = _auto_fg_mask_sam2(
                     src_img, device=device, sam2_model_id=self.sam2_model_id)
                 if raw_mask is None:
@@ -1210,6 +1225,162 @@ def _auto_fg_mask_sam2(
         print(f"[UltimateFlux] SAM2 segmentation failed: {exc}")
         import traceback; traceback.print_exc()
         return None
+
+
+def _concept_attention_mask(
+    pipe,
+    source_prompt: str,
+    subject_noun: str,
+    seed: int,
+    height: int,
+    width: int,
+    num_steps: int,
+    guidance_scale: float,
+    max_sequence_length: int,
+    device: str,
+    concept_layers: Optional[List[int]] = None,
+) -> Optional[Image.Image]:
+    """
+    ConceptAttention (arXiv:2502.04320) — training-free subject mask from FLUX itself.
+
+    Computes cosine similarity between image-token and concept-word attention output
+    projections across the last 10 double-stream blocks (layers 8-17).  Averaged over
+    all denoising steps and thresholded at the per-map mean to produce a binary token
+    mask at (height//16, width//16) resolution, upscaled to (height, width).
+
+    Semantically accurate: finds "bird" / "cat" / "golden retriever" via FLUX's own
+    representations, not geometric heuristics.  No external model required.
+
+    subject_noun  : a word or short phrase that appears in source_prompt, e.g. "bird".
+    concept_layers: double-stream block indices to aggregate over.
+                    Default: [8..17] — last 10 of 18 double-stream blocks per the paper.
+    """
+    from diffusers.models.attention_processor import FluxAttnProcessor2_0
+
+    if concept_layers is None:
+        concept_layers = list(range(8, 18))
+
+    # Locate subject_noun in the T5 token sequence for source_prompt
+    tok = getattr(pipe, 'tokenizer_2', None) or getattr(pipe, 'tokenizer', None)
+    if tok is None:
+        print("[ConceptAttn] No tokenizer found on pipe.")
+        return None
+    try:
+        prompt_ids = tok(source_prompt, add_special_tokens=False).input_ids
+        noun_ids   = tok(subject_noun,  add_special_tokens=False).input_ids
+    except Exception as exc:
+        print(f"[ConceptAttn] Tokenizer error: {exc}")
+        return None
+
+    concept_idx: List[int] = []
+    for i in range(len(prompt_ids) - len(noun_ids) + 1):
+        if prompt_ids[i:i + len(noun_ids)] == noun_ids:
+            concept_idx = list(range(i, i + len(noun_ids)))
+            break
+    if not concept_idx:
+        for wt in noun_ids:
+            concept_idx += [j for j, pt in enumerate(prompt_ids) if pt == wt]
+        concept_idx = sorted(set(concept_idx))
+    if not concept_idx:
+        print(f"[ConceptAttn] '{subject_noun}' not found in T5 token sequence of prompt.")
+        return None
+
+    th    = height // 16
+    tw    = width  // 16
+    n_img = th * tw
+
+    # Accumulators: sum attention-output projections across all steps for each layer
+    img_acc: Dict[int, torch.Tensor] = {}
+    txt_acc: Dict[int, torch.Tensor] = {}
+    img_cnt: Dict[int, int]          = {}
+
+    handles: List = []
+
+    for l in concept_layers:
+        n_ds = len(pipe.transformer.transformer_blocks)
+        if l >= n_ds:
+            continue
+        block = pipe.transformer.transformer_blocks[l]
+
+        def _make_img_hook(lid: int):
+            def _h(module, inp, out):
+                # out: (B, n_img, D) after attn.to_out[0]
+                if out.shape[1] != n_img:
+                    return
+                o = out[0].detach().float().cpu()   # (n_img, D)
+                if lid not in img_acc:
+                    img_acc[lid] = o.clone()
+                    img_cnt[lid] = 1
+                else:
+                    img_acc[lid] = img_acc[lid] + o
+                    img_cnt[lid] += 1
+            return _h
+
+        def _make_txt_hook(lid: int):
+            def _h(module, inp, out):
+                # out: (B, txt_len, D) after attn.to_add_out
+                o = out[0].detach().float().cpu()   # (txt_len, D)
+                if lid not in txt_acc:
+                    txt_acc[lid] = o.clone()
+                else:
+                    txt_acc[lid] = txt_acc[lid] + o
+            return _h
+
+        handles.append(block.attn.to_out[0].register_forward_hook(_make_img_hook(l)))
+        handles.append(block.attn.to_add_out.register_forward_hook(_make_txt_hook(l)))
+
+    try:
+        _generate_source_preview(
+            pipe, source_prompt, seed, height, width,
+            num_steps, guidance_scale, max_sequence_length, device,
+        )
+    except Exception as exc:
+        print(f"[ConceptAttn] Forward pass failed: {exc}")
+        return None
+    finally:
+        for h in handles:
+            h.remove()
+
+    if not img_acc or not txt_acc:
+        print("[ConceptAttn] No outputs captured.")
+        return None
+
+    saliency = torch.zeros(n_img, dtype=torch.float32)
+    n_used   = 0
+
+    for l in concept_layers:
+        if l not in img_acc or l not in txt_acc:
+            continue
+        cnt   = max(1, img_cnt.get(l, 1))
+        o_img = img_acc[l] / cnt          # (n_img, D)
+        o_txt = txt_acc[l] / cnt          # (txt_len, D)
+
+        valid = [i for i in concept_idx if i < o_txt.shape[0]]
+        if not valid:
+            continue
+        o_concept = o_txt[valid]           # (n_concept, D)
+
+        o_img_n = F.normalize(o_img,     dim=-1)   # (n_img,    D)
+        o_con_n = F.normalize(o_concept, dim=-1)   # (n_concept, D)
+        sim     = o_img_n @ o_con_n.T              # (n_img, n_concept)
+        saliency = saliency + sim.mean(dim=-1)
+        n_used  += 1
+
+    if n_used == 0:
+        print("[ConceptAttn] No concept tokens found in captured layers.")
+        return None
+
+    saliency = saliency / n_used
+
+    # Threshold at map mean → binary token mask
+    threshold = float(saliency.mean())
+    binary    = (saliency > threshold).numpy().reshape(th, tw).astype(np.uint8) * 255
+    mask_pil  = Image.fromarray(binary, mode="L").resize((width, height), Image.NEAREST)
+
+    n_fg = int((saliency > threshold).sum())
+    print(f"[ConceptAttn] '{subject_noun}' saliency mask: {n_fg}/{n_img} fg tokens "
+          f"({100 * n_fg // n_img}%)")
+    return mask_pil
 
 
 class BackgroundReplacePolicy(BasePolicy):

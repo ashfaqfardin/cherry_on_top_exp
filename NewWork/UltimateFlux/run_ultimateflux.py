@@ -90,6 +90,7 @@ def build_policy(cfg: dict):
             identity_steps_frac=tuple(cfg["identity_steps_frac"]) if cfg.get("identity_steps_frac") else (0.0, 0.5),
             low_freq_cutoff=cfg.get("low_freq_cutoff", 0.1),
             fg_mask=fg_mask,
+            subject_noun=cfg.get("subject_noun", None),
             use_sam2=cfg.get("use_sam2_nonrigid", False),
             sam2_model_id=cfg.get("sam2_model_id", "facebook/sam2-hiera-large"),
             bg_dilate=cfg.get("bg_dilate", 6),
@@ -343,8 +344,13 @@ def parse_args():
                         "Try 0.0 first if identity is not fully preserved.")
     p.add_argument("--fg_mask", default=None,
                    help="Non-rigid: path to foreground mask image (white=subject to edit). "
-                        "Activates KV-Edit masked mode. If omitted and --use_sam2_nonrigid, "
-                        "SAM2 auto-segments the subject from a source preview.")
+                        "Activates KV-Edit masked mode. Highest priority.")
+    p.add_argument("--subject_noun", default=None,
+                   help="Non-rigid: subject word in the source prompt, e.g. 'bird', 'cat', "
+                        "'golden retriever'. Enables ConceptAttention masking (arXiv:2502.04320): "
+                        "uses FLUX's own attention output projections in layers 8-17 to locate "
+                        "the subject — no SAM2 or external model needed. Semantically accurate "
+                        "because it finds the named concept, not just the largest blob.")
     p.add_argument("--use_sam2_nonrigid", action="store_true", default=False,
                    help="Non-rigid: auto-segment subject with SAM2 before generation. "
                         "Generates a source preview, runs SAM2, builds a foreground mask. "
@@ -510,6 +516,7 @@ def main():
         "sam2_model_id":  args.sam2_model_id,
         "inject_steps_frac":    args.inject_steps_frac,
         "fg_mask":              args.fg_mask,
+        "subject_noun":         args.subject_noun,
         "use_sam2_nonrigid":    args.use_sam2_nonrigid,
         "bg_dilate":            args.bg_dilate,
         "synps":                args.synps,
