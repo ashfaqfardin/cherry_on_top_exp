@@ -872,12 +872,17 @@ class NonRigidPolicy(BasePolicy):
         """
         Three-zone attention injection (KV-Edit adapted, arXiv:2502.17363).
 
-        Background — ALL 57 layers:
-            K_edit[bg] = K_src[bg],  V_edit[bg] = V_src[bg]
-            At TIER_A: feature-driven content anchor (what the bg looks like).
-            At non-TIER_A: RoPE-locks bg tokens to source spatial positions.
-            Together: full spatial + content background preservation without
-            any latent compositing.
+        Background V — ALL 57 layers:
+            V_edit[bg] = V_src[bg]
+            Appearance anchor at every layer.  V only — no effect on Q×K, so
+            fg tokens attending to bg receive source bg VALUES but are not
+            RoPE-locked to source positions.
+
+        Background K — TIER_A only (13 content-similarity, low-RoPE-frequency):
+            K_edit[bg] = K_src[bg]
+            Content-similarity anchor for bg.  NOT applied at non-TIER_A because
+            bg K_src at position-sensitive layers would pull fg attention toward
+            source bg positions via cross-attention, freezing the edit pose.
 
         Foreground at TIER_A (13 content-similarity, low-RoPE-frequency):
             K_edit[fg] = SynPS(K_src_raw[fg], w),  V_edit[fg] = V_src[fg]
@@ -887,9 +892,8 @@ class NonRigidPolicy(BasePolicy):
             K unchanged — edit Q×K stays 100% free for pose change.
             V blended: V_edit[fg] = v_blend*V_src[fg] + (1-v_blend)*V_edit[fg]
             Grounds subject colour without blocking spatial restructuring.
-            Sensitivity analysis (StableFlow, arXiv:2506.xxxxx) shows MM-DiT
-            layers 1-2 are the most vital for object/colour identity; since
-            these are non-TIER_A, they are covered by this V blend pass.
+            Covers MM-DiT layers 1-2 (most vital for colour per sensitivity
+            analysis) which are non-TIER_A.
         """
         fg     = self._fg_token_mask.to(k.device)          # (n_img,) bool
         bg     = ~fg
@@ -899,14 +903,19 @@ class NonRigidPolicy(BasePolicy):
         k = k.clone()
         v = v.clone()
 
-        # ── Background: full K,V replacement at ALL layers ────────────────────
-        # At TIER_A: content similarity anchor.
-        # At non-TIER_A: RoPE spatially locks bg tokens to source positions —
-        # desired for background, safe since fg K is NOT replaced here.
-        k[1, :, bg_abs, :] = k[0, :, bg_abs, :]
+        # ── Background V: ALL 57 layers — appearance anchor ──────────────────
+        # V injection only; V doesn't affect the Q×K attention pattern, so fg
+        # tokens cannot be RoPE-locked by this.  Provides source bg VALUES at
+        # every layer to consistently anchor bg colour/texture.
         v[1, :, bg_abs, :] = v[0, :, bg_abs, :]
 
         if layer in self.inject_layers:
+            # ── Background K: TIER_A only — content-similarity anchor ─────────
+            # At content-similarity (low-RoPE) layers, injecting bg K provides a
+            # feature-driven appearance anchor without the spatial-lock side-effect
+            # that bg K at non-TIER_A would cause (fg attends to source bg K →
+            # fg residuals pulled toward source spatial context → pose freeze).
+            k[1, :, bg_abs, :] = k[0, :, bg_abs, :]
             # ── Foreground at TIER_A: SynPS appearance anchor ─────────────────
             if inject_active:
                 if self.synps and self._raw_k is not None and self._rotary_emb is not None:

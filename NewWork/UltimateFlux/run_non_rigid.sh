@@ -26,22 +26,23 @@
 #
 # Attention injection (three-zone, no latent compositing):
 #
-#   ALL 57 layers — Background tokens only:
-#       K_edit[bg] ← K_src[bg],  V_edit[bg] ← V_src[bg]
-#       At TIER_A: feature-driven content anchor (appearance).
-#       At non-TIER_A: RoPE spatially locks bg tokens to source positions.
-#       Combined → full spatial + content background preservation.
+#   ALL 57 layers — Background V only:
+#       V_edit[bg] ← V_src[bg]   (appearance anchor; V doesn't affect attention
+#       pattern, so fg cannot be spatially locked via bg→fg cross-attention)
 #
-#   TIER_A layers (13 content-similarity, low-RoPE-freq) — Foreground:
+#   TIER_A layers (13 content-similarity, low-RoPE-freq) — Background K:
+#       K_edit[bg] ← K_src[bg]   content-similarity anchor
+#       NOT at non-TIER_A: bg K_src at position-sensitive layers causes fg
+#       tokens attending to bg to be pulled toward source positions → pose freeze.
+#
+#   TIER_A layers — Foreground:
 #       K_edit[fg] ← SynPS(K_src_raw[fg], w)   position-agnostic appearance anchor
 #       V_edit[fg] ← V_src[fg]
 #
-#   Non-TIER_A layers (44 position-sensitive, high-RoPE-freq) — Foreground:
+#   Non-TIER_A layers — Foreground:
 #       K unchanged — Q×K stays edit-conditioned; pose change is free.
 #       V blended: V_edit[fg] = v_blend*V_src[fg] + (1-v_blend)*V_edit[fg]
-#       Grounds subject colour without blocking limb/wing extension.
-#       StableFlow sensitivity analysis shows MM-DiT layers 1-2 (most vital
-#       for object colour) are non-TIER_A — V blend covers these exactly.
+#       Grounds subject colour; covers vital MM-DiT layers 1-2 (non-TIER_A).
 #
 # SynPS:
 #   --static_w 0.0   fully position-agnostic K at TIER_A → strongest colour retrieval.
