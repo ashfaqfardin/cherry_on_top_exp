@@ -16,6 +16,14 @@
 #   3. --use_sam2_nonrigid              SAM2 automatic segmentation fallback.
 #                                       Requires: pip install sam2
 #
+# Mask derivation (--subject_noun) now uses DAAM-style Q_img × K_concept logits
+# (image patches attending TO concept key vectors) at layers 10-17, averaged over
+# 20 denoising steps.  Top-35% of tokens by saliency → foreground mask.
+#
+# This replaces the previous output-projection cosine-similarity which was
+# inverted (background appeared more similar to contaminated "bird" text vector
+# than the bird body itself) causing the copy-paste double-image artifact.
+#
 # Attention injection (TIER_A only; non-TIER_A completely free):
 #
 #   TIER_A layers (13 content-similarity, low-RoPE-freq):
@@ -36,9 +44,10 @@
 #   Adaptive w available via --m_min / --m_max (default: 0.7 / 0.95).
 #
 # Post-step soft composite:
-#   --bg_dilate 6    dilate fg mask 6 tokens (~96px) before alpha-blending source bg
-#                    latent into edit latent.  Prevents ghost traces from extended
-#                    limbs being overwritten.  Increase if traces remain.
+#   --bg_dilate 15   dilate fg mask 15 tokens (~240px) before alpha-blending source bg
+#                    latent into edit latent.  Large value needed for large pose changes
+#                    (wings, jumping) so new limbs that extend beyond the source mask
+#                    boundary are not composited over.  Reduce to 6 for small edits.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -61,7 +70,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a bird flying away from the branch" \
     --subject_noun  "bird" \
     --static_w 0.0 \
-    --bg_dilate 6 \
+    --bg_dilate 15 \
     --seed 42
 
 # ── Case 2: cat sitting → lying ──────────────────────────────────────────────
@@ -75,7 +84,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a cat lying down on a wooden floor" \
     --subject_noun  "cat" \
     --static_w 0.0 \
-    --bg_dilate 6 \
+    --bg_dilate 15 \
     --seed 42
 
 # ── Case 3: dog standing → jumping ───────────────────────────────────────────
@@ -89,7 +98,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a golden retriever jumping in a park" \
     --subject_noun  "retriever" \
     --static_w 0.0 \
-    --bg_dilate 6 \
+    --bg_dilate 15 \
     --seed 7
 
 echo "=== Non-rigid editing complete. Results in results/ultimateflux/ ==="

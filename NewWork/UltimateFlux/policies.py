@@ -780,8 +780,8 @@ class NonRigidPolicy(BasePolicy):
         raw_mask = self.raw_fg_mask
 
         if raw_mask is None and self.subject_noun:
-            print(f"[NonRigid] ConceptAttention mask for '{self.subject_noun}' "
-                  f"(arXiv:2502.04320, layers 8-17)…")
+            print(f"[NonRigid] DAAM mask for '{self.subject_noun}' "
+                  f"(Q_img×K_concept, layers 10-17)…")
             raw_mask = _concept_attention_mask(
                 pipe, source_prompt, self.subject_noun, seed,
                 height, width, num_steps, guidance_scale, max_sequence_length, device,
@@ -1237,6 +1237,119 @@ def _auto_fg_mask_sam2(
         return None
 
 
+class _DAAmAttnProcessor:
+    """
+    Drop-in replacement for FluxAttnProcessor2_0 that additionally captures
+    DAAM-style Q_img × K_concept attention logits at specified double-stream layers.
+
+    Direction: Q_img × K_concept measures "how much does image patch i attend to
+    concept key j."  This is the correct (non-inverted) direction for subject
+    saliency: patches that belong to the concept attend most strongly to its keys.
+
+    The previous approach (cosine sim between post-projection outputs from the same
+    normal pass) was inverted because the text output at "bird" positions encodes
+    "bird in context of branch/perch" — making background patches more similar to
+    that contaminated text vector than the bird body itself.  Q × K logits bypass
+    this contamination because they are computed before any inter-token mixing.
+    """
+
+    def __init__(
+        self,
+        concept_layers: List[int],
+        concept_token_idx: List[int],
+        n_img: int,
+        n_layers_total: int = 57,
+    ):
+        self.concept_layers    = set(concept_layers)
+        self.concept_token_idx = concept_token_idx
+        self.n_img             = n_img
+        self.n_layers_total    = n_layers_total
+        self._cur_layer        = 0
+        self._accum            = torch.zeros(n_img, dtype=torch.float32)
+        self._n_cap            = 0
+
+    @property
+    def saliency(self) -> torch.Tensor:
+        return self._accum / max(1, self._n_cap)
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+    ):
+        is_double = encoder_hidden_states is not None
+        cur_layer = self._cur_layer
+        B         = hidden_states.shape[0]
+        inner_dim = attn.to_k.out_features if hasattr(attn.to_k, 'out_features') else attn.inner_dim
+        head_dim  = inner_dim // attn.heads
+
+        q = attn.to_q(hidden_states)
+        k = attn.to_k(hidden_states)
+        v = attn.to_v(hidden_states)
+
+        q = q.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+        k = k.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+        v = v.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+
+        txt_len = 0
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states)
+            ek = attn.add_k_proj(encoder_hidden_states)
+            ev = attn.add_v_proj(encoder_hidden_states)
+            eq = eq.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+            ek = ek.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+            ev = ev.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            txt_len = eq.shape[2]
+            q = torch.cat([eq, q], dim=2)
+            k = torch.cat([ek, k], dim=2)
+            v = torch.cat([ev, v], dim=2)
+
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q, image_rotary_emb)
+            k = apply_rotary_emb(k, image_rotary_emb)
+
+        # ── DAAM saliency capture ─────────────────────────────────────────────
+        if is_double and cur_layer in self.concept_layers:
+            valid_c     = [ci for ci in self.concept_token_idx if ci < txt_len]
+            n_img_local = q.shape[2] - txt_len
+            if valid_c and n_img_local == self.n_img:
+                q_img  = q[:, :, txt_len:, :].float()   # (B, H, n_img, D)
+                k_con  = k[:, :, valid_c,  :].float()   # (B, H, n_con, D)
+                # logit: how strongly does image patch i attend to concept token j
+                logits = torch.einsum('bhid,bhjd->bhij', q_img, k_con) * (head_dim ** -0.5)
+                # average over heads and concept tokens → (B, n_img)
+                sal = logits.mean(1).mean(-1)
+                # use the conditional branch (last item in batch when CFG doubles it)
+                self._accum.add_(sal[-1].detach().cpu())
+                self._n_cap += 1
+        # ─────────────────────────────────────────────────────────────────────
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, -1, attn.heads * head_dim).to(q.dtype)
+
+        if is_double:
+            enc_out = out[:, :encoder_hidden_states.shape[1]]
+            out     = out[:, encoder_hidden_states.shape[1]:]
+            out     = attn.to_out[0](out)
+            out     = attn.to_out[1](out)
+            enc_out = attn.to_add_out(enc_out)
+            self._cur_layer = (self._cur_layer + 1) % self.n_layers_total
+            return out, enc_out
+
+        out = attn.to_out[0](out)
+        out = attn.to_out[1](out)
+        self._cur_layer = (self._cur_layer + 1) % self.n_layers_total
+        return out
+
+
 def _concept_attention_mask(
     pipe,
     source_prompt: str,
@@ -1249,37 +1362,33 @@ def _concept_attention_mask(
     max_sequence_length: int,
     device: str,
     concept_layers: Optional[List[int]] = None,
+    top_k_frac: float = 0.35,
+    mask_steps: int = 20,
 ) -> Optional[Image.Image]:
     """
-    ConceptAttention (arXiv:2502.04320) — training-free subject mask from FLUX itself.
+    DAAM-style subject mask from FLUX cross-attention (arXiv:2502.04320).
 
-    Computes cosine similarity between image-token and concept-word attention output
-    projections across the last 10 double-stream blocks (layers 8-17).  Averaged over
-    all denoising steps and thresholded at the per-map mean to produce a binary token
-    mask at (height//16, width//16) resolution, upscaled to (height, width).
+    At double-stream layers 10-17, captures Q_img × K_concept pre-softmax logits:
+    "how much does image patch i attend to concept key j?"  Averaged over heads,
+    concept tokens, and denoising steps, then thresholded at top_k_frac percentile
+    to produce a binary token mask.
 
-    Semantically accurate: finds "bird" / "cat" / "golden retriever" via FLUX's own
-    representations, not geometric heuristics.  No external model required.
-
-    subject_noun  : a word or short phrase that appears in source_prompt, e.g. "bird".
-    concept_layers: double-stream block indices to aggregate over.
-                    Default: [8..17] — last 10 of 18 double-stream blocks per the paper.
+    Fixes the previous output-projection cosine-similarity approach which was
+    contaminated by full-prompt context and produced inverted (background-as-fg)
+    masks, causing the copy-paste double-image artifact.
     """
-    from diffusers.models.attention_processor import FluxAttnProcessor2_0
-
     if concept_layers is None:
-        concept_layers = list(range(8, 18))
+        concept_layers = list(range(10, 18))
 
-    # Locate subject_noun in the T5 token sequence for source_prompt
     tok = getattr(pipe, 'tokenizer_2', None) or getattr(pipe, 'tokenizer', None)
     if tok is None:
-        print("[ConceptAttn] No tokenizer found on pipe.")
+        print("[ConceptMask] No T5 tokenizer found.")
         return None
     try:
         prompt_ids = tok(source_prompt, add_special_tokens=False).input_ids
         noun_ids   = tok(subject_noun,  add_special_tokens=False).input_ids
     except Exception as exc:
-        print(f"[ConceptAttn] Tokenizer error: {exc}")
+        print(f"[ConceptMask] Tokenizer error: {exc}")
         return None
 
     concept_idx: List[int] = []
@@ -1292,104 +1401,55 @@ def _concept_attention_mask(
             concept_idx += [j for j, pt in enumerate(prompt_ids) if pt == wt]
         concept_idx = sorted(set(concept_idx))
     if not concept_idx:
-        print(f"[ConceptAttn] '{subject_noun}' not found in T5 token sequence of prompt.")
+        print(f"[ConceptMask] '{subject_noun}' not found in T5 token sequence.")
         return None
+
+    print(f"[ConceptMask] concept_idx={concept_idx} (tokens for '{subject_noun}')")
 
     th    = height // 16
     tw    = width  // 16
     n_img = th * tw
 
-    # Accumulators: sum attention-output projections across all steps for each layer
-    img_acc: Dict[int, torch.Tensor] = {}
-    txt_acc: Dict[int, torch.Tensor] = {}
-    img_cnt: Dict[int, int]          = {}
+    proc = _DAAmAttnProcessor(concept_layers, concept_idx, n_img)
 
-    handles: List = []
-
-    for l in concept_layers:
-        n_ds = len(pipe.transformer.transformer_blocks)
-        if l >= n_ds:
-            continue
-        block = pipe.transformer.transformer_blocks[l]
-
-        def _make_img_hook(lid: int):
-            def _h(module, inp, out):
-                # out: (B, n_img, D) after attn.to_out[0]
-                if out.shape[1] != n_img:
-                    return
-                o = out[0].detach().float().cpu()   # (n_img, D)
-                if lid not in img_acc:
-                    img_acc[lid] = o.clone()
-                    img_cnt[lid] = 1
-                else:
-                    img_acc[lid] = img_acc[lid] + o
-                    img_cnt[lid] += 1
-            return _h
-
-        def _make_txt_hook(lid: int):
-            def _h(module, inp, out):
-                # out: (B, txt_len, D) after attn.to_add_out
-                o = out[0].detach().float().cpu()   # (txt_len, D)
-                if lid not in txt_acc:
-                    txt_acc[lid] = o.clone()
-                else:
-                    txt_acc[lid] = txt_acc[lid] + o
-            return _h
-
-        handles.append(block.attn.to_out[0].register_forward_hook(_make_img_hook(l)))
-        handles.append(block.attn.to_add_out.register_forward_hook(_make_txt_hook(l)))
+    # Install our processor; restore afterwards (orig_procs is a dict of per-block procs)
+    orig_procs = pipe.transformer.attn_processors
+    pipe.transformer.set_attn_processor(proc)
 
     try:
-        _generate_source_preview(
-            pipe, source_prompt, seed, height, width,
-            num_steps, guidance_scale, max_sequence_length, device,
-        )
+        exec_device = getattr(pipe, '_execution_device', device)
+        generator   = torch.Generator(device=exec_device).manual_seed(seed)
+        with torch.no_grad():
+            pipe(
+                prompt=source_prompt,
+                num_inference_steps=mask_steps,
+                guidance_scale=1.0,          # no CFG → B=1 per step → 2× faster
+                height=height,
+                width=width,
+                generator=generator,
+                max_sequence_length=max_sequence_length,
+                output_type="latent",
+            )
     except Exception as exc:
-        print(f"[ConceptAttn] Forward pass failed: {exc}")
+        print(f"[ConceptMask] Forward pass failed: {exc}")
         return None
     finally:
-        for h in handles:
-            h.remove()
+        pipe.transformer.set_attn_processor(orig_procs)
 
-    if not img_acc or not txt_acc:
-        print("[ConceptAttn] No outputs captured.")
+    if proc._n_cap == 0:
+        print("[ConceptMask] No captures — concept_idx may exceed txt_len.")
         return None
 
-    saliency = torch.zeros(n_img, dtype=torch.float32)
-    n_used   = 0
+    saliency = proc.saliency    # (n_img,) mean over steps × layers × concepts
 
-    for l in concept_layers:
-        if l not in img_acc or l not in txt_acc:
-            continue
-        cnt   = max(1, img_cnt.get(l, 1))
-        o_img = img_acc[l] / cnt          # (n_img, D)
-        o_txt = txt_acc[l] / cnt          # (txt_len, D)
+    k_top    = max(1, int(top_k_frac * n_img))
+    topk_val = float(saliency.topk(k_top).values[-1])
+    binary   = (saliency >= topk_val).numpy().reshape(th, tw).astype(np.uint8) * 255
+    mask_pil = Image.fromarray(binary, mode="L").resize((width, height), Image.NEAREST)
 
-        valid = [i for i in concept_idx if i < o_txt.shape[0]]
-        if not valid:
-            continue
-        o_concept = o_txt[valid]           # (n_concept, D)
-
-        o_img_n = F.normalize(o_img,     dim=-1)   # (n_img,    D)
-        o_con_n = F.normalize(o_concept, dim=-1)   # (n_concept, D)
-        sim     = o_img_n @ o_con_n.T              # (n_img, n_concept)
-        saliency = saliency + sim.mean(dim=-1)
-        n_used  += 1
-
-    if n_used == 0:
-        print("[ConceptAttn] No concept tokens found in captured layers.")
-        return None
-
-    saliency = saliency / n_used
-
-    # Threshold at map mean → binary token mask
-    threshold = float(saliency.mean())
-    binary    = (saliency > threshold).numpy().reshape(th, tw).astype(np.uint8) * 255
-    mask_pil  = Image.fromarray(binary, mode="L").resize((width, height), Image.NEAREST)
-
-    n_fg = int((saliency > threshold).sum())
-    print(f"[ConceptAttn] '{subject_noun}' saliency mask: {n_fg}/{n_img} fg tokens "
-          f"({100 * n_fg // n_img}%)")
+    n_fg = int((saliency >= topk_val).sum())
+    print(f"[ConceptMask] '{subject_noun}': {n_fg}/{n_img} fg tokens "
+          f"({100 * n_fg // n_img}%), captures={proc._n_cap}")
     return mask_pil
 
 
