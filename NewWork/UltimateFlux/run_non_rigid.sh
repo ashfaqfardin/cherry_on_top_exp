@@ -26,23 +26,26 @@
 #
 # Attention injection (three-zone, no latent compositing):
 #
-#   ALL 57 layers — Background V only:
-#       V_edit[bg] ← V_src[bg]   (appearance anchor; V doesn't affect attention
-#       pattern, so fg cannot be spatially locked via bg→fg cross-attention)
+# Sensitivity-guided injection (StableFlow semantic ablation on FLUX):
 #
-#   TIER_A layers (13 content-similarity, low-RoPE-freq) — Background K:
-#       K_edit[bg] ← K_src[bg]   content-similarity anchor
-#       NOT at non-TIER_A: bg K_src at position-sensitive layers causes fg
-#       tokens attending to bg to be pulled toward source positions → pose freeze.
+#   Background — ALL TIER_A layers (zones 1+2+3):
+#       K_edit[bg] ← K_src[bg],  V_edit[bg] ← V_src[bg]
 #
-#   TIER_A layers — Foreground:
-#       K_edit[fg] ← SynPS(K_src_raw[fg], w)   position-agnostic appearance anchor
-#       V_edit[fg] ← V_src[fg]
+#   Foreground — TIER_A, Zone 1 (MM-DiT identity, layer ≤ 2 = just layer 0):
+#       K_edit[fg] ← SynPS(K_src_raw, w),  V_edit[fg] ← V_src[fg]
+#       Layer 0 has peak sensitivity for colour (~0.36) and object (~0.55).
+#       Anchors identity at the single most vital layer.
 #
-#   Non-TIER_A layers — Foreground:
-#       K unchanged — Q×K stays edit-conditioned; pose change is free.
-#       V blended: V_edit[fg] = v_blend*V_src[fg] + (1-v_blend)*V_edit[fg]
-#       Grounds subject colour; covers vital MM-DiT layers 1-2 (non-TIER_A).
+#   Foreground — TIER_A, Zone 2 (MM-DiT pose, layers 3–18 → {7,8,9,10,18}):
+#       SKIPPED.  Shape sensitivity peaks at layers 9-12, 16-17.
+#       Injecting fg K or V here freezes pose.
+#
+#   Foreground — TIER_A, Zone 3 (single-stream, layers 19–56):
+#       K_edit[fg] ← SynPS(K_src_raw, w),  V_edit[fg] ← V_src[fg]
+#       Low sensitivity (0.05–0.12).  Pose committed after MM-DiT.  Safe colour refine.
+#
+#   Non-TIER_A: no fg injection.  v_blend at 44 non-TIER_A layers cascades:
+#       even at 0.3 blend, (0.7)^44 ≈ 0 edit signal remains after all layers.
 #
 # SynPS:
 #   --static_w 0.0   fully position-agnostic K at TIER_A → strongest colour retrieval.
@@ -77,7 +80,6 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a bird flying away from the branch" \
     --subject_noun  "bird" \
     --static_w 0.0 \
-    --v_blend 0.3 \
     --bg_dilate 15 \
     --seed 42
 
@@ -92,7 +94,6 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a cat lying down on a wooden floor" \
     --subject_noun  "cat" \
     --static_w 0.0 \
-    --v_blend 0.3 \
     --bg_dilate 15 \
     --seed 42
 
@@ -107,7 +108,6 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --edit_prompt   "a golden retriever jumping in a park" \
     --subject_noun  "retriever" \
     --static_w 0.0 \
-    --v_blend 0.3 \
     --bg_dilate 15 \
     --seed 7
 

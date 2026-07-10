@@ -836,11 +836,8 @@ class NonRigidPolicy(BasePolicy):
 
         # ── Masked mode (KV-Edit): subject segmented ─────────────────────────
         if self._fg_token_mask is not None:
-            vblend_active = (self.v_blend > 0.0
-                             and _step_active(step, n_steps, self.v_blend_steps_frac))
             return self._masked_inject_qkv(q, k, v, layer, img_offset,
-                                           _step_active(step, n_steps, self.inject_steps_frac),
-                                           vblend_active)
+                                           _step_active(step, n_steps, self.inject_steps_frac))
 
         # ── Global mode (no mask) ─────────────────────────────────────────────
         inject_active = _step_active(step, n_steps, self.inject_steps_frac)
@@ -867,33 +864,27 @@ class NonRigidPolicy(BasePolicy):
 
         return q, k, v
 
-    def _masked_inject_qkv(self, q, k, v, layer, img_offset, inject_active,
-                           vblend_active=False):
+    def _masked_inject_qkv(self, q, k, v, layer, img_offset, inject_active):
         """
-        Three-zone attention injection (KV-Edit adapted, arXiv:2502.17363).
+        Sensitivity-guided three-zone injection (arXiv:2502.17363 + StableFlow analysis).
 
-        Background V — ALL 57 layers:
-            V_edit[bg] = V_src[bg]
-            Appearance anchor at every layer.  V only — no effect on Q×K, so
-            fg tokens attending to bg receive source bg VALUES but are not
-            RoPE-locked to source positions.
+        Zone classification (from semantic sensitivity ablation on FLUX):
+          Zone 1 — Identity (MM-DiT, layer ≤ 2):
+              Peak sensitivity for colour/object/style (layer 0 ≈ 0.36 for colour,
+              0.55 for object).  fg K+V injection here anchors identity.
 
-        Background K — TIER_A only (13 content-similarity, low-RoPE-frequency):
-            K_edit[bg] = K_src[bg]
-            Content-similarity anchor for bg.  NOT applied at non-TIER_A because
-            bg K_src at position-sensitive layers would pull fg attention toward
-            source bg positions via cross-attention, freezing the edit pose.
+          Zone 2 — Pose (MM-DiT, layers 3–18):
+              Shape/pose sensitivity is elevated here (peaks at layers 9-12, 16-17).
+              fg K or V injection in this zone freezes pose.  NO fg injection.
 
-        Foreground at TIER_A (13 content-similarity, low-RoPE-frequency):
-            K_edit[fg] = SynPS(K_src_raw[fg], w),  V_edit[fg] = V_src[fg]
-            Appearance anchor. w=0 → fully position-agnostic (max colour lock).
+          Zone 3 — Refinement (single-stream, layers 19–56):
+              Low sensitivity (0.05–0.12).  Pose is already committed after MM-DiT.
+              fg K+V injection is safe for colour/texture grounding.
 
-        Foreground at non-TIER_A (44 position-sensitive, high-RoPE-frequency):
-            K unchanged — edit Q×K stays 100% free for pose change.
-            V blended: V_edit[fg] = v_blend*V_src[fg] + (1-v_blend)*V_edit[fg]
-            Grounds subject colour without blocking spatial restructuring.
-            Covers MM-DiT layers 1-2 (most vital for colour per sensitivity
-            analysis) which are non-TIER_A.
+        Background: K,V at all TIER_A layers (zones 1+2+3).
+        Foreground: K+V only at zones 1 and 3 (skip zone 2 = pose zone).
+        Non-TIER_A: no injection.  v_blend at non-TIER_A cascades over 44 layers
+            (0.7^44 ≈ 0), collapsing edit signal — always disabled for masked mode.
         """
         fg     = self._fg_token_mask.to(k.device)          # (n_img,) bool
         bg     = ~fg
@@ -903,21 +894,15 @@ class NonRigidPolicy(BasePolicy):
         k = k.clone()
         v = v.clone()
 
-        # ── Background V: ALL 57 layers — appearance anchor ──────────────────
-        # V injection only; V doesn't affect the Q×K attention pattern, so fg
-        # tokens cannot be RoPE-locked by this.  Provides source bg VALUES at
-        # every layer to consistently anchor bg colour/texture.
-        v[1, :, bg_abs, :] = v[0, :, bg_abs, :]
-
         if layer in self.inject_layers:
-            # ── Background K: TIER_A only — content-similarity anchor ─────────
-            # At content-similarity (low-RoPE) layers, injecting bg K provides a
-            # feature-driven appearance anchor without the spatial-lock side-effect
-            # that bg K at non-TIER_A would cause (fg attends to source bg K →
-            # fg residuals pulled toward source spatial context → pose freeze).
+            # ── Background: full K,V at ALL TIER_A ───────────────────────────
             k[1, :, bg_abs, :] = k[0, :, bg_abs, :]
-            # ── Foreground at TIER_A: SynPS appearance anchor ─────────────────
-            if inject_active:
+            v[1, :, bg_abs, :] = v[0, :, bg_abs, :]
+
+            # ── Foreground: zone-gated K,V injection ─────────────────────────
+            # Zones 1 (≤ 2) and 3 (> 18) only; skip zone 2 (3–18 = pose zone).
+            fg_zone = layer <= 2 or layer > 18
+            if inject_active and fg_zone:
                 if self.synps and self._raw_k is not None and self._rotary_emb is not None:
                     w = self.current_w
                     k_src_raw = self._raw_k[0:1]
@@ -931,16 +916,6 @@ class NonRigidPolicy(BasePolicy):
                 else:
                     k[1, :, fg_abs, :] = k[0, :, fg_abs, :]
                 v[1, :, fg_abs, :] = v[0, :, fg_abs, :]
-        elif vblend_active:
-            # ── Foreground at non-TIER_A: V-only colour blend ─────────────────
-            # K is NOT touched — Q×K stays edit-conditioned so new limb/wing
-            # positions form freely.  Partial V blend (e.g. 0.3) grounds colour
-            # without cascade collapse (70% edit V prevents full source convergence).
-            v_fg_edit = v[1, :, fg_abs, :].clone()
-            v[1, :, fg_abs, :] = (
-                self.v_blend * v[0, :, fg_abs, :]
-                + (1.0 - self.v_blend) * v_fg_edit
-            )
 
         return q, k, v
 
