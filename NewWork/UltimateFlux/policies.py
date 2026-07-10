@@ -882,7 +882,8 @@ class NonRigidPolicy(BasePolicy):
               fg K+V injection is safe for colour/texture grounding.
 
         Background: K,V at all TIER_A layers (zones 1+2+3).
-        Foreground: K+V only at zones 1 and 3 (skip zone 2 = pose zone).
+        Foreground V: ALL TIER_A layers (colour anchor; V safe at pose zone too).
+        Foreground K: zones 1 and 3 only (skip zone 2 = pose zone).
         Non-TIER_A: no injection.  v_blend at non-TIER_A cascades over 44 layers
             (0.7^44 ≈ 0), collapsing edit signal — always disabled for masked mode.
         """
@@ -899,10 +900,18 @@ class NonRigidPolicy(BasePolicy):
             k[1, :, bg_abs, :] = k[0, :, bg_abs, :]
             v[1, :, bg_abs, :] = v[0, :, bg_abs, :]
 
-            # ── Foreground: zone-gated K,V injection ─────────────────────────
-            # Zones 1 (≤ 2) and 3 (> 18) only; skip zone 2 (3–18 = pose zone).
-            fg_zone = layer <= 2 or layer > 18
-            if inject_active and fg_zone:
+            # ── Foreground V: ALL TIER_A (colour anchor) ──────────────────────
+            # V doesn't affect Q×K attention pattern → safe to inject at every
+            # TIER_A layer without locking pose.  Covers zone 2 (pose zone,
+            # layers 7-18) at its moderate colour sensitivity levels.
+            if inject_active:
+                v[1, :, fg_abs, :] = v[0, :, fg_abs, :]
+
+            # ── Foreground K: zones 1+3 only (NOT pose zone 3–18) ─────────────
+            # K injection changes Q×K pattern → locks spatial attention → locks
+            # pose.  Skip at zone 2 (TIER_A layers 7, 8, 9, 10, 18).
+            fg_k_zone = layer <= 2 or layer > 18
+            if inject_active and fg_k_zone:
                 if self.synps and self._raw_k is not None and self._rotary_emb is not None:
                     w = self.current_w
                     k_src_raw = self._raw_k[0:1]
@@ -915,7 +924,6 @@ class NonRigidPolicy(BasePolicy):
                     k[1:2, :, fg_abs, :] = k_src_w[0:1, :, fg_abs, :]
                 else:
                     k[1, :, fg_abs, :] = k[0, :, fg_abs, :]
-                v[1, :, fg_abs, :] = v[0, :, fg_abs, :]
 
         return q, k, v
 
