@@ -256,8 +256,9 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         policy.content_image = _stage1_source
 
         cs = cfg.get("content_strength", policy.content_strength)
+        cs_str = f"{cs:.2f}" if cs is not None else "auto"
         print(f"  [StyleID] Stage 2/2 — style transfer from encoded source "
-              f"(content_strength={cs:.2f})…")
+              f"(content_strength={cs_str})…")
 
     # ColorCtrlPolicy (legacy) uses masked delta-flow.
     # All other policies (including KontextColorPolicy) use dual-branch attention injection.
