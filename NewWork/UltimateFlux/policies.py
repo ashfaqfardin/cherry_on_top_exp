@@ -2319,6 +2319,7 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         # Set by pre_generate when content_image is provided:
         self._initial_latent:      Optional[torch.Tensor] = None
         self._override_timesteps:  Optional[torch.Tensor] = None
+        self._override_sigmas:     Optional[list]         = None
         self._actual_num_steps:    int = 28
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
@@ -2371,7 +2372,8 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             eps  = torch.randn(z_0.shape, generator=gen,
                                device=z_0.device, dtype=z_0.dtype)
             self._initial_latent     = (1.0 - sigma_start) * z_0 + sigma_start * eps
-            self._override_timesteps = all_ts[start_idx:]     # subset to use
+            self._override_timesteps = all_ts[start_idx:]           # kept for actual_num_steps
+            self._override_sigmas    = sigmas[start_idx:].tolist()   # passed as pipe(sigmas=...)
             self._actual_num_steps   = len(self._override_timesteps)
             print(f"[StyleID] content_strength={cs:.2f}  sigma_start={sigma_start:.3f}  "
                   f"active_steps={self._actual_num_steps}/{num_steps}")

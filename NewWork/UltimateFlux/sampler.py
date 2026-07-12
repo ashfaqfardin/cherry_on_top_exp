@@ -316,6 +316,7 @@ def generate_dual_branch(
     # Policy may provide a content-image starting latent (image-anchored style transfer).
     # If so, use it; otherwise fall back to seeded random noise as before.
     override_latent    = getattr(policy, '_initial_latent',     None)
+    override_sigmas    = getattr(policy, '_override_sigmas',    None)
     override_timesteps = getattr(policy, '_override_timesteps', None)
     actual_num_steps   = getattr(policy, '_actual_num_steps',   num_steps)
 
@@ -388,10 +389,14 @@ def generate_dual_branch(
 
         return callback_kwargs
 
-    # Build pipe() kwargs — if policy provides an override timestep list (img2img),
-    # pass it directly instead of num_inference_steps so the schedule matches z_T.
+    # Build pipe() kwargs — for img2img, pass the precomputed sigma schedule so
+    # the denoising steps exactly match the noise level of the starting latent.
+    # FluxPipeline accepts `sigmas` (list[float], len=actual_steps+1) but NOT `timesteps`.
     pipe_ts_kwargs: dict = {}
-    if override_timesteps is not None:
+    if override_sigmas is not None:
+        pipe_ts_kwargs["sigmas"] = override_sigmas
+    elif override_timesteps is not None:
+        # fallback: older diffusers that accept timesteps directly
         pipe_ts_kwargs["timesteps"] = override_timesteps.tolist()
     else:
         pipe_ts_kwargs["num_inference_steps"] = num_steps
