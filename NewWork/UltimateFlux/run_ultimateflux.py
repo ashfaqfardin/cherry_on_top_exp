@@ -175,11 +175,14 @@ def build_policy(cfg: dict):
             style_img = Image.open(cfg["style_image"]).convert("RGB")
         if cfg.get("content_image") and os.path.isfile(cfg["content_image"]):
             content_img = Image.open(cfg["content_image"]).convert("RGB")
+        # content_strength default: 0.6 when auto-generating source (strong identity),
+        # 0.85 when user supplies their own content_image (more style freedom).
+        _default_cs = 0.6 if not cfg.get("content_image") else 0.85
         return StylePersonalizationPolicy(
             style_image      = style_img,
             content_image    = content_img,
             style_strength   = cfg.get("style_strength",   1.0),
-            content_strength = cfg.get("content_strength", 0.85),
+            content_strength = cfg.get("content_strength", _default_cs),
             inject_steps_frac = tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
         )
 
@@ -220,6 +223,40 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
 
     # save_strips=True only for explicit --save_intermediates; steps.png always saved.
     save_strips = explicit_intermediates
+
+    # ── Style task: two-stage pipeline ─────────────────────────────────────────
+    # Stage 1: generate clean source image (no style injection).
+    # Stage 2: encode source → add noise → dual-branch denoise with style injection.
+    #
+    # This guarantees that source.png and edit.png show THE SAME character, because
+    # stage 2 starts from a latent that already encodes the source image's identity
+    # (not from random noise where identity is only approximated via K/V injection).
+    #
+    # Only runs when no --content_image was provided (auto-generate mode).
+    # If --content_image is provided, skip to normal generate_dual_branch flow.
+    _stage1_source: Image.Image = None
+    if (cfg.get("task") == "style"
+            and not cfg.get("content_image")
+            and isinstance(policy, StylePersonalizationPolicy)):
+
+        print(f"  [StyleID] Stage 1/2 — generating clean source image (seed={seed})…")
+        # Any UltimateFluxAttnProcessor from a prior run is harmless here: its
+        # inject_qkv guard (k.shape[0] < 2) returns immediately for single-branch.
+        _g1   = torch.Generator(device=device).manual_seed(seed)
+        _r1   = pipe(
+            prompt=source_prompt,
+            num_inference_steps=num_steps,
+            guidance_scale=guidance,
+            height=height, width=width,
+            generator=_g1,
+            output_type="pil",
+        )
+        _stage1_source = _r1.images[0]
+        policy.content_image = _stage1_source
+
+        cs = cfg.get("content_strength", policy.content_strength)
+        print(f"  [StyleID] Stage 2/2 — style transfer from encoded source "
+              f"(content_strength={cs:.2f})…")
 
     # ColorCtrlPolicy (legacy) uses masked delta-flow.
     # All other policies (including KontextColorPolicy) use dual-branch attention injection.
@@ -263,22 +300,25 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             save_strips=save_strips,
         )
 
+    # For two-stage style: source.png = clean stage-1 image (not stage-2 reconstruction).
+    _display_src = _stage1_source if _stage1_source is not None else src_img
+
     if save_images:
         src_path  = os.path.join(run_dir, "source.png")
         edit_path = os.path.join(run_dir, "edit.png")
-        src_img.save(src_path)
+        _display_src.save(src_path)
         edit_img.save(edit_path)
         print(f"  Saved → {src_path}")
         print(f"  Saved → {edit_path}")
 
         # Side-by-side comparison.
         # For style task: [style_ref | source | styled] so the reference is visible.
-        panels = [src_img, edit_img]
+        panels = [_display_src, edit_img]
         style_ref_path = cfg.get("style_image")
         if cfg.get("task") == "style" and style_ref_path:
             ref = Image.open(style_ref_path).convert("RGB").resize(
-                (src_img.width, src_img.height), Image.LANCZOS)
-            panels = [ref, src_img, edit_img]
+                (_display_src.width, _display_src.height), Image.LANCZOS)
+            panels = [ref, _display_src, edit_img]
 
         comp_w = sum(p.width for p in panels)
         comp_h = max(p.height for p in panels)

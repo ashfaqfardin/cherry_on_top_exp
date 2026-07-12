@@ -1,34 +1,35 @@
 #!/usr/bin/env bash
-# Task 7 — Identity-preserving style transfer (StyleID adapted for FLUX)
+# Task 7 — Identity-preserving style transfer (two-stage pipeline)
 #
-# FORMULA at ALL 13 TIER_A layers:
-#   Attn(Q_edit, K_src, V_style)
+# ── Two-stage pipeline (new default) ────────────────────────────────────────────
 #
-#   K_src  — from source branch's own denoising trajectory
-#             Edit attends to the same spatial regions as the unmodified source
-#             → identity preserved (character, pose, shape) across all 13 layers
+# Stage 1: Generate clean source image from the content prompt (no style injection).
+#          Uses FLUX normally — 28 full denoising steps, same seed.
+#          → source.png  (the identity reference)
 #
-#   V_style — from style reference image (captured at t=0.3, 70% clean signal)
-#             Attention returns style appearance values (colour, texture,
-#             brushstrokes) across all 13 TIER_A layers
+# Stage 2: Encode source image → add partial noise (content_strength) → run
+#          dual-branch denoising with style injection at all 13 TIER_A layers.
+#          Source branch reconstructs source; edit branch gets style applied.
+#          → edit.png    (the styled output)
 #
-# Both problems solved simultaneously: identity locked via K_src everywhere,
-# style transferred via V_style everywhere.
+# Why two stages?  Starting from an encoded real image guarantees identity is
+# locked from the very first latent — K/V injection alone (from random noise)
+# cannot do this because both branches start from the same blank slate.
 #
-# Prior split (K_src+V_src at 5 identity layers, K_sty+V_sty at 8 texture
-# layers) was insufficient: identity from only 5 layers, zero style at
-# identity layers, K_sty at texture layers diverging edit from source.
+# ── Injection formula at ALL 13 TIER_A layers ────────────────────────────────────
 #
-# TIER_A safety: FreeFlux — all 13 layers are content-similarity-dependent
-#   (low RoPE frequency), K injection never causes spatial locking.
+#   Attn( AdaIN(Q_src, Q_sty) , K_src , V_style )
+#
+#   Q*     = source Q, AdaIN-normalised to style Q statistics  → identity + colour
+#   K_src  = source branch K                                   → spatial routing locked
+#   V_sty  = style reference V (captured at t=0.3)             → colour/texture/strokes
 #
 # ── Key parameters ──────────────────────────────────────────────────────────────
 #   --style_image       reference image whose style to transfer
 #   --style_strength    V_style blend weight (1.0 = full style, default)
-#   --content_image     (optional) source image for img2img mode
-#   --content_strength  noise fraction (0.85 default): 0.6=strong identity, 0.95=strong style
+#   --content_strength  0.6 default (strong identity); raise to 0.8 for more style
 #
-# Sources: StyleID arXiv:2312.09008, FreeFlux (TIER_A layer safety)
+# Sources: StyleID arXiv:2312.09008, HAM arXiv:2603.24043, FreeFlux (TIER_A)
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
