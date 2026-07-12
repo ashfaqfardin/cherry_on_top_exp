@@ -324,9 +324,15 @@ def generate_dual_branch(
         # Image-anchored: both branches start from the source image's noisy latent.
         # Source branch denoises → reconstructs source (its K tracks real source structure).
         # Edit branch denoises with style injection → styled reconstruction of source.
+        #
+        # encode_real_image returns PACKED latents [1, seq, C_packed] (3D).
+        # Expand batch dim 1→2 with exactly 3 dims.  Using expand(2, -1, -1, -1)
+        # (4 dims) on a 3D tensor silently prepends a phantom dim, yielding
+        # [2, 1, seq, C] which the FluxPipeline mis-reads as spatial [B, C, H, W]
+        # and re-packs incorrectly, doubling the image token count and crashing RoPE.
         shared_latents = (
             override_latent.to(exec_device, dtype=torch.bfloat16)
-            .expand(2, -1, -1, -1).clone()
+            .expand(2, -1, -1).clone()   # [1, seq, C] → [2, seq, C]
         )
     else:
         _g   = torch.Generator(device=exec_device).manual_seed(seed)
