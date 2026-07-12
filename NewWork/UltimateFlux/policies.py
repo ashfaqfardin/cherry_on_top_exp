@@ -1989,6 +1989,44 @@ class KontextColorPolicy(BasePolicy):
         return {lid: make_hook(lid) for lid in self._svd_layers}
 
 
+
+class LatentNudgingMixin:
+    """
+    Mixin providing latent nudging (StableFlow §3) for real-image editing.
+
+    Corrects the systematic magnitude drift in DDIM-style inversion of
+    flow-matching models (λ=1.15 from StableFlow ablation Table 3).
+    """
+
+    NUDGE_LAMBDA = 1.15
+
+    @torch.no_grad()
+    def encode_real_image(
+        self,
+        pipe,
+        image: Image.Image,
+        height: int = 1024,
+        width: int = 1024,
+        device: str = "cuda",
+        nudge: bool = True,
+    ) -> torch.Tensor:
+        """Encode a real image to FLUX packed latents with optional latent nudging."""
+        img_t = to_tensor(image.resize((width, height))).unsqueeze(0)
+        img_t = (img_t * 2.0 - 1.0).to(device, dtype=pipe.vae.dtype)
+        latents = pipe.vae.encode(img_t).latent_dist.mean
+        latents = (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+        if nudge:
+            latents = latents * self.NUDGE_LAMBDA
+        # Pack: (B, C, H, W) → (B, H/2*W/2, C*4)
+        B, C, H, W = latents.shape
+        latents = (
+            latents.view(B, C, H // 2, 2, W // 2, 2)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(B, (H // 2) * (W // 2), C * 4)
+        )
+        return latents
+
+
 # ─────────────────────────── Task 7: Style personalization ───────────────────
 #
 # Implements StyleID (CVPR 2024 Highlight, arXiv:2312.09008) adapted to FLUX,
@@ -2377,49 +2415,3 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
     def get_block_hooks(self) -> Dict[int, Callable]:
         return {}
 
-
-# ─────────────────────────── Task 8: Real-image inversion helper ─────────────
-
-class LatentNudgingMixin:
-    """
-    Mixin providing latent nudging (StableFlow §3) for real-image editing.
-
-    Before calling generate_dual_branch, call prepare_inverted_latent() to
-    get the nudged+inverted starting latent, then pass it as latents= to pipe().
-
-    NOTE: FLUX ODE inversion is not implemented here — this nudging corrects
-    the systematic magnitude drift in DDIM-style inversion of flow-matching
-    models (λ=1.15 from StableFlow ablation Table 3).
-    """
-
-    NUDGE_LAMBDA = 1.15
-
-    @torch.no_grad()
-    def encode_real_image(
-        self,
-        pipe,
-        image: Image.Image,
-        height: int = 1024,
-        width: int = 1024,
-        device: str = "cuda",
-        nudge: bool = True,
-    ) -> torch.Tensor:
-        """
-        Encode a real image to FLUX packed latents (with optional latent nudging).
-        The returned tensor can be passed as the starting latent for generation.
-        """
-        img_t = to_tensor(image.resize((width, height))).unsqueeze(0)
-        img_t = (img_t * 2.0 - 1.0).to(device, dtype=pipe.vae.dtype)
-        latents = pipe.vae.encode(img_t).latent_dist.mean
-        latents = (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-        if nudge:
-            latents = latents * self.NUDGE_LAMBDA
-
-        # Pack: (B, C, H, W) → (B, H/2*W/2, C*4)
-        B, C, H, W = latents.shape
-        latents = (
-            latents.view(B, C, H // 2, 2, W // 2, 2)
-            .permute(0, 2, 4, 1, 3, 5)
-            .reshape(B, (H // 2) * (W // 2), C * 4)
-        )
-        return latents
