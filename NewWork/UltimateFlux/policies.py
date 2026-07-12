@@ -2344,8 +2344,17 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             z_0 = self.encode_real_image(
                 pipe, self.content_image, height, width, device, nudge=True
             )
-            # Get FLUX timestep schedule (mu-shifted for resolution)
-            pipe.scheduler.set_timesteps(num_steps, device=device)
+            # Get FLUX timestep schedule (mu-shifted for resolution).
+            # FlowMatchEulerDiscreteScheduler requires mu when use_dynamic_shifting=True.
+            # mu = linear interpolation of shift based on image sequence length.
+            _img_seq_len = (height // 16) * (width // 16)
+            _base_seq    = getattr(pipe.scheduler.config, "base_image_seq_len", 256)
+            _max_seq     = getattr(pipe.scheduler.config, "max_image_seq_len",  4096)
+            _base_shift  = getattr(pipe.scheduler.config, "base_shift",         0.5)
+            _max_shift   = getattr(pipe.scheduler.config, "max_shift",          1.16)
+            _m  = (_max_shift - _base_shift) / (_max_seq - _base_seq)
+            _mu = _img_seq_len * _m + (_base_shift - _m * _base_seq)
+            pipe.scheduler.set_timesteps(num_steps, device=device, mu=_mu)
             all_ts  = pipe.scheduler.timesteps   # (num_steps,) descending, CPU
             sigmas  = pipe.scheduler.sigmas.cpu().float()  # (num_steps+1,) descending
 
