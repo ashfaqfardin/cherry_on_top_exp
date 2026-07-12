@@ -589,6 +589,41 @@ def _reinhard_color_transfer(edit_img: Image.Image, src_img: Image.Image) -> Ima
     return Image.fromarray((rgb * 255).astype(np.uint8))
 
 
+def _match_style_color(
+    edit_img: Image.Image,
+    style_img: Image.Image,
+    strength: float = 0.6,
+) -> Image.Image:
+    """
+    Partial LAB-space colour histogram matching from style reference onto edit.
+
+    Per-channel AdaIN in CIE-LAB:
+      L  (lightness)  — half-strength transfer to avoid overexposure
+      A, B (chroma)   — full-strength transfer → palette replacement
+
+    strength=0.0 → no change; strength=1.0 → complete palette replacement.
+    Default 0.6 gives a visible boost without washing out generated detail.
+    """
+    edit  = np.array(edit_img.convert("RGB")).astype(np.float32) / 255.0
+    style = np.array(style_img.resize(edit_img.size, Image.LANCZOS)
+                    .convert("RGB")).astype(np.float32) / 255.0
+    e_lab = _rgb_to_lab(edit)
+    s_lab = _rgb_to_lab(style)
+    out   = e_lab.copy()
+    for c, scale in enumerate([0.5, 1.0, 1.0]):   # L partial, A/B full
+        s = strength * scale
+        if s <= 0.0:
+            continue
+        e_mean = e_lab[..., c].mean()
+        e_std  = e_lab[..., c].std() + 1e-6
+        s_mean = s_lab[..., c].mean()
+        s_std  = s_lab[..., c].std() + 1e-6
+        transferred = (e_lab[..., c] - e_mean) * (s_std / e_std) + s_mean
+        out[..., c] = s * transferred + (1.0 - s) * e_lab[..., c]
+    rgb = np.clip(_lab_to_rgb(out), 0.0, 1.0)
+    return Image.fromarray((rgb * 255).astype(np.uint8))
+
+
 def _freq_identity_guidance(
     latents: torch.Tensor,
     lat_h: int, lat_w: int, C: int,
@@ -2303,17 +2338,19 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         style_strength: float = 1.0,
         content_strength: float = 0.85,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        color_transfer_strength: float = 0.6,
         # Legacy aliases — accepted for backward compat but not used.
         q_preservation: float = 1.0,
         alpha: float = 1.0,
         sac_steps_frac: Tuple[float, float] = (0.0, 0.25),
         pfb_steps_frac: Tuple[float, float] = (0.0, 0.25),
     ):
-        self.style_image       = style_image
-        self.content_image     = content_image
-        self.style_strength    = style_strength
-        self.content_strength  = content_strength
-        self.inject_steps_frac = inject_steps_frac
+        self.style_image              = style_image
+        self.content_image            = content_image
+        self.style_strength           = style_strength
+        self.content_strength         = content_strength
+        self.inject_steps_frac        = inject_steps_frac
+        self.color_transfer_strength  = color_transfer_strength
         self._style_kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._txt_len_single   = 512
         # Set by pre_generate when content_image is provided:
@@ -2433,7 +2470,14 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
 
         q_sty, _, v_sty = self._style_kvs[layer]
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-        sw         = self.style_strength
+
+        # Layer-stratified V blend weight (Scheduled Style Injection):
+        # Identity layers {0,7,8,9,10} carry the largest structural signal, so
+        # use 60 % of style_strength there to avoid overwriting pose/shape.
+        # Texture/appearance layers {18,25,28,37,42,45,50,56} are safe for full
+        # style_strength because spatial layout is already committed by that depth.
+        layer_scale = 0.6 if layer in _TIER_A_IDENTITY else 1.0
+        sw = self.style_strength * layer_scale
 
         q  = q.clone()
         k  = k.clone()
@@ -2453,6 +2497,12 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 
         return q, k, v
+
+    def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
+        if self.style_image is None or self.color_transfer_strength <= 0.0:
+            return edit_img
+        return _match_style_color(edit_img, self.style_image,
+                                  strength=self.color_transfer_strength)
 
     def get_block_hooks(self) -> Dict[int, Callable]:
         return {}

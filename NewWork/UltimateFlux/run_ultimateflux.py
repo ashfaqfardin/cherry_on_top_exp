@@ -179,11 +179,12 @@ def build_policy(cfg: dict):
         # 0.85 when user supplies their own content_image (more style freedom).
         _default_cs = 0.6 if not cfg.get("content_image") else 0.85
         return StylePersonalizationPolicy(
-            style_image      = style_img,
-            content_image    = content_img,
-            style_strength   = cfg.get("style_strength",   1.0),
-            content_strength = cfg.get("content_strength", _default_cs),
-            inject_steps_frac = tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
+            style_image             = style_img,
+            content_image           = content_img,
+            style_strength          = cfg.get("style_strength",          1.0),
+            content_strength        = cfg.get("content_strength",        _default_cs),
+            inject_steps_frac       = tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
+            color_transfer_strength = cfg.get("color_transfer_strength", 0.6),
         )
 
     raise ValueError(
@@ -507,6 +508,10 @@ def parse_args():
                    help="Unused; kept for backward compat")
     p.add_argument("--style_strength", type=float, default=1.0,
                    help="Style task: K,V blend weight (0.0=no injection, 1.0=full style). Default 1.0.")
+    p.add_argument("--color_transfer_strength", type=float, default=0.6,
+                   help="Style task: LAB histogram matching strength applied as post-processing "
+                        "(0.0=off, 1.0=full palette replacement). Default 0.6. "
+                        "Transfers style reference colour palette onto edit image after generation.")
     p.add_argument("--content_image", type=str, default=None,
                    help="Style task: source image whose identity to preserve. "
                         "When provided, both branches start from this image's noisy latent "
@@ -615,9 +620,10 @@ def main():
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
-        "style_strength":       args.style_strength,
-        "content_image":        args.content_image,
-        "content_strength":     args.content_strength,
+        "style_strength":             args.style_strength,
+        "color_transfer_strength":    args.color_transfer_strength,
+        "content_image":              args.content_image,
+        "content_strength":           args.content_strength,
         "q_preservation":       args.q_preservation,
         "delta_scale":          args.delta_scale,
         "delta_start_step":     args.delta_start_step,

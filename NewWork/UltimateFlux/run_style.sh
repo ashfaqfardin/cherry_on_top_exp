@@ -24,10 +24,22 @@
 #   K_src  = source branch K                                   → spatial routing locked
 #   V_sty  = style reference V (captured at t=0.3)             → colour/texture/strokes
 #
+# ── Injection improvements ───────────────────────────────────────────────────────
+#
+#   Layer-stratified V blend (Scheduled Style Injection):
+#     Identity layers {0,7,8,9,10} use  style_strength × 0.6  (preserves structure)
+#     Texture  layers {18,25..56}   use  style_strength × 1.0  (full style signal)
+#
+#   LAB histogram matching (post-process):
+#     After generation, AdaIN in CIE-LAB space transfers the style reference's
+#     colour palette onto edit.png.  L channel: half strength (no overexposure).
+#     A/B channels: full strength (palette replacement).
+#
 # ── Key parameters ──────────────────────────────────────────────────────────────
-#   --style_image       reference image whose style to transfer
-#   --style_strength    V_style blend weight (1.0 = full style, default)
-#   --content_strength  0.6 default (strong identity); raise to 0.8 for more style
+#   --style_image              reference image whose style to transfer
+#   --style_strength           V_style blend weight (1.0 = full style, default)
+#   --content_strength         0.6 default (strong identity); raise to 0.8 for more style
+#   --color_transfer_strength  LAB post-processing strength (0.6 default; 0.0 = off)
 #
 # Sources: StyleID arXiv:2312.09008, HAM arXiv:2603.24043, FreeFlux (TIER_A)
 set -euo pipefail
