@@ -174,9 +174,10 @@ def build_policy(cfg: dict):
             style_img = Image.open(cfg["style_image"]).convert("RGB")
         return StylePersonalizationPolicy(
             style_image=style_img,
-            # style_strength: 1.0 = full K,V replacement; reduce for softer style.
             style_strength=cfg.get("style_strength", 1.0),
-            # inject at ALL steps — style K,V drive appearance throughout denoising.
+            # q_preservation=1.0 copies source Q to edit → Attn(Q_src, K_sty, V_sty)
+            # → preserves character shape/pose while style K,V set appearance.
+            q_preservation=cfg.get("q_preservation", 1.0),
             inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
         )
 
@@ -458,6 +459,8 @@ def parse_args():
                    help="Unused; kept for backward compat")
     p.add_argument("--style_strength", type=float, default=1.0,
                    help="Style task: K,V blend weight (0.0=no injection, 1.0=full style). Default 1.0.")
+    p.add_argument("--q_preservation", type=float, default=1.0,
+                   help="Style task: Q blend weight from source branch (1.0=full content Q → max character fidelity, 0.0=keep edit Q). Default 1.0.")
     p.add_argument("--delta_scale", type=float, default=2.0,
                    help="Unused; kept for backward compat (legacy masked-delta-flow)")
     p.add_argument("--delta_start_step", type=int, default=None,
@@ -558,6 +561,7 @@ def main():
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
         "style_strength":       args.style_strength,
+        "q_preservation":       args.q_preservation,
         "delta_scale":          args.delta_scale,
         "delta_start_step":     args.delta_start_step,
         "seed":               args.seed,

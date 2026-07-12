@@ -21,6 +21,11 @@
 # --style_strength 1.0  — full K,V replacement (maximum style).
 #   Reduce to 0.7–0.8 if style is too strong and content structure is lost.
 #
+# --q_preservation 1.0  — copy source branch Q to edit branch at TIER_A layers.
+#   Full StyleID formula: Attn(Q_content, K_style, V_style).
+#   Content Q locks character shape/anatomy/pose; style K,V set visual appearance.
+#   Reduce toward 0.0 if character looks too rigid or identical to the plain prompt.
+#
 # Why the old SVD/PFB approach was replaced:
 #   PFB modified one block's hidden-state SVD at first 25% of steps.
 #   SAC running after PFB (steps 25%–100%) forced edit Q,K → source Q,K

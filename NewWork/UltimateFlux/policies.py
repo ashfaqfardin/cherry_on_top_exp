@@ -2203,17 +2203,13 @@ class StylePersonalizationPolicy(BasePolicy):
     PRE-GENERATE — one forward pass on the style reference image at t=0.5
       (empty prompt) captures K,V at all TIER_A attention layers.
 
-    GENERATION — at every TIER_A layer and every denoising step, the EDIT
-      branch's image-token K,V are replaced (or blended) with the captured
-      style K,V.  The content Q from the text prompt remains unchanged, so
-      the prompt determines WHAT is generated while style K,V control HOW
-      it looks (texture, brush strokes, colour palette).
+    GENERATION — at every TIER_A layer and every denoising step:
+      Q:   edit ← source  (q_preservation=1.0 copies content Q → preserves character)
+      K,V: edit ← style   (style_strength=1.0 fully replaces with style K,V)
 
-    Why K,V injection is more powerful than SVD/PFB (previous approach):
-      - Operates directly on attention, not on block hidden-state SVD
-      - Active at ALL 13 TIER_A layers (vs. 1 pivotal block)
-      - Active at ALL denoising steps (vs. first 25%)
-      - No SAC-after-PFB contradiction that collapsed generation to plain color
+    Full StyleID formula: Attn(Q_content, K_style, V_style)
+      Content Q drives WHAT is generated (character shape, pose, anatomy).
+      Style K,V drive HOW it looks (texture, brush strokes, colour palette).
 
     Parameters
     ----------
@@ -2221,15 +2217,20 @@ class StylePersonalizationPolicy(BasePolicy):
         Reference image whose style to transfer.
     style_strength : float
         K,V blend weight: 0.0 = no injection, 1.0 = full style K,V.
+        Reduce to 0.7–0.8 if character structure is lost.
+    q_preservation : float
+        Q blend weight from source (content) branch: 1.0 = fully use source Q
+        (maximum character fidelity), 0.0 = keep edit Q (no content lock).
+        Default 1.0.  Reduce toward 0 if character looks too stiff/unvaried.
     inject_steps_frac : (float, float)
-        Step window for injection (fraction of total steps).
-        Default (0.0, 1.0) = all steps for consistent style throughout.
+        Step window for injection. Default (0.0, 1.0) = all steps.
     """
 
     def __init__(
         self,
         style_image: Optional[Image.Image] = None,
         style_strength: float = 1.0,
+        q_preservation: float = 1.0,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
         # Legacy aliases — accepted for backward compat but not used.
         alpha: float = 1.0,
@@ -2238,6 +2239,7 @@ class StylePersonalizationPolicy(BasePolicy):
     ):
         self.style_image       = style_image
         self.style_strength    = style_strength
+        self.q_preservation    = q_preservation
         self.inject_steps_frac = inject_steps_frac
         self._style_kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._txt_len_single   = 512
@@ -2255,13 +2257,16 @@ class StylePersonalizationPolicy(BasePolicy):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         """
-        Replace image-token K,V of the edit branch with style K,V.
+        StyleID full formula: Attn(Q_content, K_style, V_style).
 
-        Source branch (index 0) is untouched for clean comparison.
+        Q  — edit image tokens ← source branch Q  (character/structure lock)
+        K,V — edit image tokens ← style K,V        (style appearance)
+
         Text-token positions are never modified — preserves text conditioning.
+        Source branch (index 0) is untouched for clean comparison output.
 
-        Double-stream blocks (txt_len > 0): inject at [txt_len:]
-        Single-stream blocks (txt_len = 0): inject at [_txt_len_single:]
+        Double-stream (txt_len > 0): image tokens at [txt_len:]
+        Single-stream (txt_len = 0): image tokens at [_txt_len_single:]
         """
         if layer not in self._style_kvs:
             return q, k, v
@@ -2272,15 +2277,27 @@ class StylePersonalizationPolicy(BasePolicy):
 
         k_sty, v_sty = self._style_kvs[layer]
         img_offset   = txt_len if txt_len > 0 else self._txt_len_single
-        w            = self.style_strength
+        sw           = self.style_strength
+        qp           = self.q_preservation
 
         k = k.clone()
         v = v.clone()
         ks = k_sty.to(k.device, dtype=k.dtype)
         vs = v_sty.to(v.device, dtype=v.dtype)
 
-        k[1:2, :, img_offset:, :] = (1.0 - w) * k[1:2, :, img_offset:, :] + w * ks
-        v[1:2, :, img_offset:, :] = (1.0 - w) * v[1:2, :, img_offset:, :] + w * vs
+        # Style K,V injection (appearance)
+        k[1:2, :, img_offset:, :] = (1.0 - sw) * k[1:2, :, img_offset:, :] + sw * ks
+        v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
+
+        # Q preservation: blend edit Q toward source Q for character fidelity.
+        # With qp=1.0 (default): edit Q ← source Q → Attn(Q_src, K_sty, V_sty).
+        # Content Q anchors character shape/pose; style K,V set appearance only.
+        if qp > 0.0:
+            q = q.clone()
+            q[1:2, :, img_offset:, :] = (
+                qp * q[0:1, :, img_offset:, :]
+                + (1.0 - qp) * q[1:2, :, img_offset:, :]
+            )
 
         return q, k, v
 
