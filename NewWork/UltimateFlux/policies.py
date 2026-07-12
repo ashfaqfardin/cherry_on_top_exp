@@ -1990,247 +1990,302 @@ class KontextColorPolicy(BasePolicy):
 
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────
+#
+# Implements StyleID (CVPR 2024 Highlight, arXiv:2312.09008) adapted to FLUX.
+#
+# Mechanism: capture K,V from the style reference image at TIER_A layers via
+# one forward pass, then during generation replace the EDIT branch's image-token
+# K,V with the captured style K,V at every TIER_A layer and every denoising step.
+#
+# Content Q (from text prompt + generation state) drives WHAT is generated;
+# style K,V redirect the attention output to shape HOW it looks.
+#
+# TIER_A safety (FreeFlux ICCV 2025): these 13 content-similarity layers have
+# low/no RoPE frequency — K injection here does NOT cause spatial locking.
+# Non-TIER_A layers (high RoPE) are left entirely free for content generation.
 
-# Pivotal layer for PFB+SAC: double-stream block 1.
-# From schnell ablation (§5 of Pipeline_Plan.md): object (0.555), texture (0.51),
-# style (0.50) all peak there simultaneously — the same signature SVD-Style used
-# to identify Infinity's F₃. Block 1 is a strong starting hypothesis for dev too.
-_PIVOTAL_LAYER = 1
-
-
-def _style_extractor(h: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-    """SVD with exponential spectral reweighting.  h: (B, L, C) → same shape."""
-    B, L, C = h.shape
-    results = []
-    for b in range(B):
-        U, S, Vh = torch.linalg.svd(h[b].float(), full_matrices=False)
-        w = torch.exp(-alpha * torch.arange(S.shape[0], device=h.device, dtype=S.dtype))
-        results.append((U * (S * w).unsqueeze(0)) @ Vh)
-    return torch.stack(results).to(h.dtype)
+_TIER_A_STYLE = frozenset([0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56])
 
 
-def _apply_pfb(h_gen: torch.Tensor, h_sty: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-    """PFB blending: Φ(h_sty) + (h_gen − Φ(h_gen)).  All tensors (1, L, C)."""
-    return _style_extractor(h_sty, alpha) + (h_gen - _style_extractor(h_gen, alpha))
+class _StyleKVCaptureProcessor:
+    """
+    Standalone attention processor for K,V extraction from the style reference.
+
+    Installed temporarily on pipe.transformer for one forward pass during
+    pre_generate; the original processors are restored immediately after.
+
+    Layer index is inferred from a monotonically incrementing counter that
+    matches FLUX's sequential attention-call order:
+      double-stream blocks 0–18 called first, then single-stream blocks 19–56.
+
+    For double-stream blocks: text and image tokens are separate inputs;
+      img_offset = actual text prefix length (= eq.shape[2]).
+    For single-stream blocks: hidden_states is already [text | image] cat'd;
+      img_offset = self.txt_len (stored from the empty-prompt length).
+    """
+
+    def __init__(self, tier_a: frozenset, txt_len: int):
+        self.tier_a   = tier_a
+        self.txt_len  = txt_len   # text-token count (same for every block)
+        self._counter = 0
+        self.kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ):
+        layer      = self._counter
+        self._counter += 1
+        is_double  = encoder_hidden_states is not None
+        batch_size = hidden_states.shape[0]
+
+        q = attn.to_q(hidden_states)
+        k = attn.to_k(hidden_states)
+        v = attn.to_v(hidden_states)
+
+        head_dim = k.shape[-1] // attn.heads
+        q = q.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        k = k.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        v = v.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states)
+            ek = attn.add_k_proj(encoder_hidden_states)
+            ev = attn.add_v_proj(encoder_hidden_states)
+            eq = eq.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            ek = ek.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            ev = ev.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            q  = torch.cat([eq, q], dim=2)
+            k  = torch.cat([ek, k], dim=2)
+            v  = torch.cat([ev, v], dim=2)
+            img_offset = eq.shape[2]        # actual text-token count
+        else:
+            # Single-stream: hidden_states = [text | image] cat'd in transformer.
+            img_offset = self.txt_len
+
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q, image_rotary_emb)
+            k = apply_rotary_emb(k, image_rotary_emb)
+
+        # Capture image-token K,V (after RoPE) at TIER_A layers.
+        # Shape stored: (1, heads, img_seq_len, head_dim) in float32.
+        if layer in self.tier_a:
+            self.kvs[layer] = (
+                k[0:1, :, img_offset:, :].detach().clone().float(),
+                v[0:1, :, img_offset:, :].detach().clone().float(),
+            )
+
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, is_causal=False, attn_mask=attention_mask)
+        out = out.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        out = out.to(q.dtype)
+
+        if is_double:
+            enc_out = out[:, :encoder_hidden_states.shape[1]]
+            out     = out[:, encoder_hidden_states.shape[1]:]
+            out     = attn.to_out[0](out)
+            out     = attn.to_out[1](out)
+            enc_out = attn.to_add_out(enc_out)
+            return out, enc_out
+
+        return out
 
 
 @torch.no_grad()
-def _extract_style_hidden_states(
+def _extract_style_kvs(
     pipe,
     style_image: Image.Image,
+    tier_a: frozenset,
     device: str = "cuda",
     height: int = 1024,
     width: int = 1024,
-    num_steps: int = 28,
-    seed: int = 0,
-) -> Optional[torch.Tensor]:
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Extract pivotal-layer hidden states for a style reference image.
+    Capture K,V at TIER_A layers from the style reference image.
 
-    Strategy: encode style image → FLUX latent → add mid-trajectory noise →
-    one transformer forward pass (empty-prompt) → capture block 1 output.
+    Runs one FLUX forward pass on the style image at t=0.5 (50/50 noise-clean
+    mix) with empty prompt.  Installs a temporary _StyleKVCaptureProcessor to
+    collect K,V, then restores the original attention processors.
 
-    Returns h_sty: (1, L_img, C) float32, or None on failure.
+    t=0.5 is intentional: the noise level keeps style features "soft" enough
+    to be compatible with the generation's early denoising state (t≈1.0→0.75)
+    without the reference image's structure overwhelming the content prompt Q.
+
+    Returns Dict[layer_index → (k_img, v_img)] where k_img / v_img have shape
+    (1, heads, img_seq_len, head_dim) float32 (image tokens only, after RoPE).
     """
     try:
         exec_device = getattr(pipe, '_execution_device', device)
 
-        # ── Encode style image with VAE ──────────────────────────────────────
-        img_t = to_tensor(style_image.resize((width, height))).unsqueeze(0)
-        img_t = (img_t * 2.0 - 1.0).to(exec_device, dtype=pipe.vae.dtype)
+        # ── Encode style image → latents ─────────────────────────────────────
+        img_t   = to_tensor(style_image.resize((width, height))).unsqueeze(0)
+        img_t   = (img_t * 2.0 - 1.0).to(exec_device, dtype=pipe.vae.dtype)
         latents = pipe.vae.encode(img_t).latent_dist.mean
         latents = (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-
-        # Pack latents: (B, C, lat_h, lat_w) → (B, lat_h//2 * lat_w//2, C*4)
         B, C, H, W = latents.shape
         latents = (
             latents.view(B, C, H // 2, 2, W // 2, 2)
-            .permute(0, 2, 4, 1, 3, 5)
-            .reshape(B, (H // 2) * (W // 2), C * 4)
+                   .permute(0, 2, 4, 1, 3, 5)
+                   .reshape(B, (H // 2) * (W // 2), C * 4)
         )
-
-        # t=0.5: 50/50 noise-clean mix.  The noise level must be compatible with the
-        # generation state at the steps where PFB fires (steps 0-25% ≈ t=1.0→0.75).
-        # t=0.1 (near-clean) makes h_sty too structured: its high-energy principal
-        # directions overwhelm the noisy h_edit during PFB, collapsing the generation
-        # to a constant value.  t=0.5 keeps h_sty "soft" enough for safe injection.
-        noise = torch.randn_like(latents)
+        noise         = torch.randn_like(latents)
         latents_noisy = 0.5 * latents + 0.5 * noise
 
-        # ── Encode empty prompt ──────────────────────────────────────────────
+        # ── Empty prompt ─────────────────────────────────────────────────────
         enc_result = pipe.encode_prompt(
-            prompt="",
-            prompt_2=None,
-            device=exec_device,
-            num_images_per_prompt=1,
+            prompt="", prompt_2=None,
+            device=exec_device, num_images_per_prompt=1,
         )
-        # encode_prompt returns (pemb, ppooled) in newer diffusers,
-        # or (pemb, ppooled, text_ids) in some older versions.
         pemb, ppooled = enc_result[0], enc_result[1]
+        txt_len = pemb.shape[1]
 
-        # ── Build RoPE ids ───────────────────────────────────────────────────
-        lh, lw = height // 8, width // 8
+        # ── RoPE position ids ─────────────────────────────────────────────────
+        lh, lw  = height // 8, width // 8
         img_ids = torch.zeros(lh // 2, lw // 2, 3, device=exec_device, dtype=latents.dtype)
         img_ids[..., 1] = torch.arange(lh // 2, device=exec_device)[:, None]
         img_ids[..., 2] = torch.arange(lw // 2, device=exec_device)[None, :]
-        img_ids = img_ids.reshape((lh // 2) * (lw // 2), 3)  # (L_img, 3) — no batch dim
-        txt_ids = torch.zeros(pemb.shape[1], 3, device=exec_device, dtype=latents.dtype)
+        img_ids = img_ids.reshape((lh // 2) * (lw // 2), 3)
+        txt_ids = torch.zeros(txt_len, 3, device=exec_device, dtype=latents.dtype)
 
-        # ── Guidance tensor (FLUX.1-dev requires it; schnell ignores it) ─────
         guidance = None
         if getattr(pipe.transformer.config, 'guidance_embeds', False):
             guidance = torch.full([1], 3.5, device=exec_device, dtype=latents.dtype)
 
-        # ── Forward hook on pivotal block ────────────────────────────────────
-        captured: Dict = {}
-
-        def _hook(module, inp, out):
-            # FluxTransformerBlock returns (encoder_hidden_states, hidden_states).
-            # Index 1 = image hidden states — the tensor that carries visual/style info.
-            h = (out[1] if (isinstance(out, tuple) and len(out) > 1)
-                 else (out[0] if isinstance(out, tuple) else out))
-            captured["h_sty"] = h.detach().float()
-
-        handle = pipe.transformer.transformer_blocks[_PIVOTAL_LAYER].register_forward_hook(_hook)
-
-        # t=500 → timestep/1000 = 0.5, matching latents_noisy (50/50 mix).
-        # Avoids scheduler.set_timesteps(mu=...) requirement from newer diffusers.
-        t = torch.tensor([500.0], device=exec_device, dtype=latents.dtype)
-
+        # ── Capture K,V with temporary processor ─────────────────────────────
+        cap  = _StyleKVCaptureProcessor(tier_a=tier_a, txt_len=txt_len)
+        orig = pipe.transformer.attn_processors   # dict {name: processor}
+        pipe.transformer.set_attn_processor(cap)
         try:
+            t = torch.tensor([500.0], device=exec_device, dtype=latents.dtype)
             _ = pipe.transformer(
-                hidden_states=latents_noisy.to(pipe.transformer.dtype),
-                timestep=t / 1000.0,
-                guidance=guidance,
-                pooled_projections=ppooled.to(pipe.transformer.dtype),
-                encoder_hidden_states=pemb.to(pipe.transformer.dtype),
-                txt_ids=txt_ids,
-                img_ids=img_ids,
-                return_dict=False,
+                hidden_states         = latents_noisy.to(pipe.transformer.dtype),
+                timestep              = t / 1000.0,
+                guidance              = guidance,
+                pooled_projections    = ppooled.to(pipe.transformer.dtype),
+                encoder_hidden_states = pemb.to(pipe.transformer.dtype),
+                txt_ids               = txt_ids,
+                img_ids               = img_ids,
+                return_dict           = False,
             )
         finally:
-            handle.remove()
+            pipe.transformer.set_attn_processor(orig)
 
-        return captured.get("h_sty")  # (1, L_img, C)
+        if cap.kvs:
+            first_shape = tuple(next(iter(cap.kvs.values()))[0].shape)
+            print(f"[StyleID] Captured KV at {len(cap.kvs)} TIER_A layers: "
+                  f"{sorted(cap.kvs.keys())}  kv_shape={first_shape}")
+        else:
+            print("[StyleID] WARNING: No KV captured — layer indices may not match TIER_A.")
+
+        return cap.kvs
 
     except Exception as exc:
-        print(f"[UltimateFlux] Style extraction failed: {exc}")
+        print(f"[StyleID] KV extraction failed: {exc}")
         import traceback; traceback.print_exc()
-        return None
+        return {}
 
 
 class StylePersonalizationPolicy(BasePolicy):
     """
-    Reference-image style transfer on FLUX.1-dev.
+    Reference-image style transfer on FLUX.1-dev (StyleID mechanism).
 
-    Adapts SVD-Style (Paper 4) to FLUX's continuous hidden-state space at
-    double-stream layer 1 — the pivotal layer where object (0.555), texture
-    (0.51), and style (0.50) peak simultaneously (§5/§7 of Pipeline_Plan.md).
+    StyleID (CVPR 2024, arXiv:2312.09008) adapted to FLUX joint attention:
 
-    PFB (Principal Feature Blending):
-        Applied via forward hook on block 1 output.
-        h_edit ← Φ(h_sty, α) + (h_edit − Φ(h_edit, α))
-        where Φ = SVD with exponential spectral reweighting.
+    PRE-GENERATE — one forward pass on the style reference image at t=0.5
+      (empty prompt) captures K,V at all TIER_A attention layers.
 
-    SAC (Structural Attention Correction):
-        Applied via attention processor at block 1.
-        Q[edit] ← Q[src],  K[edit] ← K[src]   (preserve spatial structure)
+    GENERATION — at every TIER_A layer and every denoising step, the EDIT
+      branch's image-token K,V are replaced (or blended) with the captured
+      style K,V.  The content Q from the text prompt remains unchanged, so
+      the prompt determines WHAT is generated while style K,V control HOW
+      it looks (texture, brush strokes, colour palette).
+
+    Why K,V injection is more powerful than SVD/PFB (previous approach):
+      - Operates directly on attention, not on block hidden-state SVD
+      - Active at ALL 13 TIER_A layers (vs. 1 pivotal block)
+      - Active at ALL denoising steps (vs. first 25%)
+      - No SAC-after-PFB contradiction that collapsed generation to plain color
+
+    Parameters
+    ----------
+    style_image : PIL.Image, optional
+        Reference image whose style to transfer.
+    style_strength : float
+        K,V blend weight: 0.0 = no injection, 1.0 = full style K,V.
+    inject_steps_frac : (float, float)
+        Step window for injection (fraction of total steps).
+        Default (0.0, 1.0) = all steps for consistent style throughout.
     """
 
     def __init__(
         self,
         style_image: Optional[Image.Image] = None,
+        style_strength: float = 1.0,
+        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        # Legacy aliases — accepted for backward compat but not used.
         alpha: float = 1.0,
-        # SAC window must match pfb_steps_frac.  If SAC runs AFTER PFB stops,
-        # it forces edit Q,K → source Q,K while edit hidden states are in a
-        # PFB-modified subspace — the mismatch collapses denoising to a plain
-        # constant color.  Default matches pfb_steps_frac (first 25%).
         sac_steps_frac: Tuple[float, float] = (0.0, 0.25),
-        # PFB applied only in the first quarter of denoising — analogous to
-        # step 3/12 in SVD-Style (Infinity). Applying at all steps over-injects
-        # style features and creates noise in the output.
         pfb_steps_frac: Tuple[float, float] = (0.0, 0.25),
     ):
-        self.style_image = style_image
-        self.alpha = alpha
-        self.sac_steps_frac = sac_steps_frac
-        self.pfb_steps_frac = pfb_steps_frac
-        self._h_sty: Optional[torch.Tensor] = None
-        self._step_counter = [0]     # mutable ref shared with closure
-        self._n_steps = 28           # updated in pre_generate
+        self.style_image       = style_image
+        self.style_strength    = style_strength
+        self.inject_steps_frac = inject_steps_frac
+        self._style_kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._txt_len_single   = 512
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
-                     num_steps=28, seed=0, style_image=None, **kwargs):
-        self._n_steps = num_steps
-        img = style_image if style_image is not None else self.style_image
+                     num_steps=28, max_sequence_length=512, **kwargs):
+        self._txt_len_single = max_sequence_length
+        img = self.style_image
         if img is not None:
-            print("[UltimateFlux] Extracting style features from reference image…")
-            self._h_sty = _extract_style_hidden_states(
-                pipe, img,
+            print("[StyleID] Extracting style K,V from reference image…")
+            self._style_kvs = _extract_style_kvs(
+                pipe, img, _TIER_A_STYLE,
                 device=device, height=height, width=width,
-                num_steps=num_steps, seed=seed,
             )
-            if self._h_sty is not None:
-                print(f"[UltimateFlux] Style features captured, shape: {self._h_sty.shape}")
-        self._step_counter[0] = 0
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
-        """SAC: copy image-token Q, K from source branch to edit branch at pivotal layer.
-
-        Text tokens (0:txt_len) are left as-is — both branches share the same prompt
-        for style tasks, so text Q,K are already identical; the clone is just explicit.
-        Only image tokens (txt_len:) carry visual structure worth preserving.
         """
-        if layer != _PIVOTAL_LAYER:
+        Replace image-token K,V of the edit branch with style K,V.
+
+        Source branch (index 0) is untouched for clean comparison.
+        Text-token positions are never modified — preserves text conditioning.
+
+        Double-stream blocks (txt_len > 0): inject at [txt_len:]
+        Single-stream blocks (txt_len = 0): inject at [_txt_len_single:]
+        """
+        if layer not in self._style_kvs:
             return q, k, v
-        if not _step_active(step, n_steps, self.sac_steps_frac):
+        if k.shape[0] < 2:
+            return q, k, v
+        if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
-        q_src, q_edit = q.chunk(2)
-        k_src, k_edit = k.chunk(2)
-        q_edit = q_edit.clone()
-        k_edit = k_edit.clone()
-        q_edit[:, :, txt_len:, :] = q_src[:, :, txt_len:, :]
-        k_edit[:, :, txt_len:, :] = k_src[:, :, txt_len:, :]
-        q = torch.cat([q_src, q_edit])
-        k = torch.cat([k_src, k_edit])
+        k_sty, v_sty = self._style_kvs[layer]
+        img_offset   = txt_len if txt_len > 0 else self._txt_len_single
+        w            = self.style_strength
+
+        k = k.clone()
+        v = v.clone()
+        ks = k_sty.to(k.device, dtype=k.dtype)
+        vs = v_sty.to(v.device, dtype=v.dtype)
+
+        k[1:2, :, img_offset:, :] = (1.0 - w) * k[1:2, :, img_offset:, :] + w * ks
+        v[1:2, :, img_offset:, :] = (1.0 - w) * v[1:2, :, img_offset:, :] + w * vs
+
         return q, k, v
 
     def get_block_hooks(self) -> Dict[int, Callable]:
-        """PFB: blend style features into block 1 hidden states."""
-        h_sty        = self._h_sty
-        alpha        = self.alpha
-        pfb_frac     = self.pfb_steps_frac
-        step_counter = self._step_counter
-        n_steps      = self._n_steps
-
-        def _pfb_hook(module, inp, out):
-            # Gate: only apply PFB within the configured step window.
-            # step_counter tracks how many times this hook has fired = current step.
-            cur_step = step_counter[0]
-            step_counter[0] += 1
-
-            if h_sty is None:
-                return out
-
-            # FluxTransformerBlock returns (encoder_hidden_states, hidden_states).
-            is_tuple = isinstance(out, tuple)
-            has_two  = is_tuple and len(out) >= 2
-            h = out[1] if has_two else (out[0] if is_tuple else out)
-
-            if h.shape[0] < 2 or not _step_active(cur_step, n_steps, pfb_frac):
-                return out
-
-            h_edit  = h[1:2]                                 # (1, L_img, C)
-            h_style = h_sty.to(h.device, dtype=h.dtype)
-            h_new   = _apply_pfb(h_edit, h_style, alpha)
-            h_out   = torch.cat([h[0:1], h_new], dim=0)
-
-            if has_two:
-                return (out[0], h_out)   # keep text unchanged, replace image hidden states
-            return (h_out,) + out[1:] if is_tuple else h_out
-
-        return {_PIVOTAL_LAYER: _pfb_hook}
+        return {}
 
 
 # ─────────────────────────── Task 8: Real-image inversion helper ─────────────

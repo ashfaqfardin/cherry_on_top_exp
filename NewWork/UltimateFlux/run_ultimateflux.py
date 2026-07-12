@@ -172,16 +172,12 @@ def build_policy(cfg: dict):
         style_img = None
         if cfg.get("style_image"):
             style_img = Image.open(cfg["style_image"]).convert("RGB")
-        pfb_frac = tuple(cfg.get("pfb_steps_frac", [0.0, 0.25]))
         return StylePersonalizationPolicy(
             style_image=style_img,
-            alpha=cfg.get("pfb_alpha", 1.0),
-            # SAC window must match PFB window.  If SAC runs after PFB stops, it
-            # forces edit Q,K → source Q,K while edit hidden states are in a
-            # PFB-modified subspace; the mismatch collapses denoising to a constant.
-            sac_steps_frac=tuple(cfg.get("sac_steps_frac", list(pfb_frac))),
-            # PFB only in the first quarter — all-steps over-injects → noisy output.
-            pfb_steps_frac=pfb_frac,
+            # style_strength: 1.0 = full K,V replacement; reduce for softer style.
+            style_strength=cfg.get("style_strength", 1.0),
+            # inject at ALL steps — style K,V drive appearance throughout denoising.
+            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
         )
 
     raise ValueError(
@@ -460,6 +456,8 @@ def parse_args():
                    help="Unused; kept for backward compat")
     p.add_argument("--pfb_alpha",   type=float, default=1.0,
                    help="Unused; kept for backward compat")
+    p.add_argument("--style_strength", type=float, default=1.0,
+                   help="Style task: K,V blend weight (0.0=no injection, 1.0=full style). Default 1.0.")
     p.add_argument("--delta_scale", type=float, default=2.0,
                    help="Unused; kept for backward compat (legacy masked-delta-flow)")
     p.add_argument("--delta_start_step", type=int, default=None,
@@ -559,6 +557,7 @@ def main():
         "inject_frac":          args.inject_frac,
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
+        "style_strength":       args.style_strength,
         "delta_scale":          args.delta_scale,
         "delta_start_step":     args.delta_start_step,
         "seed":               args.seed,
