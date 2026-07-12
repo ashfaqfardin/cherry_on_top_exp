@@ -2141,7 +2141,11 @@ class StylePersonalizationPolicy(BasePolicy):
         self,
         style_image: Optional[Image.Image] = None,
         alpha: float = 1.0,
-        sac_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        # SAC window must match pfb_steps_frac.  If SAC runs AFTER PFB stops,
+        # it forces edit Q,K → source Q,K while edit hidden states are in a
+        # PFB-modified subspace — the mismatch collapses denoising to a plain
+        # constant color.  Default matches pfb_steps_frac (first 25%).
+        sac_steps_frac: Tuple[float, float] = (0.0, 0.25),
         # PFB applied only in the first quarter of denoising — analogous to
         # step 3/12 in SVD-Style (Infinity). Applying at all steps over-injects
         # style features and creates noise in the output.

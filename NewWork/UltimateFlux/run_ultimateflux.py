@@ -172,13 +172,16 @@ def build_policy(cfg: dict):
         style_img = None
         if cfg.get("style_image"):
             style_img = Image.open(cfg["style_image"]).convert("RGB")
+        pfb_frac = tuple(cfg.get("pfb_steps_frac", [0.0, 0.25]))
         return StylePersonalizationPolicy(
             style_image=style_img,
             alpha=cfg.get("pfb_alpha", 1.0),
-            sac_steps_frac=tuple(cfg.get("sac_steps_frac", [0.0, 1.0])),
-            # PFB only in the first quarter — applying at all steps over-injects
-            # style features and produces a noisy output (class docstring).
-            pfb_steps_frac=tuple(cfg.get("pfb_steps_frac", [0.0, 0.25])),
+            # SAC window must match PFB window.  If SAC runs after PFB stops, it
+            # forces edit Q,K → source Q,K while edit hidden states are in a
+            # PFB-modified subspace; the mismatch collapses denoising to a constant.
+            sac_steps_frac=tuple(cfg.get("sac_steps_frac", list(pfb_frac))),
+            # PFB only in the first quarter — all-steps over-injects → noisy output.
+            pfb_steps_frac=pfb_frac,
         )
 
     raise ValueError(

@@ -13,6 +13,10 @@
 # SAC (Structural Attention Correction):
 #   Copies image-token Q, K from source branch to edit branch at block 1.
 #   Prevents PFB from distorting spatial layout and object structure.
+#   Window MUST match pfb_steps_frac (0.0, 0.25).  If SAC runs after PFB
+#   stops, it forces edit Q,K → source Q,K while edit hidden states are in a
+#   PFB-modified subspace — the Q×K mismatch collapses denoising to a plain
+#   constant color.  sac_steps_frac defaults to pfb_steps_frac in the runner.
 #
 # Style extraction: style image encoded as latent at t=0.5 (50/50 noise-clean mix),
 #   then one forward pass captures block 1 hidden states.  t=0.5 is intentional:
