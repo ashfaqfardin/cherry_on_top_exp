@@ -169,16 +169,18 @@ def build_policy(cfg: dict):
         )
 
     if task == "style":
-        style_img = None
+        style_img   = None
+        content_img = None
         if cfg.get("style_image"):
             style_img = Image.open(cfg["style_image"]).convert("RGB")
+        if cfg.get("content_image"):
+            content_img = Image.open(cfg["content_image"]).convert("RGB")
         return StylePersonalizationPolicy(
-            style_image=style_img,
-            style_strength=cfg.get("style_strength", 1.0),
-            # q_preservation=1.0 copies source Q to edit → Attn(Q_src, K_sty, V_sty)
-            # → preserves character shape/pose while style K,V set appearance.
-            q_preservation=cfg.get("q_preservation", 1.0),
-            inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
+            style_image      = style_img,
+            content_image    = content_img,
+            style_strength   = cfg.get("style_strength",   1.0),
+            content_strength = cfg.get("content_strength", 0.85),
+            inject_steps_frac = tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
         )
 
     raise ValueError(
@@ -465,8 +467,15 @@ def parse_args():
                    help="Unused; kept for backward compat")
     p.add_argument("--style_strength", type=float, default=1.0,
                    help="Style task: K,V blend weight (0.0=no injection, 1.0=full style). Default 1.0.")
+    p.add_argument("--content_image", type=str, default=None,
+                   help="Style task: source image whose identity to preserve. "
+                        "When provided, both branches start from this image's noisy latent "
+                        "(img2img mode) instead of random noise.")
+    p.add_argument("--content_strength", type=float, default=0.85,
+                   help="Style task (with --content_image): noise fraction added to source "
+                        "latent in (0,1). 0.85=strong style, 0.6=strong identity. Default 0.85.")
     p.add_argument("--q_preservation", type=float, default=1.0,
-                   help="Style task: Q blend weight from source branch (1.0=full content Q → max character fidelity, 0.0=keep edit Q). Default 1.0.")
+                   help="Deprecated, ignored.")
     p.add_argument("--delta_scale", type=float, default=2.0,
                    help="Unused; kept for backward compat (legacy masked-delta-flow)")
     p.add_argument("--delta_start_step", type=int, default=None,
@@ -567,6 +576,8 @@ def main():
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
         "style_strength":       args.style_strength,
+        "content_image":        args.content_image,
+        "content_strength":     args.content_strength,
         "q_preservation":       args.q_preservation,
         "delta_scale":          args.delta_scale,
         "delta_start_step":     args.delta_start_step,

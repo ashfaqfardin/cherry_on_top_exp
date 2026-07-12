@@ -312,25 +312,40 @@ def generate_dual_branch(
     num_ch  = pipe.transformer.config.in_channels // 4   # 16 for FLUX
     lat_h   = height // 8
     lat_w   = width  // 8
-    _g      = torch.Generator(device=exec_device).manual_seed(seed)
-    _one    = randn_tensor(
-        (1, num_ch, lat_h, lat_w),
-        generator=_g,
-        device=exec_device,
-        dtype=torch.bfloat16,
-    )
-    # Pack: (B, C, lat_h, lat_w) → (B, lat_h//2 * lat_w//2, C*4)
-    # This is the standard FLUX packing used inside prepare_latents.
-    shared_latents = (
-        _one.expand(2, -1, -1, -1).clone()
-        .view(2, num_ch, lat_h // 2, 2, lat_w // 2, 2)
-        .permute(0, 2, 4, 1, 3, 5)
-        .reshape(2, (lat_h // 2) * (lat_w // 2), num_ch * 4)
-    )
+
+    # Policy may provide a content-image starting latent (image-anchored style transfer).
+    # If so, use it; otherwise fall back to seeded random noise as before.
+    override_latent    = getattr(policy, '_initial_latent',     None)
+    override_timesteps = getattr(policy, '_override_timesteps', None)
+    actual_num_steps   = getattr(policy, '_actual_num_steps',   num_steps)
+
+    if override_latent is not None:
+        # Image-anchored: both branches start from the source image's noisy latent.
+        # Source branch denoises → reconstructs source (its K tracks real source structure).
+        # Edit branch denoises with style injection → styled reconstruction of source.
+        shared_latents = (
+            override_latent.to(exec_device, dtype=torch.bfloat16)
+            .expand(2, -1, -1, -1).clone()
+        )
+    else:
+        _g   = torch.Generator(device=exec_device).manual_seed(seed)
+        _one = randn_tensor(
+            (1, num_ch, lat_h, lat_w),
+            generator=_g,
+            device=exec_device,
+            dtype=torch.bfloat16,
+        )
+        # Pack: (B, C, lat_h, lat_w) → (B, lat_h//2 * lat_w//2, C*4)
+        shared_latents = (
+            _one.expand(2, -1, -1, -1).clone()
+            .view(2, num_ch, lat_h // 2, 2, lat_w // 2, 2)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(2, (lat_h // 2) * (lat_w // 2), num_ch * 4)
+        )
 
     # 3. Install custom attention processor
     proc = UltimateFluxAttnProcessor(
-        policy=policy, total_layers=N_LAYERS, total_steps=num_steps
+        policy=policy, total_layers=N_LAYERS, total_steps=actual_num_steps
     )
     proc.reset()
     pipe.transformer.set_attn_processor(proc)
@@ -368,16 +383,23 @@ def generate_dual_branch(
             _build_sam2_mask(pipe, policy, lats, height, width)
 
         if save_intermediates and (step_index % intermediate_every == 0
-                                   or step_index == num_steps - 1):
-            captured.append((step_index, num_steps, lats.clone().cpu()))
+                                   or step_index == actual_num_steps - 1):
+            captured.append((step_index, actual_num_steps, lats.clone().cpu()))
 
         return callback_kwargs
+
+    # Build pipe() kwargs — if policy provides an override timestep list (img2img),
+    # pass it directly instead of num_inference_steps so the schedule matches z_T.
+    pipe_ts_kwargs: dict = {}
+    if override_timesteps is not None:
+        pipe_ts_kwargs["timesteps"] = override_timesteps.tolist()
+    else:
+        pipe_ts_kwargs["num_inference_steps"] = num_steps
 
     try:
         result = pipe(
             prompt=[source_prompt, edit_prompt],
-            latents=shared_latents,        # pre-packed, shared across both branches
-            num_inference_steps=num_steps,
+            latents=shared_latents,
             guidance_scale=guidance_scale,
             height=height,
             width=width,
@@ -385,6 +407,7 @@ def generate_dual_branch(
             output_type="pil",
             callback_on_step_end=_capture if needs_callback else None,
             callback_on_step_end_tensor_inputs=["latents"] if needs_callback else [],
+            **pipe_ts_kwargs,
         )
     finally:
         for h in handles:

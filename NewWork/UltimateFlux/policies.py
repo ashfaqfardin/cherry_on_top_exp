@@ -2203,43 +2203,62 @@ def _extract_style_kvs(
         return {}
 
 
-class StylePersonalizationPolicy(BasePolicy):
+class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
     """
     Reference-image style transfer on FLUX.1-dev (StyleID mechanism).
 
-    StyleID (CVPR 2024, arXiv:2312.09008) adapted to FLUX joint attention with
-    layer-stratified injection and scheduled start:
+    StyleID (CVPR 2024, arXiv:2312.09008) adapted to FLUX joint attention.
 
-    PRE-GENERATE — one forward pass on the style reference image at t=0.5
-      (empty prompt) captures K,V at all 13 TIER_A attention layers.
+    ── Two modes ──────────────────────────────────────────────────────────────
 
-    GENERATION — inject_steps_frac[0] (default 0.4) delays injection:
-      Early steps (0–40%): both branches generate freely → content/identity forms.
-      Late steps (40–100%): style injected → appearance shaped without overwriting structure.
+    TEXT-ONLY (content_image=None):
+      Both branches start from random noise guided by the text prompt.
+      Identity relies on source K injection at identity layers.
 
-      Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
-          K copied from source branch (always clean). Anchors edit attention to
-          the same spatial regions as the unmodified generation.
-          Style V reshapes output appearance.
+    IMAGE-ANCHORED (content_image provided):
+      Formula:
+        z_T = (1 − σ) · z_src + σ · ε    σ = content_strength (default 0.85)
+             └──────────────────────┘
+             source image's noisy latent
+        Both branches start from z_T.
+        Source branch denoises z_T → reconstructs source (its K tracks source structure).
+        Edit branch denoises z_T + style K,V → styled source.
+        Source K at identity layers anchors edit to real source image structure.
+      Latent nudging ×1.15 (StableFlow §3) corrects magnitude drift in FLUX inversion.
+
+    ── Layer-stratified injection ──────────────────────────────────────────────
+      Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_src):
+          Copy K AND V from source branch → edit follows source denoising path.
+          source.png and edit.png share the same character/layout.
+          No style applied at these layers.
       Texture layers {18,25,28,37,42,45,50,56} — Attn(Q_edit, K_style, V_style):
-          K+V from style — strong style in detail-refining layers.
+          K+V from style reference → strong style after structure is committed.
 
     Parameters
     ----------
     style_image : PIL.Image, optional
         Reference image whose style to transfer.
+    content_image : PIL.Image, optional
+        Source image whose identity to preserve.  If None, falls back to
+        text-to-image generation (both branches from random noise).
     style_strength : float
         K,V blend weight: 0.0 = no injection, 1.0 = full style K,V.
+    content_strength : float
+        Noise fraction added to source image latent, in (0, 1).
+        1.0 = pure noise (source info lost), 0.5 = 50/50 mix.
+        Default 0.85: strong style flexibility while preserving identity.
+        Has no effect when content_image is None.
     inject_steps_frac : (float, float)
-        Step window. Default (0.4, 1.0) — skip first 40% for content formation.
-        Use (0.0, 1.0) for maximum style strength at the cost of more identity drift.
+        Step window for injection. Default (0.0, 1.0) = all active steps.
     """
 
     def __init__(
         self,
         style_image: Optional[Image.Image] = None,
+        content_image: Optional[Image.Image] = None,
         style_strength: float = 1.0,
-        inject_steps_frac: Tuple[float, float] = (0.4, 1.0),
+        content_strength: float = 0.85,
+        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
         # Legacy aliases — accepted for backward compat but not used.
         q_preservation: float = 1.0,
         alpha: float = 1.0,
@@ -2247,14 +2266,25 @@ class StylePersonalizationPolicy(BasePolicy):
         pfb_steps_frac: Tuple[float, float] = (0.0, 0.25),
     ):
         self.style_image       = style_image
+        self.content_image     = content_image
         self.style_strength    = style_strength
+        self.content_strength  = content_strength
         self.inject_steps_frac = inject_steps_frac
         self._style_kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._txt_len_single   = 512
+        # Set by pre_generate when content_image is provided:
+        self._initial_latent:      Optional[torch.Tensor] = None
+        self._override_timesteps:  Optional[torch.Tensor] = None
+        self._actual_num_steps:    int = 28
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
                      num_steps=28, max_sequence_length=512, **kwargs):
-        self._txt_len_single = max_sequence_length
+        self._txt_len_single   = max_sequence_length
+        self._actual_num_steps = num_steps
+        self._initial_latent   = None
+        self._override_timesteps = None
+
+        # ── Step 1: Extract style K,V ─────────────────────────────────────
         img = self.style_image
         if img is not None:
             print("[StyleID] Extracting style K,V from reference image…")
@@ -2263,24 +2293,49 @@ class StylePersonalizationPolicy(BasePolicy):
                 device=device, height=height, width=width,
             )
 
+        # ── Step 2: Encode content image → noisy starting latent ──────────
+        if self.content_image is not None:
+            print("[StyleID] Encoding content image for identity-preserving transfer…")
+            # Encode + nudge (StableFlow ×1.15 corrects FLUX inversion magnitude drift)
+            z_0 = self.encode_real_image(
+                pipe, self.content_image, height, width, device, nudge=True
+            )
+            # Get FLUX timestep schedule (mu-shifted for resolution)
+            pipe.scheduler.set_timesteps(num_steps, device=device)
+            all_ts  = pipe.scheduler.timesteps   # (num_steps,) descending, CPU
+            sigmas  = pipe.scheduler.sigmas.cpu().float()  # (num_steps+1,) descending
+
+            # Find start index for content_strength noise level.
+            # sigmas are high→low; we want the first position where sigma ≤ cs.
+            cs = self.content_strength
+            start_idx = int((1.0 - cs) * len(all_ts))
+            start_idx = max(0, min(start_idx, len(all_ts) - 1))
+            sigma_start = sigmas[start_idx].item()
+
+            # z_T = (1 − σ)·z_src + σ·ε   (flow-matching interpolation)
+            seed = kwargs.get("seed", 0)
+            gen  = torch.Generator(device=z_0.device).manual_seed(seed)
+            eps  = torch.randn(z_0.shape, generator=gen,
+                               device=z_0.device, dtype=z_0.dtype)
+            self._initial_latent     = (1.0 - sigma_start) * z_0 + sigma_start * eps
+            self._override_timesteps = all_ts[start_idx:]     # subset to use
+            self._actual_num_steps   = len(self._override_timesteps)
+            print(f"[StyleID] content_strength={cs:.2f}  sigma_start={sigma_start:.3f}  "
+                  f"active_steps={self._actual_num_steps}/{num_steps}")
+
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         """
-        Layer-stratified StyleID injection with scheduled start.
+        Layer-stratified injection.  Two zones; style never touches identity layers.
 
-        Scheduled: style injection starts at inject_steps_frac[0] (default 0.4).
-          Early steps (0–40%) form content structure without interference.
-          Late steps (40–100%) apply style during texture-refinement phase.
-          (Z-STAR+ arXiv:2411.19231; Scheduled Injection arXiv:2605.26538)
-
-        Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
-          K copied from SOURCE branch (index 0) — always clean, never modified.
-          Source K anchors edit attention to the same spatial regions as the
-          unmodified generation → same cat/castle layout and identity.
-          Style V reshapes output appearance (colour, texture, brush strokes).
+        Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_src):
+          Copy BOTH K and V from source branch (index 0, unmodified).
+          Edit branch follows source's denoising trajectory at these layers →
+          source.png and edit.png show the same character/structure.
+          NO style applied here — style comes entirely from texture layers.
 
         Texture layers {18,25,28,37,42,45,50,56} — Attn(Q_edit, K_style, V_style):
-          K+V from style reference — strong style in detail-refining layers
-          where spatial structure is already committed by identity layers.
+          K+V from style reference — appearance (colour, texture, brushstrokes)
+          shaped in detail-refining single-stream layers after structure is committed.
 
         Text-token positions never modified.
         Double-stream (txt_len > 0): image tokens at [txt_len:]
@@ -2302,17 +2357,20 @@ class StylePersonalizationPolicy(BasePolicy):
         vs = v_sty.to(v.device, dtype=v.dtype)
 
         if layer in _TIER_A_IDENTITY:
-            # K_src injection: copy source branch K (clean, unmodified) to edit.
-            # Forces edit to attend to same spatial regions as source generation,
-            # anchoring cat/castle identity despite style V in output.
+            # Full source copy: Attn(Q_edit, K_src, V_src).
+            # Copies BOTH K and V from source branch (index 0) into edit branch.
+            # The edit branch follows the source's denoising trajectory at these
+            # 5 identity-critical layers → same character/pose in source.png and edit.png.
+            # Style is NOT applied here — style comes entirely from texture layers.
             k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
+            v[1:2, :, img_offset:, :] = v[0:1, :, img_offset:, :].detach().clone()
         else:
-            # _TIER_A_TEXTURE: K+V from style for strong style signal
+            # Texture layers: full style K+V — Attn(Q_edit, K_style, V_style).
+            # Structure is already committed from identity layers; style signal here
+            # reshapes appearance (colour, texture, brushstrokes) without touching identity.
             ks = k_sty.to(k.device, dtype=k.dtype)
             k[1:2, :, img_offset:, :] = (1.0 - sw) * k[1:2, :, img_offset:, :] + sw * ks
-
-        # V always injected (both identity and texture layers)
-        v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
+            v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 
         return q, k, v
 

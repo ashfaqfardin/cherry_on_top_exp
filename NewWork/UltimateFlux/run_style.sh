@@ -1,46 +1,36 @@
 #!/usr/bin/env bash
-# Task 7 — Reference-based style personalization (StyleID K,V injection)
-# Transfers the visual style of a reference image to a text-prompted generation.
-# Place style reference images in inputs/ before running.
+# Task 7 — Identity-preserving style transfer (StyleID + StableFlow latent nudging)
 #
-# Mechanism (StyleID CVPR 2024 arXiv:2312.09008 + Z-STAR+ arXiv:2411.19231
-#            + Scheduled Injection arXiv:2605.26538, adapted to FLUX):
+# FORMULA:
+#   z_T = (1 − σ) · z_src + σ · ε         (flow-matching interpolation)
+#         └──────── source image ────────┘
+#   σ = content_strength (default 0.85)
 #
-#   1. PRE-GENERATE: one FLUX forward pass on the style reference image
-#      at t=0.5 (50/50 noise-clean mix, empty prompt) captures K,V at
-#      all 13 TIER_A (content-similarity) attention layers.
+#   Both branches start from z_T.
+#   Source branch denoises z_T → reconstructs source (K tracks real source structure).
+#   Edit branch denoises z_T with style K,V → styled reconstruction of source.
 #
-#   2. GENERATION: scheduled + layer-stratified injection:
+# ── Layer-stratified injection ──────────────────────────────────────────────────
 #
-#      Steps 0–40%: no injection — early denoising forms content identity freely.
-#      Steps 40–100%: style injected — texture/detail phase only.
-#        (Scheduled injection arXiv:2605.26538)
+#   Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
+#     K from SOURCE branch (real source denoising trajectory) → edit attends to
+#     the same spatial regions as source reconstruction → identity preserved.
+#     Style V reshapes appearance (colour, texture, brush strokes).
 #
-#      Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
-#        K copied from SOURCE branch (clean, unmodified) → anchors edit to
-#        same spatial regions as unmodified generation → preserves identity.
-#        Style V reshapes appearance (colour, texture, brush strokes).
-#        (Z-STAR+ arXiv:2411.19231)
+#   Texture layers {18,25,28,37,42,45,50,56} — Attn(Q_edit, K_style, V_style):
+#     K+V from style reference → strong style in detail-refining single-stream layers.
 #
-#      Texture layers {18,25,28,37,42,45,50,56} — K+V:
-#        Attn(Q_edit, K_style, V_style)
-#        Strong style in detail-refining layers; structure already committed.
+# TIER_A safety: FreeFlux — all 13 layers are content-similarity-dependent
+#   (low RoPE frequency), K injection never causes spatial locking.
 #
-# TIER_A safety: FreeFlux identifies these 13 layers as content-similarity-
-#   dependent (low RoPE frequency) — K injection here never causes spatial
-#   locking.  Non-TIER_A layers (high RoPE) are left entirely free.
+# ── Key parameters ──────────────────────────────────────────────────────────────
+#   --content_image     source image whose identity to preserve (required for img2img)
+#   --style_image       reference image whose style to transfer
+#   --content_strength  noise fraction (0.85 default): 0.6=strong identity, 0.95=strong style
+#   --style_strength    K,V blend weight (1.0 default)
 #
-# --style_strength 1.0  — K,V blend weight (0.0=no injection, 1.0=full style).
-#   Reduce to 0.7–0.8 if character structure is still distorted.
-#   Increase inject_steps_frac start toward 0.0 for stronger style at cost
-#   of more identity drift (e.g. --inject_steps_frac "[0.2, 1.0]").
-#
-# Why the old SVD/PFB approach was replaced:
-#   PFB modified one block's hidden-state SVD at first 25% of steps.
-#   SAC running after PFB (steps 25%–100%) forced edit Q,K → source Q,K
-#   while edit hidden states were in a PFB-modified subspace — the mismatch
-#   collapsed denoising to a plain constant color.  Direct K,V injection at
-#   all TIER_A layers for all steps avoids this entirely.
+# Sources: StyleID arXiv:2312.09008, Z-STAR+ arXiv:2411.19231,
+#          StableFlow §3 latent nudging, Scheduled Injection arXiv:2605.26538
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -50,7 +40,9 @@ CFG=3.5
 H=1024
 W=1024
 
-echo "=== Task 7: Style personalization ==="
+echo "=== Task 7: Identity-preserving style transfer ==="
+# Place your source image in inputs/source.png and style reference in inputs/*_ref.*
+# Adjust --content_strength: lower (0.6) = stronger identity, higher (0.9) = stronger style.
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
     --hf_token "$HF_TOKEN" --model_path "$MODEL" \
@@ -59,8 +51,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name cat_watercolor \
     --prompt "A cat, watercolor painting" \
-    --style_image inputs/watercolor_ref.png \
-    --style_strength 1.0 \
+    --content_image inputs/cat.png \
+    --style_image   inputs/watercolor_ref.png \
+    --content_strength 0.85 \
+    --style_strength   1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -70,8 +64,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name flower_watercolor \
     --prompt "A flower, watercolor painting" \
-    --style_image inputs/watercolor_ref.png \
-    --style_strength 1.0 \
+    --content_image inputs/flower.png \
+    --style_image   inputs/watercolor_ref.png \
+    --content_strength 0.85 \
+    --style_strength   1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -81,8 +77,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name castle_oilpainting \
     --prompt "A castle, oil painting" \
-    --style_image inputs/oilpainting_ref.jpg \
-    --style_strength 1.0 \
+    --content_image inputs/castle.png \
+    --style_image   inputs/oilpainting_ref.jpg \
+    --content_strength 0.85 \
+    --style_strength   1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -92,8 +90,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name robot_3d \
     --prompt "A robot, 3D render" \
-    --style_image inputs/cartoon3d_ref.png \
-    --style_strength 1.0 \
+    --content_image inputs/robot.png \
+    --style_image   inputs/cartoon3d_ref.png \
+    --content_strength 0.85 \
+    --style_strength   1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -103,8 +103,10 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name cat_crayon \
     --prompt "A cat, kid crayon drawing" \
-    --style_image inputs/drawing_ref.png \
-    --style_strength 1.0 \
+    --content_image inputs/cat.png \
+    --style_image   inputs/drawing_ref.png \
+    --content_strength 0.85 \
+    --style_strength   1.0 \
     --seed 42
 
-echo "=== Style personalization complete. Results in results/ultimateflux/ ==="
+echo "=== Style transfer complete. Results in results/ultimateflux/ ==="
