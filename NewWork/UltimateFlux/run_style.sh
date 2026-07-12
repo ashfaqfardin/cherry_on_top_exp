@@ -1,36 +1,34 @@
 #!/usr/bin/env bash
-# Task 7 — Identity-preserving style transfer (StyleID + StableFlow latent nudging)
+# Task 7 — Identity-preserving style transfer (StyleID adapted for FLUX)
 #
-# FORMULA:
-#   z_T = (1 − σ) · z_src + σ · ε         (flow-matching interpolation)
-#         └──────── source image ────────┘
-#   σ = content_strength (default 0.85)
+# FORMULA at ALL 13 TIER_A layers:
+#   Attn(Q_edit, K_src, V_style)
 #
-#   Both branches start from z_T.
-#   Source branch denoises z_T → reconstructs source (K tracks real source structure).
-#   Edit branch denoises z_T with style K,V → styled reconstruction of source.
+#   K_src  — from source branch's own denoising trajectory
+#             Edit attends to the same spatial regions as the unmodified source
+#             → identity preserved (character, pose, shape) across all 13 layers
 #
-# ── Layer-stratified injection ──────────────────────────────────────────────────
+#   V_style — from style reference image (captured at t=0.3, 70% clean signal)
+#             Attention returns style appearance values (colour, texture,
+#             brushstrokes) across all 13 TIER_A layers
 #
-#   Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
-#     K from SOURCE branch (real source denoising trajectory) → edit attends to
-#     the same spatial regions as source reconstruction → identity preserved.
-#     Style V reshapes appearance (colour, texture, brush strokes).
+# Both problems solved simultaneously: identity locked via K_src everywhere,
+# style transferred via V_style everywhere.
 #
-#   Texture layers {18,25,28,37,42,45,50,56} — Attn(Q_edit, K_style, V_style):
-#     K+V from style reference → strong style in detail-refining single-stream layers.
+# Prior split (K_src+V_src at 5 identity layers, K_sty+V_sty at 8 texture
+# layers) was insufficient: identity from only 5 layers, zero style at
+# identity layers, K_sty at texture layers diverging edit from source.
 #
 # TIER_A safety: FreeFlux — all 13 layers are content-similarity-dependent
 #   (low RoPE frequency), K injection never causes spatial locking.
 #
 # ── Key parameters ──────────────────────────────────────────────────────────────
-#   --content_image     source image whose identity to preserve (required for img2img)
 #   --style_image       reference image whose style to transfer
+#   --style_strength    V_style blend weight (1.0 = full style, default)
+#   --content_image     (optional) source image for img2img mode
 #   --content_strength  noise fraction (0.85 default): 0.6=strong identity, 0.95=strong style
-#   --style_strength    K,V blend weight (1.0 default)
 #
-# Sources: StyleID arXiv:2312.09008, Z-STAR+ arXiv:2411.19231,
-#          StableFlow §3 latent nudging, Scheduled Injection arXiv:2605.26538
+# Sources: StyleID arXiv:2312.09008, FreeFlux (TIER_A layer safety)
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

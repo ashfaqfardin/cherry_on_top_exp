@@ -2029,28 +2029,26 @@ class LatentNudgingMixin:
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────
 #
-# Implements StyleID (CVPR 2024 Highlight, arXiv:2312.09008) adapted to FLUX,
-# with layer-stratified injection to balance identity preservation vs style strength.
+# Implements StyleID (CVPR 2024 Highlight, arXiv:2312.09008) adapted to FLUX.
 #
-# TIER_A layers are split into two groups (both are content-similarity layers,
-# safe for K injection per FreeFlux):
+# Unified injection formula at ALL 13 TIER_A layers:
+#   Attn(Q_edit, K_src, V_style)
 #
-#   _TIER_A_IDENTITY = {0, 7, 8, 9, 10}  — early MM-DiT double-stream layers.
-#       Highest sensitivity for object identity / structure (StableFlow ablation).
-#       V-ONLY injection: Attn(Q_edit, K_edit, V_style).
-#       Content Q×K pattern unchanged → character shape/pose preserved.
-#       Style V still reshapes the output appearance (colour, texture).
+#   K from SOURCE branch: edit attends to same spatial regions as source
+#     → identity preserved (character, pose, shape) — applies at all 13 layers
+#   V from STYLE reference: attention returns style appearance values
+#     → colour, texture, brushstrokes transferred — applies at all 13 layers
 #
-#   _TIER_A_TEXTURE = {18, 25, 28, 37, 42, 45, 50, 56}  — last MM-DiT block
-#       and all single-stream layers where textural detail is refined.
-#       Lower identity sensitivity; structure already committed.
-#       K+V injection: Attn(Q_edit, K_style, V_style) → strong style appearance.
+# Both problems (identity + style) solved by separating K and V roles.
+# Prior stratified approach (K_src+V_src at 5 identity layers, K_sty+V_sty at
+# 8 texture layers) gave partial results: identity from only 5 layers, zero
+# style at identity layers, K_sty at texture layers diverging edit from source.
 #
 # No Q preservation: source Q × style K misaligns (different feature spaces)
 # → blurred attention onto style V → weaker style, no identity benefit.
 
-_TIER_A_IDENTITY = frozenset([0, 7, 8, 9, 10])              # V-only
-_TIER_A_TEXTURE  = frozenset([18, 25, 28, 37, 42, 45, 50, 56])  # K+V
+_TIER_A_IDENTITY = frozenset([0, 7, 8, 9, 10])              # early MM-DiT (ref only)
+_TIER_A_TEXTURE  = frozenset([18, 25, 28, 37, 42, 45, 50, 56])  # late MM-DiT + single-stream (ref only)
 _TIER_A_STYLE    = _TIER_A_IDENTITY | _TIER_A_TEXTURE         # all 13 TIER_A layers
 
 
@@ -2159,13 +2157,15 @@ def _extract_style_kvs(
     """
     Capture K,V at TIER_A layers from the style reference image.
 
-    Runs one FLUX forward pass on the style image at t=0.5 (50/50 noise-clean
-    mix) with empty prompt.  Installs a temporary _StyleKVCaptureProcessor to
-    collect K,V, then restores the original attention processors.
+    Runs one FLUX forward pass on the style image at t=0.3 (30% noise, 70%
+    clean signal) with empty prompt.  Installs a temporary
+    _StyleKVCaptureProcessor to collect K,V, then restores the original
+    attention processors.
 
-    t=0.5 is intentional: the noise level keeps style features "soft" enough
-    to be compatible with the generation's early denoising state (t≈1.0→0.75)
-    without the reference image's structure overwhelming the content prompt Q.
+    t=0.3 (vs the prior t=0.5) gives richer V features — more detailed
+    colour, texture, and brushstroke information from the style reference.
+    Content leakage via K is no longer a concern because inject_qkv always
+    uses K_src (not K_style) during generation.
 
     Returns Dict[layer_index → (k_img, v_img)] where k_img / v_img have shape
     (1, heads, img_seq_len, head_dim) float32 (image tokens only, after RoPE).
@@ -2185,7 +2185,7 @@ def _extract_style_kvs(
                    .reshape(B, (H // 2) * (W // 2), C * 4)
         )
         noise         = torch.randn_like(latents)
-        latents_noisy = 0.5 * latents + 0.5 * noise
+        latents_noisy = 0.7 * latents + 0.3 * noise   # t=0.3: richer style features
 
         # ── Empty prompt ─────────────────────────────────────────────────────
         enc_result = pipe.encode_prompt(
@@ -2212,7 +2212,7 @@ def _extract_style_kvs(
         orig = pipe.transformer.attn_processors   # dict {name: processor}
         pipe.transformer.set_attn_processor(cap)
         try:
-            t = torch.tensor([500.0], device=exec_device, dtype=latents.dtype)
+            t = torch.tensor([300.0], device=exec_device, dtype=latents.dtype)
             _ = pipe.transformer(
                 hidden_states         = latents_noisy.to(pipe.transformer.dtype),
                 timestep              = t / 1000.0,
@@ -2363,17 +2363,22 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         """
-        Layer-stratified injection.  Two zones; style never touches identity layers.
+        Unified K_src + V_style injection at ALL 13 TIER_A layers.
 
-        Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_src):
-          Copy BOTH K and V from source branch (index 0, unmodified).
-          Edit branch follows source's denoising trajectory at these layers →
-          source.png and edit.png show the same character/structure.
-          NO style applied here — style comes entirely from texture layers.
+        Formula: Attn(Q_edit, K_src, V_style)
 
-        Texture layers {18,25,28,37,42,45,50,56} — Attn(Q_edit, K_style, V_style):
-          K+V from style reference — appearance (colour, texture, brushstrokes)
-          shaped in detail-refining single-stream layers after structure is committed.
+          K from source branch (index 0):
+            Edit attends to exactly the same spatial regions as the unmodified
+            source denoising — preserves character identity, pose, and shape.
+
+          V from style reference:
+            Attention output carries style appearance (colour, texture,
+            brushstrokes) from the reference image at every TIER_A layer.
+
+        Applying both at all 13 layers (vs prior split: K_src+V_src at 5
+        identity layers, K_sty+V_sty at 8 texture layers) fixes both problems
+        simultaneously: identity lock is stronger (13 not 5 layers) and style
+        coverage is complete (all 13 layers contribute style V, not just 8).
 
         Text-token positions never modified.
         Double-stream (txt_len > 0): image tokens at [txt_len:]
@@ -2386,29 +2391,18 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
-        k_sty, v_sty = self._style_kvs[layer]
-        img_offset   = txt_len if txt_len > 0 else self._txt_len_single
-        sw           = self.style_strength
+        _, v_sty = self._style_kvs[layer]
+        img_offset = txt_len if txt_len > 0 else self._txt_len_single
+        sw         = self.style_strength
 
-        k = k.clone()
-        v = v.clone()
+        k  = k.clone()
+        v  = v.clone()
         vs = v_sty.to(v.device, dtype=v.dtype)
 
-        if layer in _TIER_A_IDENTITY:
-            # Full source copy: Attn(Q_edit, K_src, V_src).
-            # Copies BOTH K and V from source branch (index 0) into edit branch.
-            # The edit branch follows the source's denoising trajectory at these
-            # 5 identity-critical layers → same character/pose in source.png and edit.png.
-            # Style is NOT applied here — style comes entirely from texture layers.
-            k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
-            v[1:2, :, img_offset:, :] = v[0:1, :, img_offset:, :].detach().clone()
-        else:
-            # Texture layers: full style K+V — Attn(Q_edit, K_style, V_style).
-            # Structure is already committed from identity layers; style signal here
-            # reshapes appearance (colour, texture, brushstrokes) without touching identity.
-            ks = k_sty.to(k.device, dtype=k.dtype)
-            k[1:2, :, img_offset:, :] = (1.0 - sw) * k[1:2, :, img_offset:, :] + sw * ks
-            v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
+        # K from source: spatial attention routing locked to source denoising path
+        k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
+        # V from style: colour, texture, brushstrokes from reference image
+        v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 
         return q, k, v
 
