@@ -177,7 +177,7 @@ def build_policy(cfg: dict):
             # style_strength: 1.0 = full K,V replacement; reduce for softer style.
             style_strength=cfg.get("style_strength", 1.0),
             # inject at ALL steps — style K,V drive appearance throughout denoising.
-            inject_steps_frac=tuple(cfg.get("inject_steps_frac", [0.0, 1.0])),
+            inject_steps_frac=tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
         )
 
     raise ValueError(
