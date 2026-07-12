@@ -2073,7 +2073,8 @@ class _StyleKVCaptureProcessor:
         self.tier_a   = tier_a
         self.txt_len  = txt_len   # text-token count (same for every block)
         self._counter = 0
-        self.kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.kvs:  Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        # kvs stores (q_img, k_img, v_img) for Q-AdaIN color transfer (HAM §3.1)
 
     def __call__(
         self,
@@ -2121,10 +2122,14 @@ class _StyleKVCaptureProcessor:
             q = apply_rotary_emb(q, image_rotary_emb)
             k = apply_rotary_emb(k, image_rotary_emb)
 
-        # Capture image-token K,V (after RoPE) at TIER_A layers.
+        # Capture image-token Q,K,V (after RoPE) at TIER_A layers.
+        # Q is captured for Q-AdaIN colour transfer (HAM arXiv:2603.24043 §3.1):
+        #   normalise source Q statistics to match style Q statistics at inject time
+        #   → style colour distribution flows through Q channel in addition to V.
         # Shape stored: (1, heads, img_seq_len, head_dim) in float32.
         if layer in self.tier_a:
             self.kvs[layer] = (
+                q[0:1, :, img_offset:, :].detach().clone().float(),
                 k[0:1, :, img_offset:, :].detach().clone().float(),
                 v[0:1, :, img_offset:, :].detach().clone().float(),
             )
@@ -2167,8 +2172,9 @@ def _extract_style_kvs(
     Content leakage via K is no longer a concern because inject_qkv always
     uses K_src (not K_style) during generation.
 
-    Returns Dict[layer_index → (k_img, v_img)] where k_img / v_img have shape
-    (1, heads, img_seq_len, head_dim) float32 (image tokens only, after RoPE).
+    Returns Dict[layer_index → (q_img, k_img, v_img)] where each tensor has
+    shape (1, heads, img_seq_len, head_dim) float32 (image tokens only, after
+    RoPE).  Q is stored to enable Q-AdaIN colour transfer (HAM §3.1).
     """
     try:
         exec_device = getattr(pipe, '_execution_device', device)
@@ -2227,9 +2233,9 @@ def _extract_style_kvs(
             pipe.transformer.set_attn_processor(orig)
 
         if cap.kvs:
-            first_shape = tuple(next(iter(cap.kvs.values()))[0].shape)
-            print(f"[StyleID] Captured KV at {len(cap.kvs)} TIER_A layers: "
-                  f"{sorted(cap.kvs.keys())}  kv_shape={first_shape}")
+            first_shape = tuple(next(iter(cap.kvs.values()))[1].shape)   # K tensor
+            print(f"[StyleID] Captured QKV at {len(cap.kvs)} TIER_A layers: "
+                  f"{sorted(cap.kvs.keys())}  k_shape={first_shape}")
         else:
             print("[StyleID] WARNING: No KV captured — layer indices may not match TIER_A.")
 
@@ -2361,24 +2367,47 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             print(f"[StyleID] content_strength={cs:.2f}  sigma_start={sigma_start:.3f}  "
                   f"active_steps={self._actual_num_steps}/{num_steps}")
 
+    @staticmethod
+    def _q_adain(q_src: torch.Tensor, q_sty: torch.Tensor) -> torch.Tensor:
+        """
+        Q-AdaIN (HAM arXiv:2603.24043 §3.1 Global Attention Regulation):
+          normalise source Q statistics to match style Q statistics, transferring
+          the style's colour/feature distribution through the query channel.
+
+        q_src: (1, heads, seq_len, head_dim)  — source branch Q at image tokens
+        q_sty: (1, heads, seq_sty, head_dim)  — style reference Q at image tokens
+        Returns q_src renormalised to have style's per-head per-dim mean/std.
+        """
+        eps = 1e-5
+        # Statistics over sequence dimension (spatial, per-head per-channel)
+        mean_s = q_src.mean(dim=2, keepdim=True)
+        std_s  = q_src.std(dim=2,  keepdim=True).clamp(min=eps)
+        mean_y = q_sty.mean(dim=2, keepdim=True).to(q_src.dtype)
+        std_y  = q_sty.std(dim=2,  keepdim=True).clamp(min=eps).to(q_src.dtype)
+        return std_y * (q_src - mean_s) / std_s + mean_y
+
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         """
-        Unified K_src + V_style injection at ALL 13 TIER_A layers.
+        Unified Attn(Q_src*, K_src, V_style) injection at ALL 13 TIER_A layers.
 
-        Formula: Attn(Q_edit, K_src, V_style)
+          Q* — source Q, optionally AdaIN-normalised to style Q statistics:
+            source Q × source K = source-identical attention weights (no cross-
+            domain mismatch) → structural layout and identity fully preserved.
+            Q-AdaIN further transfers style colour distribution through Q.
+            (FreeControl arXiv:2511.05219, HAM arXiv:2603.24043)
 
           K from source branch (index 0):
             Edit attends to exactly the same spatial regions as the unmodified
-            source denoising — preserves character identity, pose, and shape.
+            source denoising — preserves character, pose, shape.
 
-          V from style reference:
-            Attention output carries style appearance (colour, texture,
-            brushstrokes) from the reference image at every TIER_A layer.
+          V from style reference (t=0.3, 70 % clean signal):
+            Attention output carries colour, texture, brushstrokes from the
+            reference image at every TIER_A layer.
 
-        Applying both at all 13 layers (vs prior split: K_src+V_src at 5
-        identity layers, K_sty+V_sty at 8 texture layers) fixes both problems
-        simultaneously: identity lock is stronger (13 not 5 layers) and style
-        coverage is complete (all 13 layers contribute style V, not just 8).
+        Why this works vs previous failed Q preservation:
+          Prior attempt: Attn(Q_src, K_style, V_style) — Q×K cross-domain
+          mismatch (Q from source space, K from style space) → blurred attention.
+          Current: Q_src × K_src (same branch, same step) → no mismatch.
 
         Text-token positions never modified.
         Double-stream (txt_len > 0): image tokens at [txt_len:]
@@ -2391,16 +2420,24 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
-        _, v_sty = self._style_kvs[layer]
+        q_sty, _, v_sty = self._style_kvs[layer]
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
         sw         = self.style_strength
 
+        q  = q.clone()
         k  = k.clone()
         v  = v.clone()
         vs = v_sty.to(v.device, dtype=v.dtype)
+        qs = q_sty.to(q.device, dtype=q.dtype)
 
-        # K from source: spatial attention routing locked to source denoising path
+        # Q* from source (with Q-AdaIN colour injection): structural layout lock
+        # + style colour distribution transferred through Q statistics.
+        q_src_img = q[0:1, :, img_offset:, :].detach().clone()
+        q[1:2, :, img_offset:, :] = self._q_adain(q_src_img, qs)
+
+        # K from source: spatial routing locked to source denoising path
         k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
+
         # V from style: colour, texture, brushstrokes from reference image
         v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 
