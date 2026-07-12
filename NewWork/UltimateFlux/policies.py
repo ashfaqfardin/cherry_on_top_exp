@@ -2049,12 +2049,13 @@ def _extract_style_hidden_states(
             .reshape(B, (H // 2) * (W // 2), C * 4)
         )
 
-        # Add minimal noise (t=0.1) — style features should come from a near-clean
-        # representation.  t=0.5 (old value) obscures style information with noise.
-        # SVD-Style (Infinity) uses a clean image encoder; 10% noise is the closest
-        # analogy in a flow-matching denoiser.
+        # t=0.5: 50/50 noise-clean mix.  The noise level must be compatible with the
+        # generation state at the steps where PFB fires (steps 0-25% ≈ t=1.0→0.75).
+        # t=0.1 (near-clean) makes h_sty too structured: its high-energy principal
+        # directions overwhelm the noisy h_edit during PFB, collapsing the generation
+        # to a constant value.  t=0.5 keeps h_sty "soft" enough for safe injection.
         noise = torch.randn_like(latents)
-        latents_noisy = 0.9 * latents + 0.1 * noise
+        latents_noisy = 0.5 * latents + 0.5 * noise
 
         # ── Encode empty prompt ──────────────────────────────────────────────
         enc_result = pipe.encode_prompt(
@@ -2092,9 +2093,9 @@ def _extract_style_hidden_states(
 
         handle = pipe.transformer.transformer_blocks[_PIVOTAL_LAYER].register_forward_hook(_hook)
 
-        # t=100 → timestep/1000 = 0.1, matching latents_noisy (90% clean, 10% noise).
+        # t=500 → timestep/1000 = 0.5, matching latents_noisy (50/50 mix).
         # Avoids scheduler.set_timesteps(mu=...) requirement from newer diffusers.
-        t = torch.tensor([100.0], device=exec_device, dtype=latents.dtype)
+        t = torch.tensor([500.0], device=exec_device, dtype=latents.dtype)
 
         try:
             _ = pipe.transformer(

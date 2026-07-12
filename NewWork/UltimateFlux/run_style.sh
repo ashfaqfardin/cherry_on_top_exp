@@ -14,9 +14,12 @@
 #   Copies image-token Q, K from source branch to edit branch at block 1.
 #   Prevents PFB from distorting spatial layout and object structure.
 #
-# Style extraction: style image encoded as near-clean latent (t=0.1, 10% noise)
-#   then one forward pass captures block 1 hidden states.  Low noise ensures
-#   style features reflect the reference image content, not noise artifacts.
+# Style extraction: style image encoded as latent at t=0.5 (50/50 noise-clean mix),
+#   then one forward pass captures block 1 hidden states.  t=0.5 is intentional:
+#   PFB fires at denoising steps 0-25% when the generation is near t=1.0 (pure noise).
+#   If extraction uses t=0.1 (near-clean), h_sty is too structured and overwhelms
+#   the noisy h_edit during PFB → generation collapses to a plain constant image.
+#   t=0.5 keeps h_sty soft enough to be compatible with the early denoising state.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
