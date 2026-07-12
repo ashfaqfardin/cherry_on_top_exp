@@ -176,7 +176,9 @@ def build_policy(cfg: dict):
             style_image=style_img,
             alpha=cfg.get("pfb_alpha", 1.0),
             sac_steps_frac=tuple(cfg.get("sac_steps_frac", [0.0, 1.0])),
-            pfb_steps_frac=tuple(cfg.get("pfb_steps_frac", [0.0, 1.0])),
+            # PFB only in the first quarter — applying at all steps over-injects
+            # style features and produces a noisy output (class docstring).
+            pfb_steps_frac=tuple(cfg.get("pfb_steps_frac", [0.0, 0.25])),
         )
 
     raise ValueError(

@@ -2,6 +2,21 @@
 # Task 7 — Reference-based style personalization (SVD-Style PFB + SAC)
 # Transfers the visual style of a reference image to a text-prompted generation.
 # Place style reference images in inputs/ before running.
+#
+# PFB (Principal Feature Blending):
+#   Applied at double-stream block 1 (peak style/texture/object sensitivity).
+#   pfb_steps_frac=(0.0, 0.25) — first 25% of denoising steps only.
+#   Applying at all steps over-injects style features → noisy output.
+#   pfb_alpha=1.0: exponential SVD reweighting, keeps top principal directions.
+#   Lower alpha (e.g. 0.5) retains more style detail; raise for coarser transfer.
+#
+# SAC (Structural Attention Correction):
+#   Copies image-token Q, K from source branch to edit branch at block 1.
+#   Prevents PFB from distorting spatial layout and object structure.
+#
+# Style extraction: style image encoded as near-clean latent (t=0.1, 10% noise)
+#   then one forward pass captures block 1 hidden states.  Low noise ensures
+#   style features reflect the reference image content, not noise artifacts.
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 

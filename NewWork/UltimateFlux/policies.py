@@ -2049,9 +2049,12 @@ def _extract_style_hidden_states(
             .reshape(B, (H // 2) * (W // 2), C * 4)
         )
 
-        # Add noise at t=0.5 (mid-trajectory for flow matching)
+        # Add minimal noise (t=0.1) — style features should come from a near-clean
+        # representation.  t=0.5 (old value) obscures style information with noise.
+        # SVD-Style (Infinity) uses a clean image encoder; 10% noise is the closest
+        # analogy in a flow-matching denoiser.
         noise = torch.randn_like(latents)
-        latents_noisy = 0.5 * latents + 0.5 * noise
+        latents_noisy = 0.9 * latents + 0.1 * noise
 
         # ── Encode empty prompt ──────────────────────────────────────────────
         enc_result = pipe.encode_prompt(
@@ -2089,10 +2092,9 @@ def _extract_style_hidden_states(
 
         handle = pipe.transformer.transformer_blocks[_PIVOTAL_LAYER].register_forward_hook(_hook)
 
-        # Use t=500 (mid-trajectory) directly — avoids scheduler.set_timesteps(mu=...)
-        # requirement introduced in newer diffusers for dev's dynamic timestep shifting.
-        # The transformer receives timestep / 1000 = 0.5, matching latents_noisy (50/50 mix).
-        t = torch.tensor([500.0], device=exec_device, dtype=latents.dtype)
+        # t=100 → timestep/1000 = 0.1, matching latents_noisy (90% clean, 10% noise).
+        # Avoids scheduler.set_timesteps(mu=...) requirement from newer diffusers.
+        t = torch.tensor([100.0], device=exec_device, dtype=latents.dtype)
 
         try:
             _ = pipe.transformer(
