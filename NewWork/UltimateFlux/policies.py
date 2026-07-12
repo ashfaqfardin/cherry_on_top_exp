@@ -2354,37 +2354,39 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         self._style_kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._txt_len_single   = 512
         # Set by pre_generate when content_image is provided:
-        self._initial_latent:      Optional[torch.Tensor] = None
-        self._override_timesteps:  Optional[torch.Tensor] = None
-        self._override_sigmas:     Optional[list]         = None
-        self._actual_num_steps:    int = 28
+        self._initial_latent:       Optional[torch.Tensor] = None
+        self._style_initial_latent: Optional[torch.Tensor] = None  # three-branch mode
+        self._three_branch:         bool = False
+        self._override_timesteps:   Optional[torch.Tensor] = None
+        self._override_sigmas:      Optional[list]         = None
+        self._actual_num_steps:     int = 28
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
                      num_steps=28, max_sequence_length=512, **kwargs):
-        self._txt_len_single   = max_sequence_length
-        self._actual_num_steps = num_steps
-        self._initial_latent   = None
-        self._override_timesteps = None
+        self._txt_len_single        = max_sequence_length
+        self._actual_num_steps      = num_steps
+        self._initial_latent        = None
+        self._style_initial_latent  = None
+        self._three_branch          = False
+        self._override_timesteps    = None
+        self._override_sigmas       = None
 
-        # ── Step 1: Extract style K,V ─────────────────────────────────────
-        img = self.style_image
-        if img is not None:
-            print("[StyleID] Extracting style K,V from reference image…")
-            self._style_kvs = _extract_style_kvs(
-                pipe, img, _TIER_A_STYLE,
-                device=device, height=height, width=width,
-            )
-
-        # ── Step 2: Encode content image → noisy starting latent ──────────
         if self.content_image is not None:
-            print("[StyleID] Encoding content image for identity-preserving transfer…")
-            # Encode + nudge (StableFlow ×1.15 corrects FLUX inversion magnitude drift)
-            z_0 = self.encode_real_image(
+            # ── Three-branch mode (StyleAligned) ─────────────────────────────
+            # Source and style images are both encoded to the same noise level
+            # and denoised in parallel alongside the edit branch.  This means
+            # V_style at each attention step is at the CORRECT noise level —
+            # eliminating the timestep mismatch that caused blurry outputs when
+            # a single pre-extracted style pass was reused across all steps.
+            #
+            # Branch layout:  0=source   1=style   2=edit
+            # inject_qkv:     edit gets K from source (identity lock)
+            #                 edit gets V from style  (live style features)
+            print("[StyleID] Three-branch (StyleAligned) setup…")
+            z_src = self.encode_real_image(
                 pipe, self.content_image, height, width, device, nudge=True
             )
-            # Get FLUX timestep schedule (mu-shifted for resolution).
-            # FlowMatchEulerDiscreteScheduler requires mu when use_dynamic_shifting=True.
-            # mu = linear interpolation of shift based on image sequence length.
+            # FLUX mu-shifted timestep schedule
             _img_seq_len = (height // 16) * (width // 16)
             _base_seq    = getattr(pipe.scheduler.config, "base_image_seq_len", 256)
             _max_seq     = getattr(pipe.scheduler.config, "max_image_seq_len",  4096)
@@ -2393,27 +2395,47 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             _m  = (_max_shift - _base_shift) / (_max_seq - _base_seq)
             _mu = _img_seq_len * _m + (_base_shift - _m * _base_seq)
             pipe.scheduler.set_timesteps(num_steps, device=device, mu=_mu)
-            all_ts  = pipe.scheduler.timesteps   # (num_steps,) descending, CPU
-            sigmas  = pipe.scheduler.sigmas.cpu().float()  # (num_steps+1,) descending
+            all_ts  = pipe.scheduler.timesteps
+            sigmas  = pipe.scheduler.sigmas.cpu().float()
 
-            # Find start index for content_strength noise level.
-            # sigmas are high→low; we want the first position where sigma ≤ cs.
-            cs = self.content_strength
-            start_idx = int((1.0 - cs) * len(all_ts))
-            start_idx = max(0, min(start_idx, len(all_ts) - 1))
+            cs          = self.content_strength
+            start_idx   = int((1.0 - cs) * len(all_ts))
+            start_idx   = max(0, min(start_idx, len(all_ts) - 1))
             sigma_start = sigmas[start_idx].item()
 
-            # z_T = (1 − σ)·z_src + σ·ε   (flow-matching interpolation)
-            seed = kwargs.get("seed", 0)
-            gen  = torch.Generator(device=z_0.device).manual_seed(seed)
-            eps  = torch.randn(z_0.shape, generator=gen,
-                               device=z_0.device, dtype=z_0.dtype)
-            self._initial_latent     = (1.0 - sigma_start) * z_0 + sigma_start * eps
-            self._override_timesteps = all_ts[start_idx:]           # kept for actual_num_steps
-            self._override_sigmas    = sigmas[start_idx:].tolist()   # passed as pipe(sigmas=...)
+            seed    = kwargs.get("seed", 0)
+            gen_src = torch.Generator(device=z_src.device).manual_seed(seed)
+            eps_src = torch.randn(z_src.shape, generator=gen_src,
+                                  device=z_src.device, dtype=z_src.dtype)
+            self._initial_latent = (1.0 - sigma_start) * z_src + sigma_start * eps_src
+
+            if self.style_image is not None:
+                z_sty   = self.encode_real_image(
+                    pipe, self.style_image, height, width, device, nudge=False
+                )
+                gen_sty = torch.Generator(device=z_sty.device).manual_seed(seed + 1)
+                eps_sty = torch.randn(z_sty.shape, generator=gen_sty,
+                                      device=z_sty.device, dtype=z_sty.dtype)
+                self._style_initial_latent = (1.0 - sigma_start) * z_sty + sigma_start * eps_sty
+                self._three_branch = True
+
+            self._override_timesteps = all_ts[start_idx:]
+            self._override_sigmas    = sigmas[start_idx:].tolist()
             self._actual_num_steps   = len(self._override_timesteps)
-            print(f"[StyleID] content_strength={cs:.2f}  sigma_start={sigma_start:.3f}  "
+            print(f"[StyleID] mode={'three-branch' if self._three_branch else 'two-branch'}  "
+                  f"content_strength={cs:.2f}  sigma_start={sigma_start:.3f}  "
                   f"active_steps={self._actual_num_steps}/{num_steps}")
+            # Three-branch uses live K/V — pre-extracted single-pass KVs not needed.
+            self._style_kvs = {}
+            return
+
+        # ── Two-branch (random noise start, pre-extracted style KVs) ─────────
+        if self.style_image is not None:
+            print("[StyleID] Extracting style K,V from reference image (two-branch)…")
+            self._style_kvs = _extract_style_kvs(
+                pipe, self.style_image, _TIER_A_STYLE,
+                device=device, height=height, width=width,
+            )
 
     @staticmethod
     def _q_adain(q_src: torch.Tensor, q_sty: torch.Tensor) -> torch.Tensor:
@@ -2436,13 +2458,12 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         """
-        Unified Attn(Q_src*, K_src, V_style) injection at ALL 13 TIER_A layers.
+        Attn(Q_edit, K_src, V_style) injection at ALL 13 TIER_A layers.
 
-          Q* — source Q, optionally AdaIN-normalised to style Q statistics:
-            source Q × source K = source-identical attention weights (no cross-
-            domain mismatch) → structural layout and identity fully preserved.
-            Q-AdaIN further transfers style colour distribution through Q.
-            (FreeControl arXiv:2511.05219, HAM arXiv:2603.24043)
+          Q from edit branch (unchanged):
+            Coherent with the current denoising state at every step.
+            Q-AdaIN was removed — it normalised Q stats to style stats, but
+            at high noise levels this distorted attention maps and produced blur.
 
           K from source branch (index 0):
             Edit attends to exactly the same spatial regions as the unmodified
@@ -2452,49 +2473,47 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             Attention output carries colour, texture, brushstrokes from the
             reference image at every TIER_A layer.
 
-        Why this works vs previous failed Q preservation:
-          Prior attempt: Attn(Q_src, K_style, V_style) — Q×K cross-domain
-          mismatch (Q from source space, K from style space) → blurred attention.
-          Current: Q_src × K_src (same branch, same step) → no mismatch.
-
         Text-token positions never modified.
         Double-stream (txt_len > 0): image tokens at [txt_len:]
         Single-stream (txt_len = 0): image tokens at [_txt_len_single:]
         """
-        if layer not in self._style_kvs:
-            return q, k, v
-        if k.shape[0] < 2:
+        if layer not in _TIER_A_STYLE:
             return q, k, v
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
-        q_sty, _, v_sty = self._style_kvs[layer]
+        n_branches = k.shape[0]
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
 
-        # Layer-stratified V blend weight (Scheduled Style Injection):
-        # Identity layers {0,7,8,9,10} carry the largest structural signal, so
-        # use 60 % of style_strength there to avoid overwriting pose/shape.
-        # Texture/appearance layers {18,25,28,37,42,45,50,56} are safe for full
-        # style_strength because spatial layout is already committed by that depth.
+        # Layer-stratified V blend weight:
+        # Identity layers {0,7,8,9,10}: 60 % of style_strength (preserve structure)
+        # Texture layers {18,25,28,37,42,45,50,56}: full style_strength
         layer_scale = 0.6 if layer in _TIER_A_IDENTITY else 1.0
         sw = self.style_strength * layer_scale
 
-        q  = q.clone()
-        k  = k.clone()
-        v  = v.clone()
-        vs = v_sty.to(v.device, dtype=v.dtype)
-        qs = q_sty.to(q.device, dtype=q.dtype)
+        if n_branches == 3:
+            # ── Three-branch (StyleAligned) ───────────────────────────────────
+            # Branches: 0=source, 1=style, 2=edit
+            # Source and style denoise freely; only edit branch is modified.
+            # V_style is taken from the LIVE style branch at the current step,
+            # so it always matches the denoising noise level — no timestep mismatch.
+            k = k.clone()
+            v = v.clone()
+            k[2:3, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
+            v_live_sty = v[1:2, :, img_offset:, :].detach().clone()
+            v[2:3, :, img_offset:, :] = (1.0 - sw) * v[2:3, :, img_offset:, :] + sw * v_live_sty
+            return q, k, v
 
-        # Q* from source (with Q-AdaIN colour injection): structural layout lock
-        # + style colour distribution transferred through Q statistics.
-        q_src_img = q[0:1, :, img_offset:, :].detach().clone()
-        q[1:2, :, img_offset:, :] = self._q_adain(q_src_img, qs)
-
-        # K from source: spatial routing locked to source denoising path
-        k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
-
-        # V from style: colour, texture, brushstrokes from reference image
-        v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
+        elif n_branches == 2 and layer in self._style_kvs:
+            # ── Two-branch (pre-extracted style KVs, fallback) ────────────────
+            # Used when no content image is provided (random noise start).
+            _, _, v_sty = self._style_kvs[layer]
+            k = k.clone()
+            v = v.clone()
+            vs = v_sty.to(v.device, dtype=v.dtype)
+            k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
+            v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
+            return q, k, v
 
         return q, k, v
 

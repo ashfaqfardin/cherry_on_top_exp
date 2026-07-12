@@ -18,11 +18,13 @@
 #
 # ── Injection formula at ALL 13 TIER_A layers ────────────────────────────────────
 #
-#   Attn( AdaIN(Q_src, Q_sty) , K_src , V_style )
+#   Attn( Q_edit , K_src , V_style )
 #
-#   Q*     = source Q, AdaIN-normalised to style Q statistics  → identity + colour
+#   Q_edit = edit branch Q (unchanged)                         → coherent with denoising
 #   K_src  = source branch K                                   → spatial routing locked
 #   V_sty  = style reference V (captured at t=0.3)             → colour/texture/strokes
+#
+#   Q-AdaIN removed: it distorted Q stats at high noise → blurry outputs.
 #
 # ── Injection improvements ───────────────────────────────────────────────────────
 #
@@ -38,7 +40,8 @@
 # ── Key parameters ──────────────────────────────────────────────────────────────
 #   --style_image              reference image whose style to transfer
 #   --style_strength           V_style blend weight (1.0 = full style, default)
-#   --content_strength         0.6 default (strong identity); raise to 0.8 for more style
+#   --content_strength         0.6 two-stage default; 0.85 when --content_image given
+#                              lower = stronger identity, higher = more style freedom
 #   --color_transfer_strength  LAB post-processing strength (0.6 default; 0.0 = off)
 #
 # Sources: StyleID arXiv:2312.09008, HAM arXiv:2603.24043, FreeFlux (TIER_A)

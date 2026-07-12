@@ -516,9 +516,10 @@ def parse_args():
                    help="Style task: source image whose identity to preserve. "
                         "When provided, both branches start from this image's noisy latent "
                         "(img2img mode) instead of random noise.")
-    p.add_argument("--content_strength", type=float, default=0.85,
-                   help="Style task (with --content_image): noise fraction added to source "
-                        "latent in (0,1). 0.85=strong style, 0.6=strong identity. Default 0.85.")
+    p.add_argument("--content_strength", type=float, default=None,
+                   help="Style task: noise fraction added to source latent (0,1). "
+                        "Two-stage default 0.6 (strong identity). Explicit --content_image default 0.85. "
+                        "Lower = stronger identity; higher = more style freedom.")
     p.add_argument("--q_preservation", type=float, default=1.0,
                    help="Deprecated, ignored.")
     p.add_argument("--delta_scale", type=float, default=2.0,

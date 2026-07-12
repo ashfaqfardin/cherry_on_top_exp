@@ -320,20 +320,29 @@ def generate_dual_branch(
     override_timesteps = getattr(policy, '_override_timesteps', None)
     actual_num_steps   = getattr(policy, '_actual_num_steps',   num_steps)
 
+    # Detect three-branch (StyleAligned) mode: policy has both a source latent
+    # (_initial_latent) and a parallel style latent (_style_initial_latent).
+    # Layout: branch 0 = source (identity anchor), 1 = style (live K/V donor),
+    #         2 = edit (receives K_src + V_style blended by inject_qkv).
+    override_style_latent = getattr(policy, '_style_initial_latent', None)
+    three_branch = override_latent is not None and override_style_latent is not None
+
     if override_latent is not None:
-        # Image-anchored: both branches start from the source image's noisy latent.
-        # Source branch denoises → reconstructs source (its K tracks real source structure).
-        # Edit branch denoises with style injection → styled reconstruction of source.
-        #
         # encode_real_image returns PACKED latents [1, seq, C_packed] (3D).
-        # Expand batch dim 1→2 with exactly 3 dims.  Using expand(2, -1, -1, -1)
-        # (4 dims) on a 3D tensor silently prepends a phantom dim, yielding
-        # [2, 1, seq, C] which the FluxPipeline mis-reads as spatial [B, C, H, W]
-        # and re-packs incorrectly, doubling the image token count and crashing RoPE.
-        shared_latents = (
-            override_latent.to(exec_device, dtype=torch.bfloat16)
-            .expand(2, -1, -1).clone()   # [1, seq, C] → [2, seq, C]
-        )
+        # Expand batch dim with exactly 3 dims — using 4 dims on a 3D tensor
+        # silently prepends a phantom dim and makes FluxPipeline re-pack wrongly.
+        src = override_latent.to(exec_device, dtype=torch.bfloat16)
+        if three_branch:
+            # [src, sty, edit_start=src_copy] → shape [3, seq, C]
+            sty = override_style_latent.to(exec_device, dtype=torch.bfloat16)
+            shared_latents = torch.cat(
+                [src.expand(1, -1, -1).clone(),
+                 sty.expand(1, -1, -1).clone(),
+                 src.expand(1, -1, -1).clone()],
+                dim=0,
+            )
+        else:
+            shared_latents = src.expand(2, -1, -1).clone()   # [1, seq, C] → [2, seq, C]
     else:
         _g   = torch.Generator(device=exec_device).manual_seed(seed)
         _one = randn_tensor(
@@ -407,9 +416,15 @@ def generate_dual_branch(
     else:
         pipe_ts_kwargs["num_inference_steps"] = num_steps
 
+    prompts = (
+        [source_prompt, source_prompt, edit_prompt]
+        if three_branch
+        else [source_prompt, edit_prompt]
+    )
+
     try:
         result = pipe(
-            prompt=[source_prompt, edit_prompt],
+            prompt=prompts,
             latents=shared_latents,
             guidance_scale=guidance_scale,
             height=height,
@@ -425,7 +440,10 @@ def generate_dual_branch(
             h.remove()
 
     src_img  = result.images[0]
-    edit_img = policy.post_process(src_img, result.images[1])
+    # In three-branch mode images[1] is the style branch output (discard it);
+    # the styled edit is images[2].
+    edit_raw = result.images[2] if three_branch else result.images[1]
+    edit_img = policy.post_process(src_img, edit_raw)
 
     if save_intermediates and intermediate_out_dir:
         if captured:
