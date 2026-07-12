@@ -9,22 +9,23 @@
 #      at t=0.5 (50/50 noise-clean mix, empty prompt) captures K,V at
 #      all 13 TIER_A (content-similarity) attention layers.
 #
-#   2. GENERATION: at every TIER_A layer and every denoising step, the
-#      edit branch's image-token K,V are replaced with the captured style
-#      K,V.  Content Q (from the text prompt) determines WHAT is generated;
-#      style K,V shape HOW it looks (texture, colour palette, brush strokes).
+#   2. GENERATION: layer-stratified injection at every denoising step:
+#
+#      Identity layers {0,7,8,9,10} — V-only:
+#        Attn(Q_edit, K_edit, V_style)
+#        Content Q×K pattern intact → character shape/pose preserved.
+#        Style V reshapes appearance (colour, texture, brush strokes).
+#
+#      Texture layers {18,25,28,37,42,45,50,56} — K+V:
+#        Attn(Q_edit, K_style, V_style)
+#        Strong style in detail-refining layers; structure already committed.
 #
 # TIER_A safety: FreeFlux identifies these 13 layers as content-similarity-
 #   dependent (low RoPE frequency) — K injection here never causes spatial
 #   locking.  Non-TIER_A layers (high RoPE) are left entirely free.
 #
-# --style_strength 1.0  — full K,V replacement (maximum style).
-#   Reduce to 0.7–0.8 if style is too strong and content structure is lost.
-#
-# --q_preservation 1.0  — copy source branch Q to edit branch at TIER_A layers.
-#   Full StyleID formula: Attn(Q_content, K_style, V_style).
-#   Content Q locks character shape/anatomy/pose; style K,V set visual appearance.
-#   Reduce toward 0.0 if character looks too rigid or identical to the plain prompt.
+# --style_strength 1.0  — K,V blend weight (0.0=no injection, 1.0=full style).
+#   Reduce to 0.7–0.8 if character structure is still distorted.
 #
 # Why the old SVD/PFB approach was replaced:
 #   PFB modified one block's hidden-state SVD at first 25% of steps.

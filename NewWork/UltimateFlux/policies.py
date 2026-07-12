@@ -1991,20 +1991,29 @@ class KontextColorPolicy(BasePolicy):
 
 # ─────────────────────────── Task 7: Style personalization ───────────────────
 #
-# Implements StyleID (CVPR 2024 Highlight, arXiv:2312.09008) adapted to FLUX.
+# Implements StyleID (CVPR 2024 Highlight, arXiv:2312.09008) adapted to FLUX,
+# with layer-stratified injection to balance identity preservation vs style strength.
 #
-# Mechanism: capture K,V from the style reference image at TIER_A layers via
-# one forward pass, then during generation replace the EDIT branch's image-token
-# K,V with the captured style K,V at every TIER_A layer and every denoising step.
+# TIER_A layers are split into two groups (both are content-similarity layers,
+# safe for K injection per FreeFlux):
 #
-# Content Q (from text prompt + generation state) drives WHAT is generated;
-# style K,V redirect the attention output to shape HOW it looks.
+#   _TIER_A_IDENTITY = {0, 7, 8, 9, 10}  — early MM-DiT double-stream layers.
+#       Highest sensitivity for object identity / structure (StableFlow ablation).
+#       V-ONLY injection: Attn(Q_edit, K_edit, V_style).
+#       Content Q×K pattern unchanged → character shape/pose preserved.
+#       Style V still reshapes the output appearance (colour, texture).
 #
-# TIER_A safety (FreeFlux ICCV 2025): these 13 content-similarity layers have
-# low/no RoPE frequency — K injection here does NOT cause spatial locking.
-# Non-TIER_A layers (high RoPE) are left entirely free for content generation.
+#   _TIER_A_TEXTURE = {18, 25, 28, 37, 42, 45, 50, 56}  — last MM-DiT block
+#       and all single-stream layers where textural detail is refined.
+#       Lower identity sensitivity; structure already committed.
+#       K+V injection: Attn(Q_edit, K_style, V_style) → strong style appearance.
+#
+# No Q preservation: source Q × style K misaligns (different feature spaces)
+# → blurred attention onto style V → weaker style, no identity benefit.
 
-_TIER_A_STYLE = frozenset([0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56])
+_TIER_A_IDENTITY = frozenset([0, 7, 8, 9, 10])              # V-only
+_TIER_A_TEXTURE  = frozenset([18, 25, 28, 37, 42, 45, 50, 56])  # K+V
+_TIER_A_STYLE    = _TIER_A_IDENTITY | _TIER_A_TEXTURE         # all 13 TIER_A layers
 
 
 class _StyleKVCaptureProcessor:
@@ -2198,18 +2207,18 @@ class StylePersonalizationPolicy(BasePolicy):
     """
     Reference-image style transfer on FLUX.1-dev (StyleID mechanism).
 
-    StyleID (CVPR 2024, arXiv:2312.09008) adapted to FLUX joint attention:
+    StyleID (CVPR 2024, arXiv:2312.09008) adapted to FLUX joint attention with
+    layer-stratified injection:
 
     PRE-GENERATE — one forward pass on the style reference image at t=0.5
-      (empty prompt) captures K,V at all TIER_A attention layers.
+      (empty prompt) captures K,V at all 13 TIER_A attention layers.
 
-    GENERATION — at every TIER_A layer and every denoising step:
-      Q:   edit ← source  (q_preservation=1.0 copies content Q → preserves character)
-      K,V: edit ← style   (style_strength=1.0 fully replaces with style K,V)
-
-    Full StyleID formula: Attn(Q_content, K_style, V_style)
-      Content Q drives WHAT is generated (character shape, pose, anatomy).
-      Style K,V drive HOW it looks (texture, brush strokes, colour palette).
+    GENERATION — layer-stratified per TIER_A sub-group:
+      Identity layers {0,7,8,9,10} — V-only: Attn(Q_edit, K_edit, V_style)
+          Content Q×K pattern intact → character shape/pose preserved.
+          Style V reshapes appearance (colour, texture, brush strokes).
+      Texture layers {18,25,28,37,42,45,50,56} — K+V: Attn(Q_edit, K_style, V_style)
+          Strong style in detail-refining layers where structure is already committed.
 
     Parameters
     ----------
@@ -2217,11 +2226,6 @@ class StylePersonalizationPolicy(BasePolicy):
         Reference image whose style to transfer.
     style_strength : float
         K,V blend weight: 0.0 = no injection, 1.0 = full style K,V.
-        Reduce to 0.7–0.8 if character structure is lost.
-    q_preservation : float
-        Q blend weight from source (content) branch: 1.0 = fully use source Q
-        (maximum character fidelity), 0.0 = keep edit Q (no content lock).
-        Default 1.0.  Reduce toward 0 if character looks too stiff/unvaried.
     inject_steps_frac : (float, float)
         Step window for injection. Default (0.0, 1.0) = all steps.
     """
@@ -2230,16 +2234,15 @@ class StylePersonalizationPolicy(BasePolicy):
         self,
         style_image: Optional[Image.Image] = None,
         style_strength: float = 1.0,
-        q_preservation: float = 1.0,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
         # Legacy aliases — accepted for backward compat but not used.
+        q_preservation: float = 1.0,
         alpha: float = 1.0,
         sac_steps_frac: Tuple[float, float] = (0.0, 0.25),
         pfb_steps_frac: Tuple[float, float] = (0.0, 0.25),
     ):
         self.style_image       = style_image
         self.style_strength    = style_strength
-        self.q_preservation    = q_preservation
         self.inject_steps_frac = inject_steps_frac
         self._style_kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._txt_len_single   = 512
@@ -2257,14 +2260,17 @@ class StylePersonalizationPolicy(BasePolicy):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         """
-        StyleID full formula: Attn(Q_content, K_style, V_style).
+        Layer-stratified StyleID injection.
 
-        Q  — edit image tokens ← source branch Q  (character/structure lock)
-        K,V — edit image tokens ← style K,V        (style appearance)
+        Identity layers (0,7,8,9,10) — V-only:
+            Attn(Q_edit, K_edit, V_style)
+            Content Q×K pattern unchanged → character structure preserved.
 
-        Text-token positions are never modified — preserves text conditioning.
-        Source branch (index 0) is untouched for clean comparison output.
+        Texture layers (18,25,28,37,42,45,50,56) — K+V:
+            Attn(Q_edit, K_style, V_style)
+            Strong style in detail-refining layers; structure already committed.
 
+        Text-token positions never modified.  Source branch (index 0) untouched.
         Double-stream (txt_len > 0): image tokens at [txt_len:]
         Single-stream (txt_len = 0): image tokens at [_txt_len_single:]
         """
@@ -2278,26 +2284,17 @@ class StylePersonalizationPolicy(BasePolicy):
         k_sty, v_sty = self._style_kvs[layer]
         img_offset   = txt_len if txt_len > 0 else self._txt_len_single
         sw           = self.style_strength
-        qp           = self.q_preservation
 
         k = k.clone()
         v = v.clone()
         ks = k_sty.to(k.device, dtype=k.dtype)
         vs = v_sty.to(v.device, dtype=v.dtype)
 
-        # Style K,V injection (appearance)
-        k[1:2, :, img_offset:, :] = (1.0 - sw) * k[1:2, :, img_offset:, :] + sw * ks
+        if layer in _TIER_A_TEXTURE:
+            # K+V: strong style injection in texture-refining layers
+            k[1:2, :, img_offset:, :] = (1.0 - sw) * k[1:2, :, img_offset:, :] + sw * ks
+        # V always injected (both identity and texture layers)
         v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
-
-        # Q preservation: blend edit Q toward source Q for character fidelity.
-        # With qp=1.0 (default): edit Q ← source Q → Attn(Q_src, K_sty, V_sty).
-        # Content Q anchors character shape/pose; style K,V set appearance only.
-        if qp > 0.0:
-            q = q.clone()
-            q[1:2, :, img_offset:, :] = (
-                qp * q[0:1, :, img_offset:, :]
-                + (1.0 - qp) * q[1:2, :, img_offset:, :]
-            )
 
         return q, k, v
 
