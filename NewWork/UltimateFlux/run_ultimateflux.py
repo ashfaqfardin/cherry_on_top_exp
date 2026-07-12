@@ -199,8 +199,9 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     height             = cfg.get("height", 1024)
     width              = cfg.get("width",  1024)
     max_seq_len        = cfg.get("max_sequence_length", 512)
-    save_intermediates = cfg.get("save_intermediates", False)
-    intermediate_every = cfg.get("intermediate_every", 4)
+    explicit_intermediates = cfg.get("save_intermediates", False)
+    save_intermediates     = explicit_intermediates or save_images  # steps.png whenever saving
+    intermediate_every     = cfg.get("intermediate_every", 4)
     delta_scale        = cfg.get("delta_scale", 2.0)
     delta_start_step   = cfg.get("delta_start_step", None)
 
@@ -214,6 +215,9 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     print(f"\n[UltimateFlux] '{name}' | task={cfg.get('task','non_rigid')} | seed={seed}")
     print(f"  source_prompt: {source_prompt}")
     print(f"  edit_prompt:   {edit_prompt}")
+
+    # save_strips=True only for explicit --save_intermediates; steps.png always saved.
+    save_strips = explicit_intermediates
 
     # ColorCtrlPolicy (legacy) uses masked delta-flow.
     # All other policies (including KontextColorPolicy) use dual-branch attention injection.
@@ -236,6 +240,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             save_intermediates=save_intermediates,
             intermediate_out_dir=run_dir if save_intermediates else None,
             intermediate_every=intermediate_every,
+            save_strips=save_strips,
         )
     else:
         src_img, edit_img = generate_dual_branch(
@@ -253,6 +258,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
             save_intermediates=save_intermediates,
             intermediate_out_dir=run_dir if save_intermediates else None,
             intermediate_every=intermediate_every,
+            save_strips=save_strips,
         )
 
     if save_images:

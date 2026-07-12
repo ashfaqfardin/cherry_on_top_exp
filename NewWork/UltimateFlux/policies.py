@@ -2208,17 +2208,21 @@ class StylePersonalizationPolicy(BasePolicy):
     Reference-image style transfer on FLUX.1-dev (StyleID mechanism).
 
     StyleID (CVPR 2024, arXiv:2312.09008) adapted to FLUX joint attention with
-    layer-stratified injection:
+    layer-stratified injection and scheduled start:
 
     PRE-GENERATE — one forward pass on the style reference image at t=0.5
       (empty prompt) captures K,V at all 13 TIER_A attention layers.
 
-    GENERATION — layer-stratified per TIER_A sub-group:
-      Identity layers {0,7,8,9,10} — V-only: Attn(Q_edit, K_edit, V_style)
-          Content Q×K pattern intact → character shape/pose preserved.
-          Style V reshapes appearance (colour, texture, brush strokes).
-      Texture layers {18,25,28,37,42,45,50,56} — K+V: Attn(Q_edit, K_style, V_style)
-          Strong style in detail-refining layers where structure is already committed.
+    GENERATION — inject_steps_frac[0] (default 0.4) delays injection:
+      Early steps (0–40%): both branches generate freely → content/identity forms.
+      Late steps (40–100%): style injected → appearance shaped without overwriting structure.
+
+      Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
+          K copied from source branch (always clean). Anchors edit attention to
+          the same spatial regions as the unmodified generation.
+          Style V reshapes output appearance.
+      Texture layers {18,25,28,37,42,45,50,56} — Attn(Q_edit, K_style, V_style):
+          K+V from style — strong style in detail-refining layers.
 
     Parameters
     ----------
@@ -2227,14 +2231,15 @@ class StylePersonalizationPolicy(BasePolicy):
     style_strength : float
         K,V blend weight: 0.0 = no injection, 1.0 = full style K,V.
     inject_steps_frac : (float, float)
-        Step window for injection. Default (0.0, 1.0) = all steps.
+        Step window. Default (0.4, 1.0) — skip first 40% for content formation.
+        Use (0.0, 1.0) for maximum style strength at the cost of more identity drift.
     """
 
     def __init__(
         self,
         style_image: Optional[Image.Image] = None,
         style_strength: float = 1.0,
-        inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        inject_steps_frac: Tuple[float, float] = (0.4, 1.0),
         # Legacy aliases — accepted for backward compat but not used.
         q_preservation: float = 1.0,
         alpha: float = 1.0,
@@ -2260,17 +2265,24 @@ class StylePersonalizationPolicy(BasePolicy):
 
     def inject_qkv(self, q, k, v, layer, step, n_steps, txt_len=0):
         """
-        Layer-stratified StyleID injection.
+        Layer-stratified StyleID injection with scheduled start.
 
-        Identity layers (0,7,8,9,10) — V-only:
-            Attn(Q_edit, K_edit, V_style)
-            Content Q×K pattern unchanged → character structure preserved.
+        Scheduled: style injection starts at inject_steps_frac[0] (default 0.4).
+          Early steps (0–40%) form content structure without interference.
+          Late steps (40–100%) apply style during texture-refinement phase.
+          (Z-STAR+ arXiv:2411.19231; Scheduled Injection arXiv:2605.26538)
 
-        Texture layers (18,25,28,37,42,45,50,56) — K+V:
-            Attn(Q_edit, K_style, V_style)
-            Strong style in detail-refining layers; structure already committed.
+        Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
+          K copied from SOURCE branch (index 0) — always clean, never modified.
+          Source K anchors edit attention to the same spatial regions as the
+          unmodified generation → same cat/castle layout and identity.
+          Style V reshapes output appearance (colour, texture, brush strokes).
 
-        Text-token positions never modified.  Source branch (index 0) untouched.
+        Texture layers {18,25,28,37,42,45,50,56} — Attn(Q_edit, K_style, V_style):
+          K+V from style reference — strong style in detail-refining layers
+          where spatial structure is already committed by identity layers.
+
+        Text-token positions never modified.
         Double-stream (txt_len > 0): image tokens at [txt_len:]
         Single-stream (txt_len = 0): image tokens at [_txt_len_single:]
         """
@@ -2287,12 +2299,18 @@ class StylePersonalizationPolicy(BasePolicy):
 
         k = k.clone()
         v = v.clone()
-        ks = k_sty.to(k.device, dtype=k.dtype)
         vs = v_sty.to(v.device, dtype=v.dtype)
 
-        if layer in _TIER_A_TEXTURE:
-            # K+V: strong style injection in texture-refining layers
+        if layer in _TIER_A_IDENTITY:
+            # K_src injection: copy source branch K (clean, unmodified) to edit.
+            # Forces edit to attend to same spatial regions as source generation,
+            # anchoring cat/castle identity despite style V in output.
+            k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
+        else:
+            # _TIER_A_TEXTURE: K+V from style for strong style signal
+            ks = k_sty.to(k.device, dtype=k.dtype)
             k[1:2, :, img_offset:, :] = (1.0 - sw) * k[1:2, :, img_offset:, :] + sw * ks
+
         # V always injected (both identity and texture layers)
         v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 

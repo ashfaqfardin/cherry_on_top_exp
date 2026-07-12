@@ -281,6 +281,7 @@ def generate_dual_branch(
     save_intermediates: bool = False,
     intermediate_out_dir: Optional[str] = None,
     intermediate_every: int = 4,
+    save_strips: bool = False,
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Dual-branch denoising with injections from policy.
@@ -394,7 +395,8 @@ def generate_dual_branch(
 
     if save_intermediates and intermediate_out_dir:
         if captured:
-            _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir)
+            _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir,
+                                     save_strips=save_strips)
         _save_color_mask(policy, intermediate_out_dir, height, width)
 
     return src_img, edit_img
@@ -492,14 +494,14 @@ def _save_intermediate_grids(
     width: int,
     out_dir: str,
     thumb_size: int = 256,
+    save_strips: bool = False,
 ) -> None:
     """
-    Decode captured latents at intermediate steps and write three images:
+    Decode captured latents at intermediate steps and write:
 
-    source_intermediate.png   — strip of source branch frames left→right
-    edit_intermediate.png     — strip of edit   branch frames left→right
-    compare_intermediate.png  — 2-row grid: top=source, bottom=edit
-                                with step number labels above each column
+    steps.png                 — 2-row grid: top=source, bottom=edit, columns=steps
+    source_intermediate.png   — strip of source branch frames  (only if save_strips)
+    edit_intermediate.png     — strip of edit   branch frames  (only if save_strips)
     """
     label_h = 22   # pixels reserved for step label above each thumbnail
     pad     = 4    # gap between the two rows in compare image
@@ -546,10 +548,13 @@ def _save_intermediate_grids(
     compare.paste(edit_strip, (0, strip_h + pad))
 
     os.makedirs(out_dir, exist_ok=True)
-    src_strip.save( os.path.join(out_dir, "source_intermediate.png"))
-    edit_strip.save(os.path.join(out_dir, "edit_intermediate.png"))
-    compare.save(   os.path.join(out_dir, "compare_intermediate.png"))
-    print(f"  Intermediates → {out_dir}/{{source,edit,compare}}_intermediate.png")
+    steps_path = os.path.join(out_dir, "steps.png")
+    compare.save(steps_path)
+    print(f"  Steps         → {steps_path}")
+    if save_strips:
+        src_strip.save( os.path.join(out_dir, "source_intermediate.png"))
+        edit_strip.save(os.path.join(out_dir, "edit_intermediate.png"))
+        print(f"  Intermediates → {out_dir}/{{source,edit}}_intermediate.png")
 
 
 def _save_color_mask(policy, out_dir: str, height: int, width: int) -> None:
@@ -798,6 +803,7 @@ def generate_masked_delta_flow(
     save_intermediates: bool = False,
     intermediate_out_dir: Optional[str] = None,
     intermediate_every: int = 4,
+    save_strips: bool = False,
 ) -> Tuple[Image.Image, Image.Image]:
     """
     Three-phase masked delta-flow colour editing.
@@ -1027,7 +1033,8 @@ def generate_masked_delta_flow(
 
     if save_intermediates and intermediate_out_dir:
         if captured:
-            _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir)
+            _save_intermediate_grids(pipe, captured, height, width, intermediate_out_dir,
+                                     save_strips=save_strips)
         _save_color_mask(policy, intermediate_out_dir, height, width)
 
     return src_img, edit_img

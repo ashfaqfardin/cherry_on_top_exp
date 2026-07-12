@@ -3,18 +3,24 @@
 # Transfers the visual style of a reference image to a text-prompted generation.
 # Place style reference images in inputs/ before running.
 #
-# Mechanism (StyleID, CVPR 2024 arXiv:2312.09008 adapted to FLUX):
+# Mechanism (StyleID CVPR 2024 arXiv:2312.09008 + Z-STAR+ arXiv:2411.19231
+#            + Scheduled Injection arXiv:2605.26538, adapted to FLUX):
 #
 #   1. PRE-GENERATE: one FLUX forward pass on the style reference image
 #      at t=0.5 (50/50 noise-clean mix, empty prompt) captures K,V at
 #      all 13 TIER_A (content-similarity) attention layers.
 #
-#   2. GENERATION: layer-stratified injection at every denoising step:
+#   2. GENERATION: scheduled + layer-stratified injection:
 #
-#      Identity layers {0,7,8,9,10} — V-only:
-#        Attn(Q_edit, K_edit, V_style)
-#        Content Q×K pattern intact → character shape/pose preserved.
+#      Steps 0–40%: no injection — early denoising forms content identity freely.
+#      Steps 40–100%: style injected — texture/detail phase only.
+#        (Scheduled injection arXiv:2605.26538)
+#
+#      Identity layers {0,7,8,9,10} — Attn(Q_edit, K_src, V_style):
+#        K copied from SOURCE branch (clean, unmodified) → anchors edit to
+#        same spatial regions as unmodified generation → preserves identity.
 #        Style V reshapes appearance (colour, texture, brush strokes).
+#        (Z-STAR+ arXiv:2411.19231)
 #
 #      Texture layers {18,25,28,37,42,45,50,56} — K+V:
 #        Attn(Q_edit, K_style, V_style)
@@ -26,6 +32,8 @@
 #
 # --style_strength 1.0  — K,V blend weight (0.0=no injection, 1.0=full style).
 #   Reduce to 0.7–0.8 if character structure is still distorted.
+#   Increase inject_steps_frac start toward 0.0 for stronger style at cost
+#   of more identity drift (e.g. --inject_steps_frac "[0.2, 1.0]").
 #
 # Why the old SVD/PFB approach was replaced:
 #   PFB modified one block's hidden-state SVD at first 25% of steps.
