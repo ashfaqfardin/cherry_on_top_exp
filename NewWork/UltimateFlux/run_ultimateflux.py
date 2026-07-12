@@ -173,7 +173,7 @@ def build_policy(cfg: dict):
         content_img = None
         if cfg.get("style_image"):
             style_img = Image.open(cfg["style_image"]).convert("RGB")
-        if cfg.get("content_image"):
+        if cfg.get("content_image") and os.path.isfile(cfg["content_image"]):
             content_img = Image.open(cfg["content_image"]).convert("RGB")
         return StylePersonalizationPolicy(
             style_image      = style_img,

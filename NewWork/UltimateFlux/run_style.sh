@@ -51,10 +51,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name cat_watercolor \
     --prompt "A cat, watercolor painting" \
-    --content_image inputs/cat.png \
-    --style_image   inputs/watercolor_ref.png \
-    --content_strength 0.85 \
-    --style_strength   1.0 \
+    --style_image inputs/watercolor_ref.png \
+    --style_strength 1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -64,10 +62,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name flower_watercolor \
     --prompt "A flower, watercolor painting" \
-    --content_image inputs/flower.png \
-    --style_image   inputs/watercolor_ref.png \
-    --content_strength 0.85 \
-    --style_strength   1.0 \
+    --style_image inputs/watercolor_ref.png \
+    --style_strength 1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -77,10 +73,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name castle_oilpainting \
     --prompt "A castle, oil painting" \
-    --content_image inputs/castle.png \
-    --style_image   inputs/oilpainting_ref.jpg \
-    --content_strength 0.85 \
-    --style_strength   1.0 \
+    --style_image inputs/oilpainting_ref.jpg \
+    --style_strength 1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -90,10 +84,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name robot_3d \
     --prompt "A robot, 3D render" \
-    --content_image inputs/robot.png \
-    --style_image   inputs/cartoon3d_ref.png \
-    --content_strength 0.85 \
-    --style_strength   1.0 \
+    --style_image inputs/cartoon3d_ref.png \
+    --style_strength 1.0 \
     --seed 42
 
 python NewWork/UltimateFlux/run_ultimateflux.py \
@@ -103,10 +95,8 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --task style \
     --name cat_crayon \
     --prompt "A cat, kid crayon drawing" \
-    --content_image inputs/cat.png \
-    --style_image   inputs/drawing_ref.png \
-    --content_strength 0.85 \
-    --style_strength   1.0 \
+    --style_image inputs/drawing_ref.png \
+    --style_strength 1.0 \
     --seed 42
 
 echo "=== Style transfer complete. Results in results/ultimateflux/ ==="
