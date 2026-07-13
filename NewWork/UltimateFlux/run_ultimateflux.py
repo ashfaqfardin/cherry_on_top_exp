@@ -182,7 +182,7 @@ def build_policy(cfg: dict):
             style_image             = style_img,
             content_image           = content_img,
             style_strength          = cfg.get("style_strength",          1.0),
-            content_strength        = cfg.get("content_strength",        _default_cs),
+            content_strength        = cfg.get("content_strength") or _default_cs,
             inject_steps_frac       = tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
             color_transfer_strength = cfg.get("color_transfer_strength", 0.6),
         )
@@ -255,7 +255,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
         _stage1_source = _r1.images[0]
         policy.content_image = _stage1_source
 
-        cs = cfg.get("content_strength", policy.content_strength)
+        cs = cfg.get("content_strength") or policy.content_strength
         cs_str = f"{cs:.2f}" if cs is not None else "auto"
         print(f"  [StyleID] Stage 2/2 — style transfer from encoded source "
               f"(content_strength={cs_str})…")
