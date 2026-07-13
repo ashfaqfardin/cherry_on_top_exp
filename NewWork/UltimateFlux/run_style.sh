@@ -55,7 +55,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task style \
     --name cat_watercolor \
-    --prompt "A cat" \
+    --prompt "A cat, watercolor painting" \
     --style_image inputs/watercolor_ref.png \
     --style_description "watercolor painting" \
     --style_strength 1.0 \
@@ -67,7 +67,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task style \
     --name flower_watercolor \
-    --prompt "A flower" \
+    --prompt "A flower, watercolor painting" \
     --style_image inputs/watercolor_ref.png \
     --style_description "watercolor painting" \
     --style_strength 1.0 \
@@ -79,7 +79,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task style \
     --name castle_oilpainting \
-    --prompt "A castle" \
+    --prompt "A castle, oil painting" \
     --style_image inputs/oilpainting_ref.jpg \
     --style_description "oil painting" \
     --style_strength 1.0 \
@@ -91,7 +91,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task style \
     --name robot_3d \
-    --prompt "A robot" \
+    --prompt "A robot, 3D cartoon" \
     --style_image inputs/cartoon3d_ref.png \
     --style_description "3D cartoon rendering" \
     --style_strength 1.0 \
@@ -103,7 +103,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --num_steps "$STEPS" --guidance_scale "$CFG" --height "$H" --width "$W" \
     --task style \
     --name cat_crayon \
-    --prompt "A cat" \
+    --prompt "A cat, crayon drawing" \
     --style_image inputs/drawing_ref.png \
     --style_description "crayon drawing" \
     --style_strength 1.0 \
