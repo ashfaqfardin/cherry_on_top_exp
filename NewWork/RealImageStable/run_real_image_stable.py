@@ -113,7 +113,7 @@ def parse_args():
     p.add_argument("--height",      type=int,   default=1024)
     p.add_argument("--width",       type=int,   default=1024)
     p.add_argument("--model_path",  default="black-forest-labs/FLUX.1-schnell")
-    p.add_argument("--hf_token",    default=None)
+    p.add_argument("--hf_token",    required=True)
     p.add_argument("--device",      default="cuda")
     p.add_argument("--cache_dir",   default="./models")
     p.add_argument("--out_dir",     default="results/realimageStable")
