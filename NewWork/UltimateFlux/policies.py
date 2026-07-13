@@ -2415,11 +2415,16 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             sigma_start = sigmas[start_idx].item()
 
         # ── Step 2: Extract style K,V at sigma_start noise level ─────────
+        # Inject only at TEXTURE layers {18,25,28,37,42,45,50,56}.
+        # Identity layers {0,7,8,9,10} are where the coarse object form (the cat)
+        # is built. Injecting style V there destroys the subject's structure before
+        # it forms. At texture layers the structure is already committed, so style V
+        # replaces rendering style without breaking form.
         img = self.style_image
         if img is not None:
             print(f"[StyleID] Extracting style K,V at noise level t={sigma_start:.2f}…")
             self._style_kvs = _extract_style_kvs(
-                pipe, img, _TIER_A_STYLE,
+                pipe, img, _TIER_A_TEXTURE,
                 device=device, height=height, width=width,
                 noise_level=sigma_start,
                 style_description=self.style_description,
@@ -2496,33 +2501,26 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
-        q_sty, _, v_sty, style_w = self._style_kvs[layer]
+        _, _, v_sty, style_w = self._style_kvs[layer]
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
         sw         = self.style_strength
 
-        q  = q.clone()
         k  = k.clone()
         v  = v.clone()
         vs = v_sty.to(v.device, dtype=v.dtype)
-        qs = q_sty.to(q.device, dtype=q.dtype)
 
-        # Style-attention reweighting: amplify patches that correspond to the
-        # style description ("oil painting" → brushstroke patches) and suppress
-        # patches that correspond to the content object in the reference image.
-        # style_w is mean-normalised to 1.0 so average injection energy is preserved.
+        # Style-attention reweighting: amplify patches aligned with the style
+        # description (brushstrokes, texture) and suppress content-object patches.
         if style_w is not None:
             vs = vs * style_w.to(v.device, dtype=v.dtype)
 
-        # Q* from source (with Q-AdaIN colour injection): structural layout lock
-        # + style colour distribution transferred through Q statistics.
-        q_src_img = q[0:1, :, img_offset:, :].detach().clone()
-        q[1:2, :, img_offset:, :] = self._q_adain(q_src_img, qs)
-
-        # K from source: spatial routing locked to source denoising path
+        # K from source: locks spatial routing to the source denoising path so
+        # both branches attend to the same spatial positions.
         k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
 
-        # V from style (reweighted): texture/stroke patches at full strength,
-        # content-object patches suppressed
+        # V from style reference: carries colour, texture, brushstrokes.
+        # Q is left untouched — the edit branch's own Q keeps driving content
+        # formation ("A cat") through the text prompt without interference.
         v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 
         return q, k, v
