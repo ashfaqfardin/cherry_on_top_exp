@@ -2571,9 +2571,4 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
     def get_block_hooks(self) -> Dict[int, Callable]:
         return {}
 
-    def post_process(self, src_img: Image.Image, edit_img: Image.Image) -> Image.Image:
-        cts = getattr(self, 'color_transfer_strength', 0.6)
-        if cts <= 0.0 or self.style_image is None:
-            return edit_img
-        return _lab_histogram_match(edit_img, self.style_image, blend_strength=cts)
 
