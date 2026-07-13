@@ -2396,7 +2396,11 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         # V_sty must be captured at the same noise level as the starting latent.
         # Capturing at t=0.3 (70% clean) while denoising starts at sigma=0.6
         # causes a feature mismatch — the model ignores mismatched V features.
-        sigma_start = 0.3   # fallback if no content image (pure T2I mode)
+        # T2I mode: extraction sigma.  Denoising runs from sigma≈1.0→0.0 over 28 steps;
+        # sigma≈0.3 corresponds to roughly the 70-80% mark of the schedule.
+        # Injection is gated to the second half of steps (inject_steps_frac) so
+        # it only fires when sigma is close to 0.3 and the feature spaces match.
+        sigma_start = 0.3
         _img_seq_len = (height // 16) * (width // 16)
         _mu = calculate_shift(
             _img_seq_len,

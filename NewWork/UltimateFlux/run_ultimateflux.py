@@ -185,12 +185,25 @@ def build_policy(cfg: dict):
         # content_strength default: 0.6 when auto-generating source (strong identity),
         # 0.85 when user supplies their own content_image (more style freedom).
         _default_cs = 0.6 if not cfg.get("content_image") else 0.85
+        # T2I (no content_image): style V is extracted at sigma≈0.3, which corresponds
+        # to roughly the 70-80 % mark of FLUX's shifted schedule for 28 steps at 1024px.
+        # Injecting in ALL steps means we inject V from sigma=0.3 into steps where the
+        # model is at sigma=1.0, 0.9, … — the feature spaces are incompatible there.
+        # Limit to the second half of steps where sigma is close to 0.3.
+        # content_image mode: sigma is already matched (denoising starts from sigma_start),
+        # so inject from step 0.
+        if cfg.get("inject_steps_frac"):
+            _inject_frac = tuple(cfg["inject_steps_frac"])
+        elif cfg.get("content_image"):
+            _inject_frac = (0.0, 1.0)
+        else:
+            _inject_frac = (0.5, 1.0)
         return StylePersonalizationPolicy(
             style_image             = style_img,
             content_image           = content_img,
             style_strength          = cfg.get("style_strength",          1.0),
             content_strength        = cfg.get("content_strength") or _default_cs,
-            inject_steps_frac       = tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
+            inject_steps_frac       = _inject_frac,
             color_transfer_strength = cfg.get("color_transfer_strength", 0.6),
             style_description       = cfg.get("style_description",       ""),
         )
