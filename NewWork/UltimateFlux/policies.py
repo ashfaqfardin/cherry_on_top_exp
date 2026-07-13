@@ -119,6 +119,46 @@ def _lab_color_transfer(
     return Image.fromarray(result)
 
 
+def _lab_histogram_match(
+    src_img: Image.Image,
+    ref_img: Image.Image,
+    blend_strength: float = 0.8,
+) -> Image.Image:
+    """
+    Transfer the LAB color distribution from ref_img onto src_img via per-channel
+    histogram (CDF) matching.  Only the distribution is transferred — no spatial
+    pixel values from the reference bleed into the output.  Works correctly even
+    when src and ref are completely unrelated images (style transfer case).
+    """
+    src = np.array(src_img.convert("RGB")).astype(np.float32) / 255.0
+    if ref_img.size != src_img.size:
+        ref_img = ref_img.resize(src_img.size, Image.LANCZOS)
+    ref = np.array(ref_img.convert("RGB")).astype(np.float32) / 255.0
+
+    src_lab = _rgb_to_lab(src)
+    ref_lab = _rgb_to_lab(ref)
+
+    result_lab = src_lab.copy()
+    for ch in range(3):
+        s = src_lab[:, :, ch].flatten()
+        r = ref_lab[:, :, ch].flatten()
+        n = len(s)
+
+        # rank of each source pixel within the source channel
+        sort_idx = np.argsort(s)
+        rank = np.empty(n, dtype=np.int64)
+        rank[sort_idx] = np.arange(n)
+
+        # map to the corresponding percentile in the reference channel
+        r_sorted = np.sort(r)
+        matched = r_sorted[np.clip(rank, 0, n - 1)].reshape(src_lab.shape[:2])
+
+        result_lab[:, :, ch] = (1.0 - blend_strength) * src_lab[:, :, ch] + blend_strength * matched
+
+    result = np.clip(_lab_to_rgb(result_lab) * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(result)
+
+
 # ─────────────────────────── Shared helpers ───────────────────────────────────
 
 def _image_mask_to_token_mask(
@@ -2536,5 +2576,5 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         cts = getattr(self, 'color_transfer_strength', 0.6)
         if cts <= 0.0 or self.style_image is None:
             return edit_img
-        return _lab_color_transfer(edit_img, self.style_image, blend_strength=cts)
+        return _lab_histogram_match(edit_img, self.style_image, blend_strength=cts)
 
