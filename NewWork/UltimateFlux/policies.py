@@ -2459,16 +2459,17 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             sigma_start = sigmas[start_idx].item()
 
         # ── Step 2: Extract style K,V at sigma_start noise level ─────────
-        # Inject only at TEXTURE layers {18,25,28,37,42,45,50,56}.
-        # Identity layers {0,7,8,9,10} are where the coarse object form (the cat)
-        # is built. Injecting style V there destroys the subject's structure before
-        # it forms. At texture layers the structure is already committed, so style V
-        # replaces rendering style without breaking form.
+        # Extract at ALL 13 TIER_A layers (identity + texture).
+        # Color sensitivity peaks at layer 0 and drops fast (sensitivity chart).
+        # Skipping identity layers meant the early color signal was never captured,
+        # making color transfer rely entirely on a post-process step.
+        # V blend is stratified in inject_qkv: identity layers get 0.3×sw (avoids
+        # overwriting object structure), texture layers get 1.0×sw (full style).
         img = self.style_image
         if img is not None:
             print(f"[StyleID] Extracting style K,V at noise level t={sigma_start:.2f}…")
             self._style_kvs = _extract_style_kvs(
-                pipe, img, _TIER_A_TEXTURE,
+                pipe, img, _TIER_A_STYLE,
                 device=device, height=height, width=width,
                 noise_level=sigma_start,
                 style_description=self.style_description,
@@ -2547,24 +2548,22 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
 
         _, _, v_sty, style_w = self._style_kvs[layer]
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
-        sw         = self.style_strength
+
+        # Layer-stratified V blend (sensitivity chart: color peaks at layer 0,
+        # drops sharply after layer 2; texture/stroke signal is stronger in late layers).
+        # Identity layers {0,7,8,9,10}: reduced strength to carry color without
+        # overwriting the coarse object form being built at those layers.
+        # Texture layers {18,25,28,37,42,45,50,56}: full strength for stroke/texture.
+        sw = self.style_strength * (0.3 if layer in _TIER_A_IDENTITY else 1.0)
 
         k  = k.clone()
         v  = v.clone()
         vs = v_sty.to(v.device, dtype=v.dtype)
 
-        # Style-attention reweighting: amplify patches aligned with the style
-        # description (brushstrokes, texture) and suppress content-object patches.
         if style_w is not None:
             vs = vs * style_w.to(v.device, dtype=v.dtype)
 
-        # K from source: locks spatial routing to the source denoising path so
-        # both branches attend to the same spatial positions.
         k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
-
-        # V from style reference: carries colour, texture, brushstrokes.
-        # Q is left untouched — the edit branch's own Q keeps driving content
-        # formation ("A cat") through the text prompt without interference.
         v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 
         return q, k, v
