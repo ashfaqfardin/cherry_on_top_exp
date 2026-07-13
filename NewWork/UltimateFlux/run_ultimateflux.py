@@ -192,6 +192,7 @@ def build_policy(cfg: dict):
             content_strength        = cfg.get("content_strength") or _default_cs,
             inject_steps_frac       = tuple(cfg["inject_steps_frac"]) if cfg.get("inject_steps_frac") else (0.0, 1.0),
             color_transfer_strength = cfg.get("color_transfer_strength", 0.6),
+            style_description       = cfg.get("style_description",       ""),
         )
 
     raise ValueError(
@@ -483,6 +484,10 @@ def parse_args():
                    help="Unused; kept for backward compat")
     p.add_argument("--style_strength", type=float, default=1.0,
                    help="Style task: K,V blend weight (0.0=no injection, 1.0=full style). Default 1.0.")
+    p.add_argument("--style_description", default="",
+                   help="Style task: text description of the style (e.g. 'oil painting'). "
+                        "Used for attention-based style-patch selection during extraction. "
+                        "Empty = extract all patches uniformly (previous behaviour).")
     p.add_argument("--color_transfer_strength", type=float, default=0.6,
                    help="Style task: LAB histogram matching strength applied as post-processing "
                         "(0.0=off, 1.0=full palette replacement). Default 0.6. "
@@ -597,6 +602,7 @@ def main():
         "pfb_step":             args.pfb_step,
         "pfb_alpha":            args.pfb_alpha,
         "style_strength":             args.style_strength,
+        "style_description":          args.style_description,
         "color_transfer_strength":    args.color_transfer_strength,
         "content_image":              args.content_image,
         "content_strength":           args.content_strength,

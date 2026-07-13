@@ -57,6 +57,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name cat_watercolor \
     --prompt "A cat" \
     --style_image inputs/watercolor_ref.png \
+    --style_description "watercolor painting" \
     --style_strength 1.0 \
     --seed 42
 
@@ -68,6 +69,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name flower_watercolor \
     --prompt "A flower" \
     --style_image inputs/watercolor_ref.png \
+    --style_description "watercolor painting" \
     --style_strength 1.0 \
     --seed 42
 
@@ -79,6 +81,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name castle_oilpainting \
     --prompt "A castle" \
     --style_image inputs/oilpainting_ref.jpg \
+    --style_description "oil painting" \
     --style_strength 1.0 \
     --seed 42
 
@@ -90,6 +93,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name robot_3d \
     --prompt "A robot" \
     --style_image inputs/cartoon3d_ref.png \
+    --style_description "3D cartoon rendering" \
     --style_strength 1.0 \
     --seed 42
 
@@ -101,6 +105,7 @@ python NewWork/UltimateFlux/run_ultimateflux.py \
     --name cat_crayon \
     --prompt "A cat" \
     --style_image inputs/drawing_ref.png \
+    --style_description "crayon drawing" \
     --style_strength 1.0 \
     --seed 42
 

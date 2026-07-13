@@ -2081,12 +2081,17 @@ class _StyleKVCaptureProcessor:
       img_offset = self.txt_len (stored from the empty-prompt length).
     """
 
-    def __init__(self, tier_a: frozenset, txt_len: int):
-        self.tier_a   = tier_a
-        self.txt_len  = txt_len   # text-token count (same for every block)
-        self._counter = 0
-        self.kvs:  Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        # kvs stores (q_img, k_img, v_img) for Q-AdaIN color transfer (HAM §3.1)
+    def __init__(self, tier_a: frozenset, txt_len: int,
+                 style_token_idx: Optional[List[int]] = None):
+        self.tier_a          = tier_a
+        self.txt_len         = txt_len   # text-token count (same for every block)
+        self.style_token_idx = style_token_idx or []
+        self._counter        = 0
+        self.kvs:  Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                   Optional[torch.Tensor]]] = {}
+        # kvs stores (q_img, k_img, v_img, style_w) where style_w is a per-image-token
+        # weight derived from text→image cross-attention for the style description tokens.
+        # style_w shape (n_img,), mean-normalised to 1.0; None if no style_description.
 
     def __call__(
         self,
@@ -2135,16 +2140,34 @@ class _StyleKVCaptureProcessor:
             k = apply_rotary_emb(k, image_rotary_emb)
 
         # Capture image-token Q,K,V (after RoPE) at TIER_A layers.
-        # Q is captured for Q-AdaIN colour transfer (HAM arXiv:2603.24043 §3.1):
-        #   normalise source Q statistics to match style Q statistics at inject time
-        #   → style colour distribution flows through Q channel in addition to V.
-        # Shape stored: (1, heads, img_seq_len, head_dim) in float32.
+        # Q is captured for Q-AdaIN colour transfer (HAM arXiv:2603.24043 §3.1).
+        # style_w: per-image-token weight from style-text→image cross-attention.
+        #   style_w[i] > 1  → patch i is style-relevant (attend here for texture/strokes)
+        #   style_w[i] < 1  → patch i is content-object (suppress to avoid content leakage)
+        #   style_w[i] = 1  → uniform (no style_description given)
         if layer in self.tier_a:
-            self.kvs[layer] = (
-                q[0:1, :, img_offset:, :].detach().clone().float(),
-                k[0:1, :, img_offset:, :].detach().clone().float(),
-                v[0:1, :, img_offset:, :].detach().clone().float(),
-            )
+            q_img = q[0:1, :, img_offset:, :].detach().clone().float()
+            k_img = k[0:1, :, img_offset:, :].detach().clone().float()
+            v_img = v[0:1, :, img_offset:, :].detach().clone().float()
+
+            style_w: Optional[torch.Tensor] = None
+            if self.style_token_idx:
+                # Full-row softmax over the entire sequence for the style tokens,
+                # then isolate the image-column.  This is the actual cross-attention
+                # weight from each style text token to each image patch.
+                valid_idx = [i for i in self.style_token_idx if i < q.shape[2]]
+                if valid_idx:
+                    head_dim = q.shape[-1]
+                    scale    = head_dim ** -0.5
+                    q_sty    = q[0:1, :, valid_idx, :].float()          # (1,H,n_sty,D)
+                    # Full K sequence: [text | image] for both block types
+                    logits   = torch.matmul(q_sty, k[0:1].float().transpose(-2, -1)) * scale
+                    attn_row = logits.softmax(dim=-1)                    # (1,H,n_sty,n_all)
+                    img_attn = attn_row[:, :, :, img_offset:].mean(1).mean(1).squeeze(0)
+                    # Normalise to mean=1 so total injection energy is preserved
+                    style_w  = (img_attn / (img_attn.mean() + 1e-8)).view(1, 1, -1, 1)
+
+            self.kvs[layer] = (q_img, k_img, v_img, style_w)
 
         out = F.scaled_dot_product_attention(
             q, k, v, dropout_p=0.0, is_causal=False, attn_mask=attention_mask)
@@ -2171,23 +2194,25 @@ def _extract_style_kvs(
     height: int = 1024,
     width: int = 1024,
     noise_level: float = 0.3,
+    style_description: str = "",
 ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Capture K,V at TIER_A layers from the style reference image.
 
-    Runs one FLUX forward pass on the style image at t=0.3 (30% noise, 70%
-    clean signal) with empty prompt.  Installs a temporary
-    _StyleKVCaptureProcessor to collect K,V, then restores the original
-    attention processors.
+    When style_description is given (e.g. "oil painting"), the prompt is set to
+    the style description and per-patch style-alignment weights are computed via
+    full-row text→image cross-attention at each TIER_A layer.  Patches that the
+    style text attends to strongly (texture, brushstrokes) get weight > 1; patches
+    the text ignores (the content object in the painting) get weight < 1.  These
+    weights are multiplied into V_sty at injection time, suppressing content leakage
+    from the style reference.
 
-    t=0.3 (vs the prior t=0.5) gives richer V features — more detailed
-    colour, texture, and brushstroke information from the style reference.
-    Content leakage via K is no longer a concern because inject_qkv always
-    uses K_src (not K_style) during generation.
+    When style_description is empty (default / backward compat), the prompt is
+    empty and style_w = None → uniform injection (previous behaviour).
 
-    Returns Dict[layer_index → (q_img, k_img, v_img)] where each tensor has
-    shape (1, heads, img_seq_len, head_dim) float32 (image tokens only, after
-    RoPE).  Q is stored to enable Q-AdaIN colour transfer (HAM §3.1).
+    Returns Dict[layer_index → (q_img, k_img, v_img, style_w)] where each
+    tensor has shape (1, heads, img_seq_len, head_dim) float32, and style_w is
+    (1, 1, n_img, 1) float32 or None.
     """
     try:
         exec_device = getattr(pipe, '_execution_device', device)
@@ -2206,13 +2231,33 @@ def _extract_style_kvs(
         noise         = torch.randn_like(latents)
         latents_noisy = (1.0 - noise_level) * latents + noise_level * noise
 
-        # ── Empty prompt ─────────────────────────────────────────────────────
+        # ── Prompt: style description (or empty for backward compat) ──────────
+        # Using the style description lets the cross-attention Q_style × K_img
+        # identify which image patches correspond to the style (texture, strokes)
+        # vs the content object.
+        prompt_for_extraction = style_description.strip()
         enc_result = pipe.encode_prompt(
-            prompt="", prompt_2=None,
+            prompt=prompt_for_extraction, prompt_2=None,
             device=exec_device, num_images_per_prompt=1,
         )
         pemb, ppooled = enc_result[0], enc_result[1]
         txt_len = pemb.shape[1]
+
+        # Find which T5 token positions carry the style description.
+        # All tokens in the prompt are style tokens (the prompt IS the description).
+        style_token_idx: List[int] = []
+        if prompt_for_extraction:
+            try:
+                tok = getattr(pipe, 'tokenizer_2', None) or getattr(pipe, 'tokenizer', None)
+                if tok:
+                    ids = tok(prompt_for_extraction, add_special_tokens=False).input_ids
+                    style_token_idx = list(range(min(len(ids), txt_len)))
+                    print(f"[StyleID] style_description='{prompt_for_extraction}' "
+                          f"→ {len(style_token_idx)} T5 tokens (style-attention weights ON)")
+            except Exception as _te:
+                print(f"[StyleID] tokenizer error: {_te} — style_w disabled")
+        else:
+            print("[StyleID] No style_description — extracting V from all patches uniformly")
 
         # ── RoPE position ids ─────────────────────────────────────────────────
         lh, lw  = height // 8, width // 8
@@ -2227,7 +2272,8 @@ def _extract_style_kvs(
             guidance = torch.full([1], 3.5, device=exec_device, dtype=latents.dtype)
 
         # ── Capture K,V with temporary processor ─────────────────────────────
-        cap  = _StyleKVCaptureProcessor(tier_a=tier_a, txt_len=txt_len)
+        cap  = _StyleKVCaptureProcessor(tier_a=tier_a, txt_len=txt_len,
+                                        style_token_idx=style_token_idx)
         orig = pipe.transformer.attn_processors   # dict {name: processor}
         pipe.transformer.set_attn_processor(cap)
         try:
@@ -2317,6 +2363,7 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         content_strength: float = 0.85,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
         color_transfer_strength: float = 0.6,
+        style_description: str = "",
         # Legacy aliases — accepted for backward compat but not used.
         q_preservation: float = 1.0,
         alpha: float = 1.0,
@@ -2328,6 +2375,7 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         self.style_strength    = style_strength
         self.content_strength  = content_strength
         self.inject_steps_frac = inject_steps_frac
+        self.style_description = style_description
         self._style_kvs: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._txt_len_single   = 512
         # Set by pre_generate when content_image is provided:
@@ -2374,6 +2422,7 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
                 pipe, img, _TIER_A_STYLE,
                 device=device, height=height, width=width,
                 noise_level=sigma_start,
+                style_description=self.style_description,
             )
 
         # ── Step 3: Encode content image → noisy starting latent ──────────
@@ -2447,7 +2496,7 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         if not _step_active(step, n_steps, self.inject_steps_frac):
             return q, k, v
 
-        q_sty, _, v_sty = self._style_kvs[layer]
+        q_sty, _, v_sty, style_w = self._style_kvs[layer]
         img_offset = txt_len if txt_len > 0 else self._txt_len_single
         sw         = self.style_strength
 
@@ -2457,6 +2506,13 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         vs = v_sty.to(v.device, dtype=v.dtype)
         qs = q_sty.to(q.device, dtype=q.dtype)
 
+        # Style-attention reweighting: amplify patches that correspond to the
+        # style description ("oil painting" → brushstroke patches) and suppress
+        # patches that correspond to the content object in the reference image.
+        # style_w is mean-normalised to 1.0 so average injection energy is preserved.
+        if style_w is not None:
+            vs = vs * style_w.to(v.device, dtype=v.dtype)
+
         # Q* from source (with Q-AdaIN colour injection): structural layout lock
         # + style colour distribution transferred through Q statistics.
         q_src_img = q[0:1, :, img_offset:, :].detach().clone()
@@ -2465,7 +2521,8 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         # K from source: spatial routing locked to source denoising path
         k[1:2, :, img_offset:, :] = k[0:1, :, img_offset:, :].detach().clone()
 
-        # V from style: colour, texture, brushstrokes from reference image
+        # V from style (reweighted): texture/stroke patches at full strength,
+        # content-object patches suppressed
         v[1:2, :, img_offset:, :] = (1.0 - sw) * v[1:2, :, img_offset:, :] + sw * vs
 
         return q, k, v
