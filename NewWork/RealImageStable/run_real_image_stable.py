@@ -41,14 +41,18 @@ def load_pipeline(model_path, device, hf_token=None, cache_dir=None):
     return pipe
 
 
+_NUDGE = 1.15   # StableFlow latent nudge factor
+
+
 def encode_image(pipe, image: Image.Image, height: int, width: int, device: str):
-    """VAE-encode a PIL image → latent z  (1, 16, H//8, W//8)."""
+    """VAE-encode a PIL image → nudged latent z  (1, 16, H//8, W//8)."""
     image = image.convert("RGB").resize((width, height), Image.LANCZOS)
     arr   = np.array(image).astype(np.float32) / 255.0 * 2.0 - 1.0   # [-1, 1]
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device, dtype=torch.bfloat16)
     with torch.no_grad():
         z = pipe.vae.encode(tensor).latent_dist.sample()
         z = (z - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+        z = z * _NUDGE   # StableFlow nudge: stabilises flow-matching inversion
     return z   # (1, 16, H//8, W//8)
 
 
