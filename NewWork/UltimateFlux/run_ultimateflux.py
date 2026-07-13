@@ -39,6 +39,13 @@ import argparse
 import json
 import os
 import sys
+import warnings
+
+# Harmless divide-by-zero from diffusers scheduler at the t=0 boundary timestep.
+warnings.filterwarnings(
+    "ignore", message="divide by zero encountered in divide",
+    category=RuntimeWarning,
+)
 
 import torch
 from PIL import Image
@@ -225,40 +232,7 @@ def run_single(pipe, cfg: dict, out_dir: str, save_images: bool, device: str):
     # save_strips=True only for explicit --save_intermediates; steps.png always saved.
     save_strips = explicit_intermediates
 
-    # ── Style task: two-stage pipeline ─────────────────────────────────────────
-    # Stage 1: generate clean source image (no style injection).
-    # Stage 2: encode source → add noise → dual-branch denoise with style injection.
-    #
-    # This guarantees that source.png and edit.png show THE SAME character, because
-    # stage 2 starts from a latent that already encodes the source image's identity
-    # (not from random noise where identity is only approximated via K/V injection).
-    #
-    # Only runs when no --content_image was provided (auto-generate mode).
-    # If --content_image is provided, skip to normal generate_dual_branch flow.
     _stage1_source: Image.Image = None
-    if (cfg.get("task") == "style"
-            and not cfg.get("content_image")
-            and isinstance(policy, StylePersonalizationPolicy)):
-
-        print(f"  [StyleID] Stage 1/2 — generating clean source image (seed={seed})…")
-        # Any UltimateFluxAttnProcessor from a prior run is harmless here: its
-        # inject_qkv guard (k.shape[0] < 2) returns immediately for single-branch.
-        _g1   = torch.Generator(device=device).manual_seed(seed)
-        _r1   = pipe(
-            prompt=source_prompt,
-            num_inference_steps=num_steps,
-            guidance_scale=guidance,
-            height=height, width=width,
-            generator=_g1,
-            output_type="pil",
-        )
-        _stage1_source = _r1.images[0]
-        policy.content_image = _stage1_source
-
-        cs = cfg.get("content_strength") or policy.content_strength
-        cs_str = f"{cs:.2f}" if cs is not None else "auto"
-        print(f"  [StyleID] Stage 2/2 — style transfer from encoded source "
-              f"(content_strength={cs_str})…")
 
     # ColorCtrlPolicy (legacy) uses masked delta-flow.
     # All other policies (including KontextColorPolicy) use dual-branch attention injection.

@@ -1,20 +1,11 @@
 #!/usr/bin/env bash
-# Task 7 — Identity-preserving style transfer (two-stage pipeline)
+# Task 7 — Style transfer (dual-branch from random noise)
 #
-# ── Two-stage pipeline (new default) ────────────────────────────────────────────
-#
-# Stage 1: Generate clean source image from the content prompt (no style injection).
-#          Uses FLUX normally — 28 full denoising steps, same seed.
-#          → source.png  (the identity reference)
-#
-# Stage 2: Encode source image → add partial noise (content_strength) → run
-#          dual-branch denoising with style injection at all 13 TIER_A layers.
-#          Source branch reconstructs source; edit branch gets style applied.
-#          → edit.png    (the styled output)
-#
-# Why two stages?  Starting from an encoded real image guarantees identity is
-# locked from the very first latent — K/V injection alone (from random noise)
-# cannot do this because both branches start from the same blank slate.
+# Pipeline:
+#   1. Extract style K,V from reference image at the denoising noise level.
+#   2. Run B=2 dual-branch denoising from random noise (same seed both branches).
+#      Branch 0 (source): plain generation, no injection → source.png
+#      Branch 1 (edit):   style K,V injected at TIER_A layers  → edit.png
 #
 # ── Injection formula at ALL 13 TIER_A layers ────────────────────────────────────
 #

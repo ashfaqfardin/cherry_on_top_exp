@@ -2170,6 +2170,7 @@ def _extract_style_kvs(
     device: str = "cuda",
     height: int = 1024,
     width: int = 1024,
+    noise_level: float = 0.3,
 ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Capture K,V at TIER_A layers from the style reference image.
@@ -2203,7 +2204,7 @@ def _extract_style_kvs(
                    .reshape(B, (H // 2) * (W // 2), C * 4)
         )
         noise         = torch.randn_like(latents)
-        latents_noisy = 0.7 * latents + 0.3 * noise   # t=0.3: richer style features
+        latents_noisy = (1.0 - noise_level) * latents + noise_level * noise
 
         # ── Empty prompt ─────────────────────────────────────────────────────
         enc_result = pipe.encode_prompt(
@@ -2343,41 +2344,44 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         self._override_timesteps = None
         self._override_sigmas    = None
 
-        # ── Step 1: Extract style K,V ─────────────────────────────────────
+        # ── Step 1: Compute sigma_start so style extraction matches denoising ──
+        # V_sty must be captured at the same noise level as the starting latent.
+        # Capturing at t=0.3 (70% clean) while denoising starts at sigma=0.6
+        # causes a feature mismatch — the model ignores mismatched V features.
+        sigma_start = 0.3   # fallback if no content image (pure T2I mode)
+        _img_seq_len = (height // 16) * (width // 16)
+        _mu = calculate_shift(
+            _img_seq_len,
+            pipe.scheduler.config.get("base_image_seq_len", 256),
+            pipe.scheduler.config.get("max_image_seq_len", 4096),
+            pipe.scheduler.config.get("base_shift", 0.5),
+            pipe.scheduler.config.get("max_shift", 1.16),
+        )
+        pipe.scheduler.set_timesteps(num_steps, device=device, mu=_mu)
+        all_ts = pipe.scheduler.timesteps
+        sigmas  = pipe.scheduler.sigmas.cpu().float()
+        if self.content_image is not None:
+            cs = self.content_strength
+            start_idx   = int((1.0 - cs) * len(all_ts))
+            start_idx   = max(0, min(start_idx, len(all_ts) - 1))
+            sigma_start = sigmas[start_idx].item()
+
+        # ── Step 2: Extract style K,V at sigma_start noise level ─────────
         img = self.style_image
         if img is not None:
-            print("[StyleID] Extracting style K,V from reference image…")
+            print(f"[StyleID] Extracting style K,V at noise level t={sigma_start:.2f}…")
             self._style_kvs = _extract_style_kvs(
                 pipe, img, _TIER_A_STYLE,
                 device=device, height=height, width=width,
+                noise_level=sigma_start,
             )
 
-        # ── Step 2: Encode content image → noisy starting latent ──────────
+        # ── Step 3: Encode content image → noisy starting latent ──────────
         if self.content_image is not None:
             print("[StyleID] Encoding content image for identity-preserving transfer…")
-            # Encode + nudge (StableFlow ×1.15 corrects FLUX inversion magnitude drift)
             z_0 = self.encode_real_image(
                 pipe, self.content_image, height, width, device, nudge=True
             )
-            # Get FLUX timestep schedule — mu required when use_dynamic_shifting=True.
-            # mu is computed from image sequence length (standard FLUX convention).
-            _img_seq_len = (height // 16) * (width // 16)
-            _mu = calculate_shift(
-                _img_seq_len,
-                pipe.scheduler.config.get("base_image_seq_len", 256),
-                pipe.scheduler.config.get("max_image_seq_len", 4096),
-                pipe.scheduler.config.get("base_shift", 0.5),
-                pipe.scheduler.config.get("max_shift", 1.16),
-            )
-            pipe.scheduler.set_timesteps(num_steps, device=device, mu=_mu)
-            all_ts = pipe.scheduler.timesteps          # (num_steps,) descending
-            sigmas = pipe.scheduler.sigmas.cpu().float()  # (num_steps+1,)
-
-            # Find start index for content_strength noise level.
-            cs = self.content_strength
-            start_idx = int((1.0 - cs) * len(all_ts))
-            start_idx = max(0, min(start_idx, len(all_ts) - 1))
-            sigma_start = sigmas[start_idx].item()
 
             # z_T = (1 − σ)·z_src + σ·ε   (flow-matching interpolation)
             seed = kwargs.get("seed", 0)
@@ -2385,7 +2389,6 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             eps  = torch.randn(z_0.shape, generator=gen,
                                device=z_0.device, dtype=z_0.dtype)
             self._initial_latent   = (1.0 - sigma_start) * z_0 + sigma_start * eps
-            # FluxPipeline accepts sigmas (not timesteps) to control the schedule.
             self._override_sigmas  = sigmas[start_idx:].tolist()
             self._actual_num_steps = len(all_ts[start_idx:])
             print(f"[StyleID] content_strength={cs:.2f}  sigma_start={sigma_start:.3f}  "
