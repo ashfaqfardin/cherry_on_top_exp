@@ -2303,6 +2303,7 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         style_strength: float = 1.0,
         content_strength: float = 0.85,
         inject_steps_frac: Tuple[float, float] = (0.0, 1.0),
+        color_transfer_strength: float = 0.6,
         # Legacy aliases — accepted for backward compat but not used.
         q_preservation: float = 1.0,
         alpha: float = 1.0,
