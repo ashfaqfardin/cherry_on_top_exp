@@ -27,7 +27,6 @@ from torchvision.transforms.functional import to_tensor
 from typing import Callable, Dict, List, Optional, Tuple
 
 from diffusers.models.embeddings import apply_rotary_emb
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import calculate_shift
 
 from PIL import ImageFilter
 
@@ -190,6 +189,18 @@ def _masked_kv_inject(k, v, mask_1d: torch.Tensor, txt_len: int):
 
 def _step_active(step: int, n_steps: int, frac: Tuple[float, float]) -> bool:
     return int(frac[0] * n_steps) <= step < int(frac[1] * n_steps)
+
+
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.16,
+) -> float:
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    return image_seq_len * m + b
 
 
 # ─────────────────── Reasoning processor (object addition) ───────────────────
