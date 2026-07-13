@@ -48,7 +48,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
-MODEL="black-forest-labs/FLUX.1-schnell"
+MODEL="black-forest-labs/FLUX.1-dev"
 STEPS=28
 CFG=3.5
 H=1024
