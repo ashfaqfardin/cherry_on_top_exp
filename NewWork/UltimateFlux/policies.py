@@ -27,6 +27,7 @@ from torchvision.transforms.functional import to_tensor
 from typing import Callable, Dict, List, Optional, Tuple
 
 from diffusers.models.embeddings import apply_rotary_emb
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import calculate_shift
 
 from PIL import ImageFilter
 
@@ -2320,14 +2321,16 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
         # Set by pre_generate when content_image is provided:
         self._initial_latent:      Optional[torch.Tensor] = None
         self._override_timesteps:  Optional[torch.Tensor] = None
+        self._override_sigmas:     Optional[list]         = None
         self._actual_num_steps:    int = 28
 
     def pre_generate(self, pipe, device="cuda", height=1024, width=1024,
                      num_steps=28, max_sequence_length=512, **kwargs):
-        self._txt_len_single   = max_sequence_length
-        self._actual_num_steps = num_steps
-        self._initial_latent   = None
+        self._txt_len_single     = max_sequence_length
+        self._actual_num_steps   = num_steps
+        self._initial_latent     = None
         self._override_timesteps = None
+        self._override_sigmas    = None
 
         # ── Step 1: Extract style K,V ─────────────────────────────────────
         img = self.style_image
@@ -2345,13 +2348,21 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             z_0 = self.encode_real_image(
                 pipe, self.content_image, height, width, device, nudge=True
             )
-            # Get FLUX timestep schedule (mu-shifted for resolution)
-            pipe.scheduler.set_timesteps(num_steps, device=device)
-            all_ts  = pipe.scheduler.timesteps   # (num_steps,) descending, CPU
-            sigmas  = pipe.scheduler.sigmas.cpu().float()  # (num_steps+1,) descending
+            # Get FLUX timestep schedule — mu required when use_dynamic_shifting=True.
+            # mu is computed from image sequence length (standard FLUX convention).
+            _img_seq_len = (height // 16) * (width // 16)
+            _mu = calculate_shift(
+                _img_seq_len,
+                pipe.scheduler.config.get("base_image_seq_len", 256),
+                pipe.scheduler.config.get("max_image_seq_len", 4096),
+                pipe.scheduler.config.get("base_shift", 0.5),
+                pipe.scheduler.config.get("max_shift", 1.16),
+            )
+            pipe.scheduler.set_timesteps(num_steps, device=device, mu=_mu)
+            all_ts = pipe.scheduler.timesteps          # (num_steps,) descending
+            sigmas = pipe.scheduler.sigmas.cpu().float()  # (num_steps+1,)
 
             # Find start index for content_strength noise level.
-            # sigmas are high→low; we want the first position where sigma ≤ cs.
             cs = self.content_strength
             start_idx = int((1.0 - cs) * len(all_ts))
             start_idx = max(0, min(start_idx, len(all_ts) - 1))
@@ -2362,9 +2373,10 @@ class StylePersonalizationPolicy(BasePolicy, LatentNudgingMixin):
             gen  = torch.Generator(device=z_0.device).manual_seed(seed)
             eps  = torch.randn(z_0.shape, generator=gen,
                                device=z_0.device, dtype=z_0.dtype)
-            self._initial_latent     = (1.0 - sigma_start) * z_0 + sigma_start * eps
-            self._override_timesteps = all_ts[start_idx:]     # subset to use
-            self._actual_num_steps   = len(self._override_timesteps)
+            self._initial_latent   = (1.0 - sigma_start) * z_0 + sigma_start * eps
+            # FluxPipeline accepts sigmas (not timesteps) to control the schedule.
+            self._override_sigmas  = sigmas[start_idx:].tolist()
+            self._actual_num_steps = len(all_ts[start_idx:])
             print(f"[StyleID] content_strength={cs:.2f}  sigma_start={sigma_start:.3f}  "
                   f"active_steps={self._actual_num_steps}/{num_steps}")
 
