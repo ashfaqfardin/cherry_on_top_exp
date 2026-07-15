@@ -36,11 +36,12 @@ import argparse
 import os
 import sys
 
-import torch
 import numpy as np
+import torch
 from PIL import Image
 from diffusers import FluxPipeline
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.pipelines.flux.pipeline_flux import calculate_shift
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -153,8 +154,20 @@ def run(pipe: FluxPipeline, args):
     z_packed = _pack(z)                                     # (1, seq, 64)
     out_ids  = _make_image_ids(H // 16, W // 16, T=0, device=device)
 
-    # ── 4. Set up scheduler ───────────────────────────────────────────────────
-    pipe.scheduler.set_timesteps(args.num_steps, device=device)
+    # ── 4. Set up scheduler with mu-shifted sigmas ───────────────────────────
+    # FLUX.1-schnell requires a resolution-dependent shift (mu) applied to the
+    # sigma schedule. Without it, the timestep distribution is wrong and the
+    # output stays noisy. mu is computed from the OUTPUT sequence length only.
+    out_seq_len = (H // 16) * (W // 16)
+    mu = calculate_shift(
+        out_seq_len,
+        pipe.scheduler.config.get("base_image_seq_len", 256),
+        pipe.scheduler.config.get("max_image_seq_len", 4096),
+        pipe.scheduler.config.get("base_shift",         0.5),
+        pipe.scheduler.config.get("max_shift",          1.16),
+    )
+    sigmas = np.linspace(1.0, 1.0 / args.num_steps, args.num_steps)
+    pipe.scheduler.set_timesteps(sigmas=sigmas, mu=mu, device=device)
     timesteps = pipe.scheduler.timesteps
 
     # ── 5. Denoising loop ─────────────────────────────────────────────────────
