@@ -230,7 +230,7 @@ def parse_args():
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--height",         type=int,   default=1024)
     p.add_argument("--width",          type=int,   default=1024)
-    p.add_argument("--model_path",     default="black-forest-labs/FLUX.1-dev")
+    p.add_argument("--model_path",     default="black-forest-labs/FLUX.1-Kontext-dev")
     p.add_argument("--hf_token",       required=True)
     p.add_argument("--device",         default="cuda")
     p.add_argument("--cache_dir",      default="./models")
