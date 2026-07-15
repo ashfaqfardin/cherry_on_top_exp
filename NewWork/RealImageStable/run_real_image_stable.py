@@ -145,8 +145,6 @@ def run(pipe: FluxPipeline, args):
     ctx_packed = _pack(ctx_z)                               # (1, seq, 64)
     ctx_ids    = _make_image_ids(H // 16, W // 16, T=1, device=device)
 
-    ctx_seq = ctx_packed.shape[1]
-
     # ── 3. Output tokens  [T=0, h, w] ────────────────────────────────────────
     g       = torch.Generator(device=device).manual_seed(args.seed)
     z       = randn_tensor((1, 16, H // 8, W // 8),
@@ -170,12 +168,14 @@ def run(pipe: FluxPipeline, args):
     pipe.scheduler.set_timesteps(sigmas=sigmas, mu=mu, device=device)
     timesteps = pipe.scheduler.timesteps
 
+    out_seq = z_packed.shape[1]
+
     # ── 5. Denoising loop ─────────────────────────────────────────────────────
     for t in timesteps:
-        # Concatenate context (T=1) + output (T=0) every step.
-        # Context latent stays fixed; only z_packed is updated.
-        combined        = torch.cat([ctx_packed, z_packed], dim=1)  # (1, 2*seq, 64)
-        combined_ids    = torch.cat([ctx_ids,    out_ids  ], dim=0) # (2*seq, 3)
+        # Paper order: target first (T=0), context appended (T=1).
+        # "context image tokens y are appended to the image tokens x"
+        combined        = torch.cat([z_packed,  ctx_packed], dim=1)  # (1, 2*seq, 64)
+        combined_ids    = torch.cat([out_ids,   ctx_ids   ], dim=0)  # (2*seq, 3)
 
         timestep = t.expand(combined.shape[0]).to(combined.dtype) / 1000.0
 
@@ -195,8 +195,8 @@ def run(pipe: FluxPipeline, args):
             return_dict           = False,
         )[0]
 
-        # Only the output (T=0) part is denoised — context stays frozen.
-        noise_pred_out = noise_pred[:, ctx_seq:, :]
+        # Target tokens are first — extract only those, discard context.
+        noise_pred_out = noise_pred[:, :out_seq, :]
 
         z_packed = pipe.scheduler.step(
             noise_pred_out, t, z_packed, return_dict=False
