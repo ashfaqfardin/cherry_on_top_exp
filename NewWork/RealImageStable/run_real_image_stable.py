@@ -55,18 +55,26 @@ _N_LAYERS = 57
 
 class DualBranchKInjector:
     """
-    Drop-in replacement for FluxAttnProcessor2_0.
+    Drop-in replacement for FluxAttnProcessor2_0 / FluxSingleAttnProcessor2_0.
 
-    At TIER_A layers: copies image-token K from branch 0 (source) into
-    branch 1 (edit), locking spatial attention routing so the edit branch
-    preserves the original image's structure while edit_prompt drives content.
+    Handles BOTH double-stream blocks (encoder_hidden_states is not None, layers 0-18)
+    and single-stream blocks (encoder_hidden_states is None, layers 19-56).
+
+    At TIER_A layers: copies image-token K from branch 0 (source) into branch 1
+    (edit) — forcing the edit branch to attend to the same spatial positions as
+    the reconstruction branch.
+
+    Output projection (to_out) is present on double-stream FluxAttention but
+    absent on single-stream FluxAttention in newer diffusers (the block handles
+    it via proj_out), so we check before calling it.
     """
 
     def __init__(self):
-        self._layer = 0
+        self._layer     = 0
+        self._txt_seq   = None  # cached from first double-stream call
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
-                 attention_mask=None, image_rotary_emb=None):  # noqa: ARG002 (attention_mask unused — FLUX doesn't use it)
+                 attention_mask=None, image_rotary_emb=None):
         layer       = self._layer
         self._layer = (self._layer + 1) % _N_LAYERS
 
@@ -86,6 +94,7 @@ class DualBranchKInjector:
 
         txt_len = 0
         if encoder_hidden_states is not None:
+            # ── double-stream block: text tokens processed separately ──────────
             eq = attn.add_q_proj(encoder_hidden_states)
             ek = attn.add_k_proj(encoder_hidden_states)
             ev = attn.add_v_proj(encoder_hidden_states)
@@ -95,15 +104,20 @@ class DualBranchKInjector:
             if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
             if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
             txt_len = eq.shape[2]
+            self._txt_seq = txt_len  # remember for single-stream blocks below
             q = torch.cat([eq, q], dim=2)
             k = torch.cat([ek, k], dim=2)
             v = torch.cat([ev, v], dim=2)
+        else:
+            # ── single-stream block: hidden_states = [txt | img] combined ─────
+            # txt_len tells us where image tokens start so we only inject those.
+            txt_len = self._txt_seq or 0
 
         if image_rotary_emb is not None:
             q = apply_rotary_emb(q, image_rotary_emb)
             k = apply_rotary_emb(k, image_rotary_emb)
 
-        # ── K injection at TIER_A layers ──────────────────────────────────────
+        # ── K injection at TIER_A layers (image tokens only) ──────────────────
         if layer in _TIER_A and B >= 2:
             k = k.clone()
             k[1:2, :, txt_len:, :] = k[0:1, :, txt_len:, :].detach()
@@ -112,13 +126,17 @@ class DualBranchKInjector:
         out = out.transpose(1, 2).reshape(B, -1, attn.heads * head_dim).to(q.dtype)
 
         if encoder_hidden_states is not None:
+            # double-stream: to_out and to_add_out exist on the attention module
             txt_out = attn.to_add_out(out[:, :txt_len])
             img_out = attn.to_out[0](out[:, txt_len:])
             img_out = attn.to_out[1](img_out)
             return img_out, txt_out
         else:
-            out = attn.to_out[0](out)
-            out = attn.to_out[1](out)
+            # single-stream: in newer diffusers to_out lives on the block (proj_out),
+            # not the attention module — only apply it when present.
+            if hasattr(attn, "to_out") and attn.to_out is not None:
+                out = attn.to_out[0](out)
+                out = attn.to_out[1](out)
             return out
 
 
