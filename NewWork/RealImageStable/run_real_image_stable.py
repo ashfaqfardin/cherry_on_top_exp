@@ -137,7 +137,7 @@ def run(pipe: FluxPipeline, args):
         prompt=args.prompt,
         prompt_2=None,
         device=device,
-        max_sequence_length=256,   # schnell uses 256
+        max_sequence_length=512,
     )
 
     # ── 2. Context tokens  [T=1, h, w] ───────────────────────────────────────
@@ -179,6 +179,11 @@ def run(pipe: FluxPipeline, args):
 
         timestep = t.expand(combined.shape[0]).to(combined.dtype) / 1000.0
 
+        # guidance: dev uses 3.5 CFG embedding; schnell passes None
+        guidance = (torch.full((combined.shape[0],), args.guidance_scale,
+                               device=device, dtype=combined.dtype)
+                    if args.guidance_scale > 1.0 else None)
+
         noise_pred = pipe.transformer(
             hidden_states         = combined,
             timestep              = timestep,
@@ -186,7 +191,7 @@ def run(pipe: FluxPipeline, args):
             pooled_projections    = pooled_embeds,
             txt_ids               = text_ids,
             img_ids               = combined_ids,
-            guidance              = None,   # schnell is guidance-distilled
+            guidance              = guidance,
             return_dict           = False,
         )[0]
 
@@ -220,11 +225,12 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--input",          required=True)
     p.add_argument("--prompt",         required=True)
-    p.add_argument("--num_steps",      type=int,   default=4)
+    p.add_argument("--num_steps",      type=int,   default=28)
+    p.add_argument("--guidance_scale", type=float, default=3.5)
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--height",         type=int,   default=1024)
     p.add_argument("--width",          type=int,   default=1024)
-    p.add_argument("--model_path",     default="black-forest-labs/FLUX.1-schnell")
+    p.add_argument("--model_path",     default="black-forest-labs/FLUX.1-dev")
     p.add_argument("--hf_token",       required=True)
     p.add_argument("--device",         default="cuda")
     p.add_argument("--cache_dir",      default="./models")
