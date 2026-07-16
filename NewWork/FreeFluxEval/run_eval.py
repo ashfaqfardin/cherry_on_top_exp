@@ -24,12 +24,23 @@ PowerShell usage (use backtick for line continuation):
 """
 
 import argparse
+import builtins
 import contextlib
-import io
 import json
 import os
 import sys
 import time
+
+
+@contextlib.contextmanager
+def _silence_prints():
+    """Suppress all print() calls — catches prints that bypass sys.stdout."""
+    _real = builtins.print
+    builtins.print = lambda *a, **kw: None
+    try:
+        yield
+    finally:
+        builtins.print = _real
 
 from tqdm import tqdm
 
@@ -136,7 +147,7 @@ def _run_one_model(pipe, runs, model_key, model_cfg, out_dir, save_images, resum
         t0 = time.time()
         status, error_msg = "ok", ""
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
+            with _silence_prints():
                 src_img, edited_img = run_non_rigid_edit(
                     pipe,
                     source_prompt=src_prompt,
