@@ -6,36 +6,21 @@ Tests FreeFlux non-rigid attention injection across 100 prompts spanning
   color_change, texture_change, weather_change, time_of_day, style_transfer,
   object_replacement, attribute_change, action_change, seasonal_change, lighting_change
 
-Uses run_non_rigid.py's pipeline and generation function — only adds category
-filtering, progress reporting, resume support, and a summary JSON.
+Supports running FLUX.1-dev and FLUX.1-schnell side by side.
+Results go to {out_dir}/{model}/  so comparisons are easy.
 
-Usage
------
-# Run all 100
-python NewWork/FreeFluxEval/run_eval.py \\
-    --hf_token "$HF_TOKEN" \\
-    --config prompts/freeflux_downstream_eval.json \\
-    --device cuda --cpu_offload --save_images
+PowerShell usage (use backtick for line continuation):
+  # Smoke-test 5 prompts on both models
+  python NewWork/FreeFluxEval/run_eval.py `
+      --hf_token $env:HF_TOKEN --limit 5 --save_images
 
-# Run one category only
-python NewWork/FreeFluxEval/run_eval.py \\
-    --hf_token "$HF_TOKEN" \\
-    --config prompts/freeflux_downstream_eval.json \\
-    --category color_change \\
-    --device cuda --cpu_offload --save_images
+  # One category, dev only
+  python NewWork/FreeFluxEval/run_eval.py `
+      --hf_token $env:HF_TOKEN --models dev --category color_change --save_images
 
-# Quick smoke-test: first 5 prompts
-python NewWork/FreeFluxEval/run_eval.py \\
-    --hf_token "$HF_TOKEN" \\
-    --config prompts/freeflux_downstream_eval.json \\
-    --limit 5 \\
-    --device cuda --cpu_offload --save_images
-
-# Resume an interrupted run (skip already-saved outputs)
-python NewWork/FreeFluxEval/run_eval.py \\
-    --hf_token "$HF_TOKEN" \\
-    --config prompts/freeflux_downstream_eval.json \\
-    --resume --device cuda --cpu_offload --save_images
+  # Full 100 on both models, resumable
+  python NewWork/FreeFluxEval/run_eval.py `
+      --hf_token $env:HF_TOKEN --models dev schnell --resume --save_images
 """
 
 import argparse
@@ -44,7 +29,8 @@ import os
 import sys
 import time
 
-# Repo root is three levels up from NewWork/FreeFluxEval/
+from tqdm import tqdm
+
 _REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 )
@@ -69,6 +55,20 @@ _ALL_CATEGORIES = [
     "lighting_change",
 ]
 
+# Per-model inference defaults. schnell requires 0 guidance and runs in 4 steps.
+_MODEL_CONFIGS = {
+    "dev": {
+        "model_path": "black-forest-labs/FLUX.1-dev",
+        "n_steps":    28,
+        "guidance":   3.5,
+    },
+    "schnell": {
+        "model_path": "black-forest-labs/FLUX.1-schnell",
+        "n_steps":    4,
+        "guidance":   0.0,
+    },
+}
+
 
 def load_config(config_path: str) -> list:
     with open(config_path) as f:
@@ -83,98 +83,61 @@ def load_config(config_path: str) -> list:
     return runs
 
 
-def _fmt_duration(seconds: float) -> str:
-    h = int(seconds) // 3600
-    m = (int(seconds) % 3600) // 60
-    s = int(seconds) % 60
-    if h:
-        return f"{h}h{m:02d}m{s:02d}s"
-    if m:
-        return f"{m}m{s:02d}s"
-    return f"{s}s"
+def _run_one_model(pipe, runs, model_key, model_cfg, out_dir, save_images, resume):
+    model_out = os.path.join(out_dir, model_key)
 
-
-def run_eval(args):
-    runs = load_config(args.config)
-
-    # Filter by category
-    if args.category:
-        if args.category not in _ALL_CATEGORIES:
-            print(f"Unknown category '{args.category}'. Valid: {_ALL_CATEGORIES}")
-            sys.exit(1)
-        runs = [r for r in runs if r.get("category") == args.category]
-        print(f"Filtered to category '{args.category}': {len(runs)} runs")
-
-    # Apply limit
-    if args.limit:
-        runs = runs[:args.limit]
-        print(f"Limiting to first {args.limit} runs")
-
-    # Resume: skip runs whose output directory already has both images
-    if args.resume:
-        pending = []
-        skipped = 0
+    # Resume: drop runs whose images are already on disk
+    if resume:
+        pending, skipped = [], 0
         for r in runs:
-            run_dir = os.path.join(args.out_dir, r["name"])
-            if (os.path.exists(os.path.join(run_dir, "source.png")) and
-                    os.path.exists(os.path.join(run_dir, "edited.png"))):
+            d = os.path.join(model_out, r["name"])
+            if (os.path.exists(os.path.join(d, "source.png")) and
+                    os.path.exists(os.path.join(d, "edited.png"))):
                 skipped += 1
             else:
                 pending.append(r)
-        print(f"Resume mode: skipping {skipped} already-done run(s), {len(pending)} remaining")
+        if skipped:
+            print(f"  [{model_key}] resume: skipping {skipped} done, {len(pending)} remaining")
         runs = pending
 
     if not runs:
-        print("No runs to execute.")
-        return
-
-    print(f"\n[FreeFlux downstream eval] Loading model from {args.model_path} ...")
-    pipe = load_freeflux_pipeline(
-        args.model_path, args.hf_token,
-        device=args.device, cpu_offload=args.cpu_offload,
-        cache_dir=args.cache_dir,
-    )
-    print("[FreeFlux downstream eval] Model loaded.\n")
+        print(f"  [{model_key}] nothing to run.")
+        return []
 
     summary = []
-    durations = []
-    total = len(runs)
     eval_start = time.time()
 
-    for i, cfg in enumerate(runs, start=1):
-        name           = cfg["name"]
-        category       = cfg.get("category", "unknown")
-        source_prompt  = cfg["source_prompt"]
-        target_prompt  = cfg["target_prompt"]
-        n_steps        = cfg.get("n_steps", 28)
-        guidance_scale = cfg.get("guidance_scale", 3.5)
-        height         = cfg.get("height", 1024)
-        width          = cfg.get("width", 1024)
-        max_seq_len    = cfg.get("max_sequence_length", 512)
-        seed           = cfg.get("seed", 42)
+    bar = tqdm(runs, desc=f"[{model_key}]", unit="item",
+               bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                          "[{elapsed}<{remaining}, {rate_fmt}]")
 
-        eta_str = ""
-        if durations:
-            avg = sum(durations) / len(durations)
-            remaining = avg * (total - i + 1)
-            eta_str = f"  ETA: {_fmt_duration(remaining)}"
+    for cfg in bar:
+        name          = cfg["name"]
+        category      = cfg.get("category", "unknown")
+        src_prompt    = cfg["source_prompt"]
+        tgt_prompt    = cfg["target_prompt"]
+        height        = cfg.get("height", 1024)
+        width         = cfg.get("width", 1024)
+        max_seq_len   = cfg.get("max_sequence_length", 512)
+        seed          = cfg.get("seed", 42)
+        # Steps and guidance always come from the model config —
+        # the JSON defaults are dev-specific and wrong for schnell.
+        n_steps        = model_cfg["n_steps"]
+        guidance_scale = model_cfg["guidance"]
 
-        print(f"[{i:3d}/{total}] {name}  [{category}]{eta_str}")
-        print(f"         src: {source_prompt}")
-        print(f"         tgt: {target_prompt}")
+        bar.set_postfix(run=name, cat=category, refresh=False)
 
-        run_dir = os.path.join(args.out_dir, name)
-        if args.save_images:
+        run_dir = os.path.join(model_out, name)
+        if save_images:
             os.makedirs(run_dir, exist_ok=True)
 
         t0 = time.time()
-        status = "ok"
-        error_msg = ""
+        status, error_msg = "ok", ""
         try:
             src_img, edited_img = run_non_rigid_edit(
                 pipe,
-                source_prompt=source_prompt,
-                target_prompt=target_prompt,
+                source_prompt=src_prompt,
+                target_prompt=tgt_prompt,
                 n_steps=n_steps,
                 guidance_scale=guidance_scale,
                 height=height,
@@ -182,85 +145,128 @@ def run_eval(args):
                 max_sequence_length=max_seq_len,
                 seed=seed,
             )
-            if args.save_images:
+            if save_images:
                 src_img.save(os.path.join(run_dir, "source.png"))
                 edited_img.save(os.path.join(run_dir, "edited.png"))
-                print(f"         saved → {run_dir}/")
         except Exception as e:
-            status = "error"
-            error_msg = str(e)
-            print(f"         ERROR: {e}")
-
-        elapsed = time.time() - t0
-        durations.append(elapsed)
-        print(f"         done in {_fmt_duration(elapsed)}\n")
+            status, error_msg = "error", str(e)
+            tqdm.write(f"  ERROR [{name}]: {e}")
 
         summary.append({
             "name":          name,
             "category":      category,
-            "source_prompt": source_prompt,
-            "target_prompt": target_prompt,
+            "source_prompt": src_prompt,
+            "target_prompt": tgt_prompt,
             "status":        status,
             "error":         error_msg,
-            "duration_s":    round(elapsed, 1),
+            "duration_s":    round(time.time() - t0, 1),
         })
 
-    total_elapsed = time.time() - eval_start
-    ok_count    = sum(1 for r in summary if r["status"] == "ok")
-    error_count = sum(1 for r in summary if r["status"] == "error")
+    total_s   = time.time() - eval_start
+    ok_count  = sum(1 for r in summary if r["status"] == "ok")
+    err_count = len(summary) - ok_count
 
-    print("=" * 60)
-    print(f"[FreeFlux downstream eval] Complete")
-    print(f"  Runs: {total}  |  OK: {ok_count}  |  Errors: {error_count}")
-    print(f"  Total time: {_fmt_duration(total_elapsed)}")
-    if durations:
-        print(f"  Avg per run: {_fmt_duration(sum(durations)/len(durations))}")
-
-    # Write summary JSON
-    os.makedirs(args.out_dir, exist_ok=True)
-    summary_path = os.path.join(args.out_dir, "summary.json")
+    os.makedirs(model_out, exist_ok=True)
+    summary_path = os.path.join(model_out, "summary.json")
     with open(summary_path, "w") as f:
         json.dump({
-            "total": total,
-            "ok": ok_count,
-            "errors": error_count,
-            "total_duration_s": round(total_elapsed, 1),
-            "runs": summary,
+            "model":           model_cfg["model_path"],
+            "total":           len(summary),
+            "ok":              ok_count,
+            "errors":          err_count,
+            "total_duration_s": round(total_s, 1),
+            "runs":            summary,
         }, f, indent=2)
-    print(f"  Summary → {summary_path}")
 
-    if error_count:
-        print(f"\n  Failed runs:")
+    print(f"\n  [{model_key}] done — OK: {ok_count}  Errors: {err_count}  "
+          f"Total: {total_s/60:.1f} min  → {summary_path}")
+
+    if err_count:
         for r in summary:
             if r["status"] == "error":
-                print(f"    {r['name']}: {r['error']}")
+                print(f"    FAILED {r['name']}: {r['error']}")
+
+    return summary
+
+
+def run_eval(args):
+    # Strip lone backslashes that sneak in from bash-style copy-paste
+    sys.argv = [a for a in sys.argv if a != "\\"]
+
+    runs = load_config(args.config)
+
+    if args.category:
+        runs = [r for r in runs if r.get("category") == args.category]
+        print(f"Category filter '{args.category}': {len(runs)} runs")
+
+    if args.limit:
+        runs = runs[:args.limit]
+        print(f"Limit: first {args.limit} runs")
+
+    if not runs:
+        print("No runs matched the filters.")
+        return
+
+    for model_key in args.models:
+        if model_key not in _MODEL_CONFIGS:
+            # Allow passing a full HF path directly
+            model_cfg = {"model_path": model_key, "n_steps": 28, "guidance": 3.5}
+        else:
+            model_cfg = _MODEL_CONFIGS[model_key]
+
+        print(f"\n{'='*60}")
+        print(f"Model: {model_cfg['model_path']}  "
+              f"steps={model_cfg['n_steps']}  guidance={model_cfg['guidance']}")
+        print(f"{'='*60}")
+        print(f"Loading model...")
+
+        pipe = load_freeflux_pipeline(
+            model_cfg["model_path"], args.hf_token,
+            device=args.device, cpu_offload=args.cpu_offload,
+            cache_dir=args.cache_dir,
+        )
+
+        _run_one_model(pipe, runs, model_key, model_cfg,
+                       out_dir=args.out_dir,
+                       save_images=args.save_images,
+                       resume=args.resume)
+
+        # Free VRAM before loading the next model
+        del pipe
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def parse_args():
+    # Strip lone backslashes before argparse sees them (bash copy-paste on Windows)
+    sys.argv = [a for a in sys.argv if a != "\\"]
+
     parser = argparse.ArgumentParser(
         description="FreeFlux downstream task evaluation (100 prompts, 10 categories)"
     )
     parser.add_argument("--config", type=str,
-                        default="prompts/freeflux_downstream_eval.json",
-                        help="Path to the evaluation JSON config file")
+                        default="prompts/freeflux_downstream_eval.json")
+    parser.add_argument("--models", nargs="+", default=["dev", "schnell"],
+                        help="Which models to run: dev, schnell, or a full HF path. "
+                             "Default: both dev and schnell")
     parser.add_argument("--category", type=str, default=None,
                         choices=_ALL_CATEGORIES,
                         help="Run only this category (default: all 10)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Run only the first N prompts (useful for smoke testing)")
+                        help="Run only the first N prompts (smoke testing)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip runs whose output images already exist")
-    parser.add_argument("--model_path", type=str,
-                        default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--hf_token", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--cpu_offload", action="store_true")
     parser.add_argument("--cache_dir", type=str, default="./models")
     parser.add_argument("--out_dir", type=str,
                         default="results/freeflux/downstream_eval",
-                        help="Root output directory (one sub-folder per run)")
-    parser.add_argument("--save_images", action="store_true",
-                        help="Save source.png and edited.png for each run")
+                        help="Root output dir. Each model gets its own sub-folder.")
+    parser.add_argument("--save_images", action="store_true")
     return parser.parse_args()
 
 
