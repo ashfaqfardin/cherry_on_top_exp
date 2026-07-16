@@ -24,6 +24,8 @@ PowerShell usage (use backtick for line continuation):
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -109,7 +111,7 @@ def _run_one_model(pipe, runs, model_key, model_cfg, out_dir, save_images, resum
 
     bar = tqdm(runs, desc=f"[{model_key}]", unit="item",
                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
-                          "[{elapsed}<{remaining}, {rate_fmt}]")
+                          "[{elapsed}<{remaining}, {rate_fmt}{postfix}]")
 
     for cfg in bar:
         name          = cfg["name"]
@@ -134,17 +136,18 @@ def _run_one_model(pipe, runs, model_key, model_cfg, out_dir, save_images, resum
         t0 = time.time()
         status, error_msg = "ok", ""
         try:
-            src_img, edited_img = run_non_rigid_edit(
-                pipe,
-                source_prompt=src_prompt,
-                target_prompt=tgt_prompt,
-                n_steps=n_steps,
-                guidance_scale=guidance_scale,
-                height=height,
-                width=width,
-                max_sequence_length=max_seq_len,
-                seed=seed,
-            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                src_img, edited_img = run_non_rigid_edit(
+                    pipe,
+                    source_prompt=src_prompt,
+                    target_prompt=tgt_prompt,
+                    n_steps=n_steps,
+                    guidance_scale=guidance_scale,
+                    height=height,
+                    width=width,
+                    max_sequence_length=max_seq_len,
+                    seed=seed,
+                )
             if save_images:
                 src_img.save(os.path.join(run_dir, "source.png"))
                 edited_img.save(os.path.join(run_dir, "edited.png"))
