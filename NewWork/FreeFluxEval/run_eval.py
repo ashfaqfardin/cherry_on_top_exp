@@ -218,13 +218,15 @@ def run_eval(args):
         print(f"Model: {model_cfg['model_path']}  "
               f"steps={model_cfg['n_steps']}  guidance={model_cfg['guidance']}")
         print(f"{'='*60}")
-        print(f"Loading model...")
+        print(f"Loading model (cache: {args.cache_dir}) ...")
 
         pipe = load_freeflux_pipeline(
             model_cfg["model_path"], args.hf_token,
             device=args.device, cpu_offload=args.cpu_offload,
             cache_dir=args.cache_dir,
         )
+        # Suppress diffusers' per-step bar so the outer run bar stays visible.
+        pipe.set_progress_bar_config(disable=True)
 
         _run_one_model(pipe, runs, model_key, model_cfg,
                        out_dir=args.out_dir,
