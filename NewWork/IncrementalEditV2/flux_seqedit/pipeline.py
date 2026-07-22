@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 import numpy as np
+import torch
 
 from .memory import LayerMemory
 from .masking import otsu_gate, refine_mask, soft_prior_fallback_mask, normalize01
@@ -83,6 +84,7 @@ class SequentialEditor:
 
     # ---- the core: one edit -------------------------------------------------
 
+    @torch.no_grad()
     def add_object(self, prompt: str, object_phrase: str, seed: int | None = None):
         """
         Add a new object described by `object_phrase` within `prompt`, letting
@@ -91,7 +93,6 @@ class SequentialEditor:
 
         Returns dict with the final image and the locked patch mask.
         """
-        import torch
 
         cfg = self.cfg
         s = self.state
@@ -197,7 +198,6 @@ class SequentialEditor:
         }
 
     def _transformer_step(self, latents, t, kw):
-        import torch
         guidance = torch.full((1,), self.cfg.guidance_scale,
                               device=latents.device, dtype=latents.dtype) \
             if self.pipe.transformer.config.guidance_embeds else None
@@ -227,7 +227,6 @@ class SequentialEditor:
         latents live in packed-token space (b, n_tok, c). Convert the patch mask
         to a per-token weight and blend: new inside mask, prev-latent outside.
         """
-        import torch
         from .torch_adapters import occupied_mask_to_token_tensor
         idx = occupied_mask_to_token_tensor(patch_mask_2d, latents.device)
         w = torch.zeros(latents.shape[1], device=latents.device, dtype=latents.dtype)
