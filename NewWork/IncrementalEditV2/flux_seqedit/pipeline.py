@@ -214,7 +214,12 @@ class SequentialEditor:
         )[0]
 
     def _scheduler_step(self, noise_pred, t, latents, i):
-        return self.pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        # With cpu_offload the scheduler lives on CPU while noise_pred/latents are on
+        # CUDA — move everything to the same device before the step.
+        device = latents.device
+        return self.pipe.scheduler.step(
+            noise_pred.to(device), t.to(device), latents, return_dict=False
+        )[0]
 
     def _bcg_blend(self, latents, patch_mask_2d, phase):
         """
