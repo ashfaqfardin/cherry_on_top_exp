@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 
 # Make the package importable when run as a script from any working directory.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -128,8 +129,8 @@ def _save_summary_grid(records, ph, pw, out_dir):
 # Diagnostic run (mirrors SequentialEditor.add_object with extra recording)
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
 def run_diagnostic_edit(editor, prompt, object_phrase, seed, out_dir):
-    import torch
     from flux_seqedit.masking import otsu_gate, refine_mask, soft_prior_fallback_mask
     from flux_seqedit.torch_adapters import (
         norm_vector_to_patch_map, phase_for_step, occupied_mask_to_token_tensor,
@@ -233,7 +234,6 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    import torch
     from diffusers import FluxPipeline
     from flux_seqedit.pipeline import SequentialEditor, EditConfig
 
