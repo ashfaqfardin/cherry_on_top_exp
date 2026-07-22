@@ -170,23 +170,31 @@ class NormExtractionFluxAttnProcessor:
 
     def _attention_with_prior(self, Q, K, V, n_txt, n_img):
         """
-        Manual attention that biases only the new object's text-token rows
-        against occupied image-token columns, pre-softmax. Everything else is
-        unchanged. Costs a full score matrix for those few rows only.
+        Biases only the new object's text-token rows against occupied image-token
+        columns, pre-softmax. Runs fused SDPA for the full sequence, then rewrites
+        only the handful of object-text rows — avoids materialising a full seq×seq
+        score matrix (which would be ~36 GB across all hooked blocks at 1024×1024).
         """
         s = self.state
         dh = Q.shape[-1]
-        scale = 1.0 / math.sqrt(dh)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * scale   # (b,h,seq,seq)
-
-        # object text rows in the joint sequence == their text positions (text first)
         t0, t1 = s.obj_token_span
-        # image columns in the joint sequence are offset by n_txt
-        occ_cols = s.occupied_token_idx.to(scores.device) + n_txt
-        scores[:, :, t0:t1, occ_cols] -= s.penalty
+        occ_cols = s.occupied_token_idx.to(Q.device) + n_txt   # image col offsets
 
-        attn_w = torch.softmax(scores, dim=-1)
-        return torch.matmul(attn_w, V)
+        # Fast path for all tokens.
+        out = F.scaled_dot_product_attention(Q, K, V)   # (b,h,seq,dh)
+
+        # Recompute only the n_obj text rows with the penalty applied.
+        scale = 1.0 / math.sqrt(dh)
+        Q_obj = Q[:, :, t0:t1, :]                               # (b,h,n_obj,dh)
+        scores_obj = torch.matmul(Q_obj, K.transpose(-2, -1)) * scale  # (b,h,n_obj,seq)
+        scores_obj[:, :, :, occ_cols] -= s.penalty
+        attn_w_obj = torch.softmax(scores_obj, dim=-1)
+        out_obj = torch.matmul(attn_w_obj, V)                   # (b,h,n_obj,dh)
+
+        # Overwrite the object text rows; leave everything else from fused SDPA.
+        out = out.clone()
+        out[:, :, t0:t1, :] = out_obj
+        return out
 
 
 def attach_processors(transformer, state: ExtractionState,
