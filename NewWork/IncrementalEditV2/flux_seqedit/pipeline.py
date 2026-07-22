@@ -61,7 +61,8 @@ class SequentialEditor:
         default_band = set(range(8, 15))       # mid-late dual-stream blocks
         attach_processors(pipe.transformer, self.state,
                           collect_blocks=self.cfg.collect_blocks or default_band)
-        self._prev_latent = None               # for BCG blend
+        self._prev_latent = None               # clean latent of committed scene
+        self._bcg_noise   = None               # fixed noise realisation for BCG blend
 
     # ---- text-token span resolution ----------------------------------------
 
@@ -99,6 +100,7 @@ class SequentialEditor:
         s.reset_collection()
         s.step_index = 0
         s.obj_token_span = self._object_token_span(prompt, object_phrase)
+        self._bcg_noise = None               # fresh noise field per edit
 
         occupied = self.memory.occupied_union()            # (ph,pw) bool
         device = self.pipe.transformer.device
@@ -136,9 +138,13 @@ class SequentialEditor:
                     and i >= cfg.otsu_hard_cutoff_frac * cfg.num_steps):
                 locked_mask = soft_prior_fallback_mask(prior_soft)
 
-            # BCG: once mask is locked, preserve background from prev-edit latent
+            # BCG: once mask is locked, preserve background from prev-edit latent.
+            # Lazily create a fixed noise tensor so the background trajectory is
+            # spatially coherent across all steps (same noise field, different sigma).
             if locked_mask is not None and self._prev_latent is not None:
-                latents = self._bcg_blend(latents, locked_mask, phase)
+                if self._bcg_noise is None:
+                    self._bcg_noise = torch.randn_like(self._prev_latent)
+                latents = self._bcg_blend(latents, locked_mask, phase, i)
 
         image = self._decode(latents)
 
@@ -221,20 +227,32 @@ class SequentialEditor:
             noise_pred.to(device), t.to(device), latents, return_dict=False
         )[0]
 
-    def _bcg_blend(self, latents, patch_mask_2d, phase):
+    def _bcg_blend(self, latents, patch_mask_2d, phase, step_idx):
         """
         Background Consistency Guidance with soft late floor.
-        latents live in packed-token space (b, n_tok, c). Convert the patch mask
-        to a per-token weight and blend: new inside mask, prev-latent outside.
+
+        latents live in packed-token space (b, n_tok, c). The background latent
+        must be at the SAME noise level as `latents` or FLUX sees an impossible
+        denoising state (clean bg blended with noisy current → blocky seams and
+        duplicate objects). We noise `_prev_latent` to match step_idx's sigma
+        using a fixed noise realisation stored in `_bcg_noise`.
+
+        Flow-matching forward: x_t = (1-σ) * x_clean + σ * noise, σ∈[1,0].
         """
         from .torch_adapters import occupied_mask_to_token_tensor
         idx = occupied_mask_to_token_tensor(patch_mask_2d, latents.device)
         w = torch.zeros(latents.shape[1], device=latents.device, dtype=latents.dtype)
         w[idx] = 1.0
-        if phase == "late":                       # relax: let some new leak out
+        if phase == "late":                       # relax: let some new content leak
             w = self.cfg.bcg_late_floor + (1 - self.cfg.bcg_late_floor) * w
         w = w.view(1, -1, 1)
-        return latents * w + self._prev_latent * (1 - w)
+
+        # Noise the background to the current noise level before blending.
+        sigma = self.pipe.scheduler.sigmas[step_idx].to(latents.device, dtype=latents.dtype)
+        bg_noise = self._bcg_noise.to(latents.device)
+        bg_at_t  = (1.0 - sigma) * self._prev_latent + sigma * bg_noise
+
+        return latents * w + bg_at_t * (1 - w)
 
     def _decode(self, latents):
         img = self.pipe._unpack_latents(latents, self.cfg.height, self.cfg.width,
