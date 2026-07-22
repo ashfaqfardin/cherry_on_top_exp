@@ -18,7 +18,9 @@ def parse_args():
                         help="HuggingFace token for FLUX.1-dev (gated model)")
     parser.add_argument("--cache_dir",  type=str, default="./models",
                         help="Local directory to cache downloaded weights")
-    parser.add_argument("--device",     type=str, default="cuda")
+    parser.add_argument("--device",      type=str, default="cuda")
+    parser.add_argument("--cpu_offload", action="store_true",
+                        help="Offload model components to CPU between uses (saves VRAM)")
     parser.add_argument("--num_steps",  type=int, default=28)
     parser.add_argument("--height",     type=int, default=1024)
     parser.add_argument("--width",      type=int, default=1024)
@@ -37,7 +39,11 @@ def main():
         torch_dtype=torch.bfloat16,
         token=args.hf_token,
         cache_dir=args.cache_dir,
-    ).to(args.device)
+    )
+    if args.cpu_offload:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to(args.device)
 
     editor = SequentialEditor(
         pipe,
