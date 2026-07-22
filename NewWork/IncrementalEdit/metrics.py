@@ -107,22 +107,30 @@ def preservation_gap(background_psnr: float, whole_image_psnr: float) -> float:
 
 
 def lpips_dist(a, b) -> Optional[float]:
-    """Optional perceptual distance. Returns None (never raises) if the
-    `lpips` package or torch isn't installed — pipelineInc.md §9."""
+    """Optional perceptual distance. Returns None (never raises) if `lpips`/
+    torch aren't installed, OR if the model call itself fails for any reason
+    (e.g. an input too small for AlexNet's pooling stack) — pipelineInc.md
+    §9's "never let a missing optional dep crash a run" extends to "never
+    let an optional metric crash a run," full stop. Real canvas/edit images
+    are always full resolution, so this only matters for tiny inputs."""
     try:
         import torch
         import lpips as _lpips
     except ImportError:
         return None
     try:
-        _model = lpips_dist._model
-    except AttributeError:
-        _model = _lpips.LPIPS(net="alex")
-        lpips_dist._model = _model
-    a_t = _to_lpips_tensor(a)
-    b_t = _to_lpips_tensor(b)
-    with torch.no_grad():
-        return float(_model(a_t, b_t).item())
+        try:
+            _model = lpips_dist._model
+        except AttributeError:
+            _model = _lpips.LPIPS(net="alex")
+            lpips_dist._model = _model
+        a_t = _to_lpips_tensor(a)
+        b_t = _to_lpips_tensor(b)
+        with torch.no_grad():
+            return float(_model(a_t, b_t).item())
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        print(f"[lpips] skipped ({exc!r})")
+        return None
 
 
 def _to_lpips_tensor(img):

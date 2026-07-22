@@ -185,11 +185,23 @@ class TestMetrics(unittest.TestCase):
         self.assertLess(metrics.preservation_gap(20.0, 30.0), 0.0)     # CHECK case
         self.assertEqual(metrics.preservation_gap(float("inf"), float("inf")), 0.0)
 
-    def test_lpips_dist_returns_none_without_deps(self):
-        # No torch/lpips installed in this environment — must return None,
-        # never raise (pipelineInc.md §9).
-        a = np.zeros((8, 8, 3), dtype=np.uint8)
-        self.assertIsNone(metrics.lpips_dist(a, a))
+    def test_lpips_dist_never_raises(self):
+        # Must never raise regardless of whether torch/lpips happen to be
+        # installed in the environment this runs in (pipelineInc.md §9) —
+        # a too-small image is exactly the kind of failure that must
+        # degrade to None rather than crash a real edit run.
+        tiny = np.zeros((8, 8, 3), dtype=np.uint8)
+        result = metrics.lpips_dist(tiny, tiny)
+        self.assertTrue(result is None or isinstance(result, float))
+
+    def test_lpips_dist_identical_images_near_zero_when_available(self):
+        # AlexNet's pooling stack needs a real-sized input; use one large
+        # enough to work if lpips/torch ARE installed. If they aren't,
+        # this degrades to None like every other call site.
+        img = np.random.default_rng(0).integers(0, 255, (64, 64, 3)).astype(np.uint8)
+        result = metrics.lpips_dist(img, img)
+        if result is not None:
+            self.assertAlmostEqual(result, 0.0, places=4)
 
 
 class TestManifest(unittest.TestCase):

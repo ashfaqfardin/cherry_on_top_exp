@@ -1,0 +1,229 @@
+"""
+Orchestrator — one edit = one denoising run with the self-masking schedule.
+
+Runs in a torch/diffusers/GPU environment. Ties together:
+  Step 1 packing (via torch_adapters)      Step 2 norm extraction (processor)
+  Step 3 repulsion prior (processor)        Step 4 Otsu gate (masking)
+  Step 5 memory + occlusion (memory)        + BCG latent blend
+
+This is intentionally a readable reference loop, not a speed-tuned production
+path. It calls the model's own pack/unpack helpers where available so token
+ordering matches exactly. Names match mainline diffusers FluxPipeline; confirm
+against your pinned version.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+import numpy as np
+
+from .memory import LayerMemory
+from .masking import otsu_gate, refine_mask, soft_prior_fallback_mask, normalize01
+from .processor import ExtractionState, attach_processors
+from .torch_adapters import (
+    occupied_mask_to_token_tensor, norm_vector_to_patch_map, phase_for_step,
+)
+from .packing import latent_dims_for_image, patch_grid
+
+
+@dataclass
+class EditConfig:
+    height: int = 1024
+    width: int = 1024
+    num_steps: int = 28
+    guidance_scale: float = 3.5
+    early_frac: float = 0.25
+    late_frac: float = 0.70
+    otsu_confidence: float = 0.02
+    otsu_hard_cutoff_frac: float = 0.40
+    penalty: float = 6.0
+    collect_blocks: Optional[set] = None      # None -> use a default mid-late band
+    bcg_late_floor: float = 0.15              # soft floor for seam-free blending
+    coverage: float = 0.5
+
+
+class SequentialEditor:
+    """
+    Wraps a loaded diffusers FluxPipeline. Holds the layer memory across edits so
+    each new prompt sees the accumulated scene.
+    """
+
+    def __init__(self, pipe, config: EditConfig | None = None):
+        self.pipe = pipe
+        self.cfg = config or EditConfig()
+        self.lh, self.lw = latent_dims_for_image(self.cfg.height, self.cfg.width)
+        self.ph, self.pw = patch_grid(self.lh, self.lw)
+        self.memory = LayerMemory(self.ph, self.pw)
+        self.state = ExtractionState(total_steps=self.cfg.num_steps,
+                                     penalty=self.cfg.penalty)
+        default_band = set(range(8, 15))       # mid-late dual-stream blocks
+        attach_processors(pipe.transformer, self.state,
+                          collect_blocks=self.cfg.collect_blocks or default_band)
+        self._prev_latent = None               # for BCG blend
+
+    # ---- text-token span resolution ----------------------------------------
+
+    def _object_token_span(self, prompt: str, object_phrase: str) -> tuple[int, int]:
+        """
+        Find the text-token index span for the object phrase within the prompt.
+        Uses the pipeline tokenizer(s). FLUX uses T5 for the sequence tokens that
+        enter the transformer; span-finding is approximate and should be sanity
+        checked per-tokenizer. Returns (start, end) exclusive.
+        """
+        tok = self.pipe.tokenizer_2      # T5 tokenizer in FLUX
+        full = tok(prompt, add_special_tokens=True).input_ids
+        obj = tok(object_phrase, add_special_tokens=False).input_ids
+        # naive contiguous sublist match
+        for i in range(len(full) - len(obj) + 1):
+            if full[i:i + len(obj)] == obj:
+                return (i, i + len(obj))
+        # fallback: whole prompt
+        return (0, len(full))
+
+    # ---- the core: one edit -------------------------------------------------
+
+    def add_object(self, prompt: str, object_phrase: str, seed: int | None = None):
+        """
+        Add a new object described by `object_phrase` within `prompt`, letting
+        FLUX choose placement (repulsed away from occupied regions), harvesting
+        the self-derived mask, and committing it to memory.
+
+        Returns dict with the final image and the locked patch mask.
+        """
+        import torch
+
+        cfg = self.cfg
+        s = self.state
+        s.reset_collection()
+        s.step_index = 0
+        s.obj_token_span = self._object_token_span(prompt, object_phrase)
+
+        occupied = self.memory.occupied_union()            # (ph,pw) bool
+        device = self.pipe.transformer.device
+        s.occupied_token_idx = occupied_mask_to_token_tensor(occupied, device) \
+            if occupied.any() else None
+
+        locked_mask: Optional[np.ndarray] = None
+        prior_soft = self._build_soft_prior(occupied)      # normalized (ph,pw)
+
+        # ---- manual denoising loop (mirrors FluxPipeline.__call__) ----
+        gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+        latents, latent_kwargs = self._prepare_latents(prompt, gen)
+        timesteps = latent_kwargs["timesteps"]
+
+        for i, t in enumerate(timesteps):
+            s.step_index = i
+            phase = phase_for_step(i, cfg.num_steps, cfg.early_frac, cfg.late_frac)
+            s.apply_prior = (phase == "early" and s.occupied_token_idx is not None)
+
+            noise_pred = self._transformer_step(latents, t, latent_kwargs)
+            latents = self._scheduler_step(noise_pred, t, latents, i)
+
+            # try to lock a mask once we're out of pure-noise phase
+            if locked_mask is None and phase in ("early", "mid"):
+                nrm = s.aggregate_norm()
+                if nrm is not None:
+                    pmap = norm_vector_to_patch_map(nrm, self.ph, self.pw)
+                    fired, mask, thr, var = otsu_gate(pmap, cfg.otsu_confidence)
+                    if fired:
+                        locked_mask = refine_mask(mask)
+                s.reset_collection()
+
+            # hard fallback: never localized by cutoff -> use soft prior
+            if (locked_mask is None
+                    and i >= cfg.otsu_hard_cutoff_frac * cfg.num_steps):
+                locked_mask = soft_prior_fallback_mask(prior_soft)
+
+            # BCG: once mask is locked, preserve background from prev-edit latent
+            if locked_mask is not None and self._prev_latent is not None:
+                latents = self._bcg_blend(latents, locked_mask, phase)
+
+        image = self._decode(latents)
+
+        if locked_mask is None:                            # ultimate safety
+            locked_mask = soft_prior_fallback_mask(prior_soft)
+
+        span = s.obj_token_span
+        self.memory.add_layer(prompt, locked_mask, token_span=span,
+                              object_phrase=object_phrase)
+        self._prev_latent = latents.detach()
+        return {"image": image, "mask": locked_mask,
+                "memory_summary": self.memory.summary()}
+
+    # ---- helpers that touch the diffusers pipeline internals ----------------
+    # Kept small and named so they can be adapted to a pinned diffusers version.
+
+    def _build_soft_prior(self, occupied_bool: np.ndarray) -> np.ndarray:
+        """Free-space prior: high where unoccupied. Used for early nudge target
+        and the Otsu hard-fallback mask."""
+        free = (~occupied_bool).astype(np.float64)
+        if not free.any():
+            free = np.ones_like(free)
+        return normalize01(free)
+
+    def _prepare_latents(self, prompt, generator):
+        """Encode prompt, init latents, get timesteps. Delegates to the pipe's
+        own prep so packing/rope match. Returns (latents, kwargs)."""
+        # Reference wiring — adapt to pinned diffusers. Pseudocode-level but
+        # calls real methods so the intent is unambiguous.
+        (prompt_embeds, pooled, text_ids) = self.pipe.encode_prompt(
+            prompt=prompt, prompt_2=prompt, device=self.pipe.transformer.device,
+            num_images_per_prompt=1,
+        )
+        num_channels = self.pipe.transformer.config.in_channels // 4
+        latents, latent_image_ids = self.pipe.prepare_latents(
+            1, num_channels, self.cfg.height, self.cfg.width,
+            prompt_embeds.dtype, self.pipe.transformer.device, generator,
+        )
+        self.pipe.scheduler.set_timesteps(self.cfg.num_steps,
+                                          device=self.pipe.transformer.device)
+        return latents, {
+            "prompt_embeds": prompt_embeds, "pooled": pooled,
+            "text_ids": text_ids, "latent_image_ids": latent_image_ids,
+            "timesteps": self.pipe.scheduler.timesteps,
+        }
+
+    def _transformer_step(self, latents, t, kw):
+        import torch
+        guidance = torch.full((1,), self.cfg.guidance_scale,
+                              device=latents.device, dtype=latents.dtype) \
+            if self.pipe.transformer.config.guidance_embeds else None
+        ts = t.expand(latents.shape[0]).to(latents.dtype) / 1000
+        return self.pipe.transformer(
+            hidden_states=latents,
+            timestep=ts,
+            guidance=guidance,
+            pooled_projections=kw["pooled"],
+            encoder_hidden_states=kw["prompt_embeds"],
+            txt_ids=kw["text_ids"],
+            img_ids=kw["latent_image_ids"],
+            return_dict=False,
+        )[0]
+
+    def _scheduler_step(self, noise_pred, t, latents, i):
+        return self.pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+    def _bcg_blend(self, latents, patch_mask_2d, phase):
+        """
+        Background Consistency Guidance with soft late floor.
+        latents live in packed-token space (b, n_tok, c). Convert the patch mask
+        to a per-token weight and blend: new inside mask, prev-latent outside.
+        """
+        import torch
+        from .torch_adapters import occupied_mask_to_token_tensor
+        idx = occupied_mask_to_token_tensor(patch_mask_2d, latents.device)
+        w = torch.zeros(latents.shape[1], device=latents.device, dtype=latents.dtype)
+        w[idx] = 1.0
+        if phase == "late":                       # relax: let some new leak out
+            w = self.cfg.bcg_late_floor + (1 - self.cfg.bcg_late_floor) * w
+        w = w.view(1, -1, 1)
+        return latents * w + self._prev_latent * (1 - w)
+
+    def _decode(self, latents):
+        img = self.pipe._unpack_latents(latents, self.cfg.height, self.cfg.width,
+                                        self.pipe.vae_scale_factor)
+        img = (img / self.pipe.vae.config.scaling_factor) + \
+            self.pipe.vae.config.shift_factor
+        img = self.pipe.vae.decode(img, return_dict=False)[0]
+        return self.pipe.image_processor.postprocess(img, output_type="pil")[0]
