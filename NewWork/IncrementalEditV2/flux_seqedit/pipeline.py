@@ -176,8 +176,20 @@ class SequentialEditor:
             1, num_channels, self.cfg.height, self.cfg.width,
             prompt_embeds.dtype, self.pipe.transformer.device, generator,
         )
-        self.pipe.scheduler.set_timesteps(self.cfg.num_steps,
-                                          device=self.pipe.transformer.device)
+        # Newer diffusers requires mu when use_dynamic_shifting=True (FLUX.1-dev default).
+        # latents.shape[1] is the packed image-token sequence length.
+        sched_kwargs = dict(device=self.pipe.transformer.device)
+        if getattr(self.pipe.scheduler.config, "use_dynamic_shifting", False):
+            from diffusers.pipelines.flux.pipeline_flux import calculate_shift
+            mu = calculate_shift(
+                latents.shape[1],
+                getattr(self.pipe.scheduler.config, "base_image_seq_len", 256),
+                getattr(self.pipe.scheduler.config, "max_image_seq_len", 4096),
+                getattr(self.pipe.scheduler.config, "base_shift", 0.5),
+                getattr(self.pipe.scheduler.config, "max_shift", 1.16),
+            )
+            sched_kwargs["mu"] = mu
+        self.pipe.scheduler.set_timesteps(self.cfg.num_steps, **sched_kwargs)
         return latents, {
             "prompt_embeds": prompt_embeds, "pooled": pooled,
             "text_ids": text_ids, "latent_image_ids": latent_image_ids,
