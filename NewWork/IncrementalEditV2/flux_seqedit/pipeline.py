@@ -115,6 +115,16 @@ class SequentialEditor:
         latents, latent_kwargs = self._prepare_latents(prompt, gen)
         timesteps = latent_kwargs["timesteps"]
 
+        # Evolving-mask strategy:
+        #   • Start BCG at FIRST Otsu fire (early background protection).
+        #   • Whenever a later step fires with fewer tokens, update the BCG mask.
+        #   • Commit the final tightest mask when the fire window closes (gap≥2).
+        #   • Hard-fallback only if Otsu NEVER fired (best_mask is None).
+        best_mask:     Optional[np.ndarray] = None   # tightest raw mask seen
+        best_tokens:   int = 10**9
+        bcg_mask:      Optional[np.ndarray] = None   # refined mask used for BCG
+        last_fired_step: int = -1
+
         for i, t in enumerate(timesteps):
             s.step_index = i
             phase = phase_for_step(i, cfg.num_steps, cfg.early_frac, cfg.late_frac)
@@ -123,31 +133,48 @@ class SequentialEditor:
             noise_pred = self._transformer_step(latents, t, latent_kwargs)
             latents = self._scheduler_step(noise_pred, t, latents, i)
 
-            # try to lock a mask once we're out of pure-noise phase
-            if locked_mask is None and phase in ("early", "mid"):
+            # Accumulate fired masks; update BCG mask whenever a tighter one arrives.
+            if locked_mask is None:
                 nrm = s.aggregate_norm()
                 if nrm is not None:
                     pmap = norm_vector_to_patch_map(nrm, self.ph, self.pw)
                     fired, mask, thr, var = otsu_gate(pmap, cfg.otsu_confidence)
                     if fired:
-                        locked_mask = refine_mask(mask)
+                        n_tok = int(mask.sum())
+                        if n_tok < best_tokens:
+                            best_mask   = mask
+                            best_tokens = n_tok
+                            bcg_mask    = refine_mask(mask)   # update BCG immediately
+                        last_fired_step = i
                 s.reset_collection()
 
-            # hard fallback: never localized by cutoff -> use soft prior
+            # Commit the tightest mask once the fire window has closed (2 consecutive
+            # non-firing steps). bcg_mask is already refined, reuse it.
+            if locked_mask is None and best_mask is not None:
+                if i - last_fired_step >= 2:
+                    locked_mask = bcg_mask
+
+            # Hard-fallback: Otsu never fired at all past the cutoff.
             if (locked_mask is None
+                    and best_mask is None
                     and i >= cfg.otsu_hard_cutoff_frac * cfg.num_steps):
                 locked_mask = soft_prior_fallback_mask(prior_soft)
+                bcg_mask    = locked_mask
 
-            # BCG: once mask is locked, preserve background from prev-edit latent.
-            # Lazily create a fixed noise tensor so the background trajectory is
-            # spatially coherent across all steps (same noise field, different sigma).
-            if locked_mask is not None and self._prev_latent is not None:
+            # BCG: blend from first fire onward (bcg_mask is set earlier than
+            # locked_mask, so background protection starts as soon as signal arrives).
+            active_mask = locked_mask if locked_mask is not None else bcg_mask
+            if active_mask is not None and self._prev_latent is not None:
                 if self._bcg_noise is None:
                     self._bcg_noise = torch.randn_like(self._prev_latent)
-                latents = self._bcg_blend(latents, locked_mask, phase, i)
+                latents = self._bcg_blend(latents, active_mask, phase, i)
 
         image = self._decode(latents)
 
+        # If the loop ended while Otsu was still firing (last step fired, so
+        # gap never reached 2), commit whatever best mask we accumulated.
+        if locked_mask is None and bcg_mask is not None:
+            locked_mask = bcg_mask
         if locked_mask is None:                            # ultimate safety
             locked_mask = soft_prior_fallback_mask(prior_soft)
 

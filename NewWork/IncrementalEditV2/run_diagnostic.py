@@ -154,11 +154,16 @@ def run_diagnostic_edit(editor, prompt, object_phrase, seed, out_dir):
     latents, latent_kwargs = editor._prepare_latents(prompt, gen)
     timesteps  = latent_kwargs["timesteps"]
 
-    locked_mask = None
-    records     = []
+    locked_mask:     Optional[np.ndarray] = None
+    best_mask:       Optional[np.ndarray] = None
+    best_tokens:     int = 10**9
+    bcg_mask:        Optional[np.ndarray] = None
+    last_fired_step: int = -1
+    records          = []
 
-    print(f"\n{'step':>4}  {'phase':>5}  {'var':>8}  {'fired':>5}  {'tokens':>6}  {'thr':>6}")
-    print("-" * 46)
+    print(f"\n{'step':>4}  {'phase':>5}  {'var':>8}  {'fired':>5}  "
+          f"{'tokens':>6}  {'thr':>6}  {'bcg':>5}")
+    print("-" * 56)
 
     for i, t in enumerate(timesteps):
         s.step_index = i
@@ -169,48 +174,75 @@ def run_diagnostic_edit(editor, prompt, object_phrase, seed, out_dir):
         latents    = editor._scheduler_step(noise_pred, t, latents, i)
 
         nrm = s.aggregate_norm()
+        fired_this_step = False
+        tokens_this_step = 0
         if nrm is not None:
             pmap = norm_vector_to_patch_map(nrm, editor.ph, editor.pw)
             fired, mask, thr, var = otsu_gate(pmap, cfg.otsu_confidence)
-            tokens = int(mask.sum()) if fired else 0
+            tokens_this_step = int(mask.sum()) if fired else 0
+            fired_this_step = fired
 
             rec = {
                 "step": i, "phase": phase, "fired": fired,
-                "var": var, "thr": thr, "mask_tokens": tokens,
+                "var": var, "thr": thr, "mask_tokens": tokens_this_step,
                 "norm_vec": nrm.cpu().numpy().copy(),
-                "mask": mask,
+                "mask": mask if fired else None,
             }
             records.append(rec)
 
-            fired_label = "YES" if fired else "no"
-            print(f"{i:>4}  {phase:>5}  {var:>8.5f}  {fired_label:>5}  "
-                  f"{tokens:>6}  {thr:>6.3f}")
+            if fired and locked_mask is None:
+                if tokens_this_step < best_tokens:
+                    best_mask   = mask
+                    best_tokens = tokens_this_step
+                    bcg_mask    = refine_mask(mask)
+                last_fired_step = i
 
             _save_step_png(nrm.cpu().numpy(), editor.ph, editor.pw,
-                           i, phase, (fired, mask, thr, var), out_dir)
-
-            if fired and locked_mask is None:
-                locked_mask = refine_mask(mask)
+                           i, phase, (fired, mask if fired else np.zeros_like(mask)
+                                       if mask is not None else
+                                       np.zeros((editor.ph, editor.pw), bool),
+                                      thr, var), out_dir)
+        else:
+            thr, var = 0.0, 0.0
 
         s.reset_collection()
 
-        if (locked_mask is None
+        # Commit when fire window closes.
+        if locked_mask is None and best_mask is not None:
+            if i - last_fired_step >= 2:
+                locked_mask = bcg_mask
+                print(f"[step {i:02d}] committed mask  tokens={best_tokens}")
+
+        # Hard-fallback only if Otsu never fired.
+        if (locked_mask is None and best_mask is None
                 and i >= cfg.otsu_hard_cutoff_frac * cfg.num_steps):
             locked_mask = soft_prior_fallback_mask(prior_soft)
+            bcg_mask = locked_mask
             print(f"[step {i:02d}] hard-fallback triggered")
 
-        if locked_mask is not None and editor._prev_latent is not None:
+        active_mask = locked_mask if locked_mask is not None else bcg_mask
+        bcg_active = active_mask is not None and editor._prev_latent is not None
+        if bcg_active:
             if editor._bcg_noise is None:
                 editor._bcg_noise = torch.randn_like(editor._prev_latent)
-            latents = editor._bcg_blend(latents, locked_mask, phase, i)
+            latents = editor._bcg_blend(latents, active_mask, phase, i)
 
-    print("-" * 46)
+        fired_label = "YES" if fired_this_step else "no"
+        bcg_label   = "ON" if bcg_active else "-"
+        print(f"{i:>4}  {phase:>5}  {var:>8.5f}  {fired_label:>5}  "
+              f"{tokens_this_step:>6}  {thr:>6.3f}  {bcg_label:>5}")
+
+    # End-of-loop commit if fire window never closed (last step still firing).
+    if locked_mask is None and bcg_mask is not None:
+        locked_mask = bcg_mask
+
+    print("-" * 56)
     if locked_mask is not None:
         pct = 100 * locked_mask.mean()
-        print(f"Locked mask: {locked_mask.sum()} / {locked_mask.size} tokens "
-              f"({pct:.1f}%)")
+        print(f"Committed mask: {locked_mask.sum()} / {locked_mask.size} tokens "
+              f"({pct:.1f}%)  [raw best: {best_tokens}]")
     else:
-        print("No mask locked (hard-fallback)")
+        print("No mask committed (hard-fallback or no signal)")
 
     image = editor._decode(latents)
 

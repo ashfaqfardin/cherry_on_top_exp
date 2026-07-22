@@ -69,19 +69,23 @@ def otsu_gate(score_map_2d: np.ndarray, confidence: float):
     return True, mask, thr, var
 
 
-def refine_mask(mask_bool: np.ndarray, sigma: float = 1.0,
+def refine_mask(mask_bool: np.ndarray, sigma: float = 0.5,
                 soft_hard_beta: float = 0.7, hard_thr: float = 0.5,
-                dilate_iter: int = 1) -> np.ndarray:
+                dilate_iter: int = 0) -> np.ndarray:
     """
-    Rough-mask cleanup (SpatialID-style): Gaussian smooth -> soft/hard blend ->
-    small morphological dilation. Returns a bool mask.
+    Rough-mask cleanup: Gaussian smooth -> soft/hard blend -> optional dilation.
 
-    The method tolerates rough masks, so this is deliberately light-touch — its
-    job is to remove speckle and close the object, not to segment precisely.
+    Defaults are deliberately conservative (sigma=0.5, no dilation): the Otsu
+    mask already covers the full object; aggressive expansion eats into background
+    and degrades BCG. Callers can pass dilate_iter=1 to restore one ring of dilation
+    if the object has hard-to-reach speckle interiors.
     """
     m = np.asarray(mask_bool, dtype=np.float64)
     soft = gaussian_filter(m, sigma=sigma)
-    soft = normalize01(soft)
+    # Clamp rather than normalize: keeps the threshold anchored to 0.5 of the
+    # blur output rather than the global [min,max] range. This prevents blurred
+    # edge-spillover from the background being pulled above the threshold.
+    soft = np.clip(soft, 0.0, 1.0)
     blended = soft_hard_beta * soft + (1.0 - soft_hard_beta) * (soft > hard_thr)
     out = blended > hard_thr
     if dilate_iter > 0:
