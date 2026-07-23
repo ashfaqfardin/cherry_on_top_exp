@@ -74,14 +74,15 @@ def main():
     img.save(os.path.join(args.out_dir, "generation.png"))
     print(f"  Captured {len(store)} tensors")
 
-    # --- Step 2: save cache ---
+    # --- Step 2: save cache (K and V only — Q is not needed for injection) ---
     print(f"\n[2] Saving K/V cache to {kv_dir}")
-    saved_keys = save_cache(store, kv_dir)
+    store_kv = {k: v for k, v in store.items() if k.endswith("_K") or k.endswith("_V")}
+    saved_keys = save_cache(store_kv, kv_dir)
     print(f"  Saved {len(saved_keys)} files")
 
     # Print a sample of the cache layout
-    rows = cache_summary(store)
-    kv_rows = [r for r in rows if r["key"].endswith("_K") or r["key"].endswith("_V")]
+    rows = cache_summary(store_kv)
+    kv_rows = rows   # store_kv already contains only K and V
     total_mb = sum(r["size_mb"] for r in kv_rows)
     print(f"\n  Cache layout (K/V only, first 6 entries):")
     print(f"  {'Key':30s}  {'Shape':30s}  {'MB':6s}")
@@ -97,8 +98,6 @@ def main():
 
     # --- Step 4: verify ---
     print(f"\n[4] Verifying numerical equality …")
-    # Filter original store to only K/V for comparison
-    store_kv = {k: v for k, v in store.items() if k.endswith("_K") or k.endswith("_V")}
     report = verify_cache(store_kv, store_reload)
 
     n_ok = sum(1 for r in report.values() if r.get("status") == "ok")

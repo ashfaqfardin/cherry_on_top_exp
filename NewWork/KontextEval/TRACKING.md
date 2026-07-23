@@ -6,7 +6,7 @@
 |-------|------|--------|--------|
 | 1 | Environment & Baseline | ✅ Done | `phase1_baseline.py` |
 | 2 | Architecture Inspection | ✅ Done | `phase2_architecture.py` |
-| 3 | Attention Hooking | ⬜ Pending | `phase3_hooking.py` |
+| 3 | Attention Hooking | ✅ Done | `phase3_hooking.py` |
 | 4 | Attention Cache | ⬜ Pending | `phase4_cache.py` |
 | 5 | Injection Prototype | ⬜ Pending | `phase5_injection.py` |
 | 6 | Layer Ablation | ⬜ Pending | `phase6_ablation.py` |
@@ -122,7 +122,7 @@ python NewWork/KontextEval/phase2_architecture.py \
 
 ## Phase 3 — Attention Hooking
 
-**Status:** ⬜ Pending
+**Status:** ✅ Done
 
 **Run:**
 ```bash
@@ -133,30 +133,32 @@ python NewWork/KontextEval/phase3_hooking.py \
 ```
 
 ### Checklist
-- [ ] CaptureProcessor attaches to all blocks without error
-- [ ] Output pixel-identical to baseline (same seed, same prompt)
-- [ ] Q, K, V shapes extracted and documented
-- [ ] Inference overhead measured
+- [x] CaptureProcessor attaches to all blocks without error
+- [x] Output pixel-identical to baseline (same seed, same prompt)
+- [x] Q, K, V shapes extracted and documented
+- [x] Inference overhead measured
 
 ### Results
 
-```
-# Paste terminal output here
-```
-
 | Metric | Value |
 |--------|-------|
-| Pixel-identical | — |
-| Time without hooks (s) | — |
-| Time with hooks (s) | — |
-| Overhead (%) | — |
-| Total tensors captured | — |
-| Total capture size (MB) | — |
-| `double_0_K` shape | — |
-| `double_0_V` shape | — |
-| `single_0_K` shape | — |
+| Pixel-identical | **YES ✓** |
+| Time without hooks (s) | 28.6s |
+| Time with hooks (s) | 209.8s |
+| Overhead (%) | +634.3% |
+| Total tensors captured | 171 (Q+K+V × 57 blocks) |
+| Total capture size (MB) | 9145 MB (~8.9 GB) |
+| `double_0_K` shape | (1, 24, 8704, 128) |
+| `double_0_V` shape | (1, 24, 8704, 128) |
+| `single_0_K` shape | (1, 24, 8704, 128) |
 
 ### Notes
+- **Actual seq len is 8704**, not 8448 predicted in Phase 2. Breakdown: 8192 img tokens (ref+gen) + **512** text tokens (T5 max = 512, not 256 as predicted)
+- Double and single-stream blocks have identical Q/K/V shapes — Kontext processes the full joint sequence in all 57 blocks
+- Overhead of 634% is expected: `detach().cpu()` on 9 GB per denoising step × 28 steps. For Phases 4–9, capture is only stored once (not per-step), so per-generation cost ≈ one copy of 9 GB instead of 28 copies
+- Two bugs fixed in `utils/attention_utils.py` during this phase:
+  1. `dh = out.shape[-1] // h` → unpacked `b, h, seq, dh = out.shape` before transpose
+  2. `attn.to_out[0]` on single-stream blocks → guarded with `hasattr(attn, "to_out")`
 
 ---
 
