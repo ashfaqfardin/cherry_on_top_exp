@@ -71,22 +71,37 @@ def main():
     )
     tr = pipe.transformer
 
+    # Collect block info first so we can derive dims from actual weights
+    # (tr.config is a FrozenDict — key names vary across diffusers versions)
+    double_infos = []
+    for i, block in enumerate(tr.transformer_blocks):
+        double_infos.append(inspect_attn_block(block, i, "double"))
+
+    single_infos = []
+    for i, block in enumerate(tr.single_transformer_blocks):
+        single_infos.append(inspect_attn_block(block, i, "single"))
+
+    hidden_dim = double_infos[0]["inner_dim"]
+    n_heads    = double_infos[0]["heads"]
+    head_dim   = hidden_dim // n_heads
+
+    cfg = tr.config   # FrozenDict — use .get() for optional keys
+    guidance_embeds = cfg.get("guidance_embeds", cfg.get("use_guidance_embeds", "N/A"))
+    in_channels     = cfg.get("in_channels", "N/A")
+
     print("\n" + "=" * 70)
     print("FLUX.1-Kontext-dev Transformer Architecture")
     print("=" * 70)
     print(f"Total parameters : {count_params(tr)/1e9:.2f}B")
     print(f"Double-stream    : {len(tr.transformer_blocks)} blocks")
     print(f"Single-stream    : {len(tr.single_transformer_blocks)} blocks")
-    print(f"Hidden dim       : {tr.config.hidden_size}")
-    print(f"Guidance embeds  : {tr.config.guidance_embeds}")
-    print(f"In channels      : {tr.config.in_channels}")
+    print(f"Hidden dim       : {hidden_dim}  ({n_heads} heads × {head_dim} head_dim)")
+    print(f"Guidance embeds  : {guidance_embeds}")
+    print(f"In channels      : {in_channels}")
 
     print("\n--- Double-stream blocks (dual self/cross attention) ---")
-    double_infos = []
-    for i, block in enumerate(tr.transformer_blocks):
-        info = inspect_attn_block(block, i, "double")
-        double_infos.append(info)
-        if i == 0 or i == len(tr.transformer_blocks) - 1:
+    for i, info in enumerate(double_infos):
+        if i == 0 or i == len(double_infos) - 1:
             print(f"\n  Block {i:2d}:")
             for k, v in info.items():
                 print(f"    {k:15s}: {v}")
@@ -94,24 +109,21 @@ def main():
     print("\n  (intermediate blocks identical to block 0)")
 
     print("\n--- Single-stream blocks (merged representation) ---")
-    single_infos = []
-    for i, block in enumerate(tr.single_transformer_blocks):
-        info = inspect_attn_block(block, i, "single")
-        single_infos.append(info)
-        if i == 0 or i == len(tr.single_transformer_blocks) - 1:
+    for i, info in enumerate(single_infos):
+        if i == 0 or i == len(single_infos) - 1:
             print(f"\n  Block {i:2d}:")
             for k, v in info.items():
                 print(f"    {k:15s}: {v}")
 
     # Compute expected tensor shapes at 1024×1024
     print("\n--- Expected tensor dimensions at 1024×1024 ---")
-    vae_sf  = pipe.vae_scale_factor
-    h_lat   = 1024 // vae_sf   # e.g. 128
-    w_lat   = 1024 // vae_sf
-    n_img   = (h_lat // 2) * (w_lat // 2)  # packed tokens per image
-    n_kontext = n_img * 2  # reference + generated
-    n_txt   = 256  # typical T5 context length in FLUX
-    seq_double = n_kontext + n_txt  # total in double-stream joint attention
+    vae_sf    = pipe.vae_scale_factor
+    h_lat     = 1024 // vae_sf
+    w_lat     = 1024 // vae_sf
+    n_img     = (h_lat // 2) * (w_lat // 2)
+    n_kontext = n_img * 2
+    n_txt     = 256
+    seq_double = n_kontext + n_txt
 
     print(f"  VAE scale factor     : {vae_sf}")
     print(f"  Latent spatial dim   : {h_lat}×{w_lat}")
@@ -121,26 +133,25 @@ def main():
     print(f"  Double-block seq len : ~{seq_double}")
     print(f"  Single-block seq len : ~{seq_double}")
 
-    # Typical K/V shape
-    h = double_infos[0]["heads"]
-    dh = double_infos[0]["inner_dim"] // h
-    print(f"\n  K/V shape (double) : [1, {h}, {seq_double}, {dh}]")
+    print(f"\n  K/V shape (double) : [1, {n_heads}, {seq_double}, {head_dim}]")
     print(f"                       = [batch, heads, seq, head_dim]")
-    print(f"  Bytes per K/V      : {1 * h * seq_double * dh * 2 / 1e6:.1f} MB (bfloat16)")
+    print(f"  Bytes per K/V      : {1 * n_heads * seq_double * head_dim * 2 / 1e6:.1f} MB (bfloat16)")
 
-    # Save a JSON summary
+    # Save JSON summary
     import json
     summary = {
         "n_double": len(tr.transformer_blocks),
         "n_single": len(tr.single_transformer_blocks),
-        "hidden_size": tr.config.hidden_size,
-        "heads": h,
-        "head_dim": dh,
+        "hidden_size": hidden_dim,
+        "heads": n_heads,
+        "head_dim": head_dim,
+        "guidance_embeds": str(guidance_embeds),
+        "in_channels": str(in_channels),
         "n_img_tokens": n_img,
         "n_kontext_tokens": n_kontext,
         "n_txt_tokens": n_txt,
         "seq_len_double": seq_double,
-        "kv_shape_double": [1, h, seq_double, dh],
+        "kv_shape_double": [1, n_heads, seq_double, head_dim],
         "double_blocks": double_infos,
         "single_blocks": single_infos,
     }
