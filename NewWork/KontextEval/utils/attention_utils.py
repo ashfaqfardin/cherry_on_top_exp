@@ -72,9 +72,8 @@ def _apply_rope_if_needed(Q, K, image_rotary_emb):
 
 def _out_project(attn, out, n_txt, encoder_hidden_states):
     """Split output, apply output projections, return (img_out, txt_out | None)."""
-    b = out.shape[0]
-    h = attn.heads
-    dh = out.shape[-1] // h
+    # out from SDPA: (b, h, seq, dh)  — unpack before transpose to get correct dims
+    b, h, seq, dh = out.shape
     out = out.transpose(1, 2).reshape(b, -1, h * dh)
 
     if encoder_hidden_states is not None:

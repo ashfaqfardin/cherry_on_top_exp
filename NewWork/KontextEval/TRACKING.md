@@ -4,8 +4,8 @@
 
 | Phase | Name | Status | Script |
 |-------|------|--------|--------|
-| 1 | Environment & Baseline | ⬜ Pending | `phase1_baseline.py` |
-| 2 | Architecture Inspection | ⬜ Pending | `phase2_architecture.py` |
+| 1 | Environment & Baseline | ✅ Done | `phase1_baseline.py` |
+| 2 | Architecture Inspection | ✅ Done | `phase2_architecture.py` |
 | 3 | Attention Hooking | ⬜ Pending | `phase3_hooking.py` |
 | 4 | Attention Cache | ⬜ Pending | `phase4_cache.py` |
 | 5 | Injection Prototype | ⬜ Pending | `phase5_injection.py` |
@@ -29,7 +29,7 @@ pip install -r NewWork/KontextEval/requirements.txt
 
 ## Phase 1 — Environment & Baseline
 
-**Status:** ⬜ Pending
+**Status:** ✅ Done
 
 **Run:**
 ```bash
@@ -40,34 +40,37 @@ python NewWork/KontextEval/phase1_baseline.py \
 ```
 
 ### Checklist
-- [ ] Google Colab A100 configured
-- [ ] FLUX.1-Kontext-dev loads without error
-- [ ] Baseline edits produce plausible output images
-- [ ] Deterministic generation verified (same seed → same pixels)
+- [x] Google Colab A100 configured
+- [x] FLUX.1-Kontext-dev loads without error
+- [x] Baseline edits produce plausible output images
+- [x] Deterministic generation verified (same seed → same pixels)
 
 ### Results
 
-```
-# Paste terminal output here
-```
+| Edit step | Action | Output file |
+|-----------|--------|-------------|
+| Step 0 | Empty grey scene (base) | `step0_empty_scene.png` |
+| Step 1 | Add wooden chair | `step1_add_wooden_chair.png` |
+| Step 2 | Replace → iron chair | `step2_replace_iron_chair.png` |
+| Step 3 | Change color → red | `step3_change_chair_color.png` |
+| Step 4 | Style → oil painting | `step4_style_change.png` |
 
-| Edit | Category | Deterministic | Hash (first 8) |
-|------|----------|---------------|----------------|
-| color_change | color_change | — | — |
-| object_addition | object_addition | — | — |
-| object_replacement | object_replacement | — | — |
-| style_change | style_change | — | — |
-
-**All deterministic:** —
+**Deterministic verification:**
+- Run 1 hash: `870c378de98ae7e7e57c3e3e37515f5f`
+- Run 2 hash: `870c378de98ae7e7e57c3e3e37515f5f`
+- **Result: ✅ Identical — same seed produces pixel-identical output**
 
 ### Notes
-_Observations, unexpected behaviour, GPU memory usage_
+- Model downloaded fresh (29.2 GB / ~1.5 min on Colab)
+- Height/width auto-adjusted from 768 → 1024 by the pipeline (model minimum)
+- Use `--size 1024` on future runs to avoid the adjustment warning
+- Chainwise editing confirmed: each step used the previous step's output as input
 
 ---
 
 ## Phase 2 — Architecture Inspection
 
-**Status:** ⬜ Pending
+**Status:** ✅ Done
 
 **Run:**
 ```bash
@@ -78,35 +81,42 @@ python NewWork/KontextEval/phase2_architecture.py \
 ```
 
 ### Checklist
-- [ ] Total parameter count documented
-- [ ] Double-stream block count confirmed
-- [ ] Single-stream block count confirmed
-- [ ] Q/K/V projection shapes recorded
-- [ ] Expected K/V tensor shape at 1024×1024 computed
-- [ ] `architecture_summary.json` saved
+- [x] Total parameter count documented
+- [x] Double-stream block count confirmed
+- [x] Single-stream block count confirmed
+- [x] Q/K/V projection shapes recorded
+- [x] Expected K/V tensor shape at 1024×1024 computed
+- [x] `architecture_summary.json` saved
 
 ### Results
 
-```
-# Paste terminal output here
-```
-
 | Property | Value |
 |----------|-------|
-| Total params (B) | — |
-| Double-stream blocks | — |
-| Single-stream blocks | — |
-| Hidden dim | — |
-| Attention heads | — |
-| Head dim | — |
-| Image tokens / image | — |
-| Kontext total img tokens | — |
-| Text tokens (T5) | — |
-| Joint seq len (double) | — |
-| K/V shape (double, example) | — |
-| K/V size MB (bfloat16, per block) | — |
+| Total params (B) | 11.90B |
+| Double-stream blocks | 19 |
+| Single-stream blocks | 38 |
+| Hidden dim | 3072 |
+| Attention heads | 24 |
+| Head dim | 128 |
+| Guidance embeds | True |
+| In channels | 64 |
+| VAE scale factor | 8 |
+| Latent spatial dim | 128×128 |
+| Image tokens / image | 4096 (64×64 packed) |
+| Kontext total img tokens | 8192 (ref + gen) |
+| Text tokens (T5) | ~256 |
+| Joint seq len (double) | ~8448 |
+| K/V shape (double, example) | [1, 24, 8448, 128] |
+| K/V size MB (bfloat16, per block) | 51.9 MB |
+
+**Q/K/V projection shapes (all blocks identical):**
+- Double: Q/K/V/Out each (3072, 3072), add_Q/K/V each (3072, 3072) for text stream
+- Single: Q/K/V each (3072, 3072), no separate `to_out` (fused at block level)
 
 ### Notes
+- All 19 double blocks and all 38 single blocks have identical weight shapes
+- Total K/V cache for one generation (all 57 blocks, K+V): 57 × 2 × 51.9 MB ≈ 5.9 GB
+- Single-stream `FluxAttention` has no `to_out` — output is fused with MLP at block level
 
 ---
 
