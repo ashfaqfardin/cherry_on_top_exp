@@ -85,9 +85,11 @@ def _out_project(attn, out, n_txt, encoder_hidden_states):
         txt_out = attn.to_add_out(txt_out)
         return img_out, txt_out
     else:
-        out = attn.to_out[0](out)
-        if len(attn.to_out) > 1:
-            out = attn.to_out[1](out)
+        # Single-stream FluxAttention has no to_out; the block applies projection itself.
+        if hasattr(attn, "to_out") and attn.to_out:
+            out = attn.to_out[0](out)
+            if len(attn.to_out) > 1:
+                out = attn.to_out[1](out)
         return out, None
 
 
