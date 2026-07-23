@@ -40,16 +40,19 @@ def parse_args():
 def inspect_attn_block(block, idx: int, block_type: str) -> dict:
     attn = block.attn
     d = {
-        "idx":        idx,
-        "type":       block_type,
-        "heads":      attn.heads,
-        "inner_dim":  attn.inner_dim,
-        "q_shape":    tuple(attn.to_q.weight.shape),
-        "k_shape":    tuple(attn.to_k.weight.shape),
-        "v_shape":    tuple(attn.to_v.weight.shape),
-        "out_shape":  tuple(attn.to_out[0].weight.shape),
+        "idx":       idx,
+        "type":      block_type,
+        "heads":     attn.heads,
+        "inner_dim": attn.inner_dim,
+        "q_shape":   tuple(attn.to_q.weight.shape),
+        "k_shape":   tuple(attn.to_k.weight.shape),
+        "v_shape":   tuple(attn.to_v.weight.shape),
     }
-    # Double-stream blocks have add_* projections for text
+    # Double-stream blocks have to_out on the attention module.
+    # Single-stream FluxAttention does not — output is fused at block level.
+    if hasattr(attn, "to_out") and attn.to_out:
+        d["out_shape"] = tuple(attn.to_out[0].weight.shape)
+    # Double-stream blocks have add_* projections for the text stream
     if hasattr(attn, "add_q_proj"):
         d["add_q_shape"] = tuple(attn.add_q_proj.weight.shape)
         d["add_k_shape"] = tuple(attn.add_k_proj.weight.shape)
