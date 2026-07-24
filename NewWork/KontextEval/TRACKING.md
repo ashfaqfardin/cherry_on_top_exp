@@ -7,7 +7,7 @@
 | 1 | Environment & Baseline | ✅ Done | `phase1_baseline.py` |
 | 2 | Architecture Inspection | ✅ Done | `phase2_architecture.py` |
 | 3 | Attention Hooking | ✅ Done | `phase3_hooking.py` |
-| 4 | Attention Cache | ⬜ Pending | `phase4_cache.py` |
+| 4 | Attention Cache | ✅ Done | `phase4_cache.py` |
 | 5 | Injection Prototype | ⬜ Pending | `phase5_injection.py` |
 | 6 | Layer Ablation | ⬜ Pending | `phase6_ablation.py` |
 | 7 | Incremental Pipeline | ⬜ Pending | `phase7_pipeline.py` |
@@ -164,7 +164,7 @@ python NewWork/KontextEval/phase3_hooking.py \
 
 ## Phase 4 — Attention Cache Construction
 
-**Status:** ⬜ Pending
+**Status:** ✅ Done
 
 **Run:**
 ```bash
@@ -176,35 +176,27 @@ python NewWork/KontextEval/phase4_cache.py \
 ```
 
 ### Checklist
-- [ ] K/V captured for all blocks
-- [ ] Cache saved to disk (one `.pt` file per tensor)
-- [ ] Cache reloaded successfully
-- [ ] Numerical equality verified (all keys pass)
+- [x] K/V captured for all blocks
+- [x] Cache saved to disk (one `.pt` file per tensor)
+- [x] Cache reloaded successfully
+- [x] Numerical equality verified (all keys pass)
 
 ### Results
 
-```
-# Paste terminal output here
-```
-
 | Property | Value |
 |----------|-------|
-| Tensors saved | — |
-| Verification passed | — |
-| Total cache size (MB) | — |
-| `block_0_K` shape | — |
-| `block_0_V` shape | — |
-
-**Sample cache layout:**
-
-| Key | Shape | MB |
-|-----|-------|----|
-| double_0_K | — | — |
-| double_0_V | — | — |
-| double_18_K | — | — |
-| single_0_K | — | — |
+| Tensors saved (K+V only) | 114 |
+| Tensors loaded | 114 |
+| Verification passed | **114 / 114** |
+| Total cache size (MB) | 6096 MB (~6 GB) |
+| `double_0_K` shape | (1, 24, 8704, 128) |
+| `double_0_V` shape | (1, 24, 8704, 128) |
+| dtype | torch.bfloat16 |
 
 ### Notes
+- Q tensors are captured in memory but NOT saved to disk (not needed for injection)
+- Fix applied: `save_cache` called with `store_kv` (K+V only filter) instead of full `store`
+- 6 GB cache fits on A100 with room to spare alongside the 33 GB model
 
 ---
 
