@@ -236,6 +236,35 @@ def region_diff(img_a: Image.Image, img_b: Image.Image,
     return float(diff[px_mask].mean()) if px_mask.any() else 0.0
 
 
+def reanchor_background(result: Image.Image, base: Image.Image,
+                        base_stable_mask: np.ndarray,
+                        h_lat: int, w_lat: int,
+                        alpha: float = 0.15) -> Image.Image:
+    """
+    In the base-stable region, blend the inject-pass result toward the
+    original base image to cancel compounding VAE drift.
+
+    At each edit step, Kontext introduces a small amount of background noise
+    even with K/V injection (injection is not 100% — s=0.3 means 70% of
+    background K/V still comes from the generation path). Over N steps this
+    compounds. Re-anchoring with alpha=0.15 pulls room pixels 15% back toward
+    the original high-quality base image after every inject pass.
+
+    alpha: fraction of BASE to blend in.  0.0 = no change.  1.0 = pure base.
+    Recommended range: 0.10–0.25. Higher = stronger correction but may
+    introduce a visible seam at object boundaries.
+    """
+    if alpha <= 0.0:
+        return result
+    H, W = result.size[1], result.size[0]
+    px_stable = _token_to_pixel(base_stable_mask, h_lat, w_lat, H, W)
+    res_arr  = np.array(result).astype(float)
+    base_arr = np.array(base).astype(float)
+    out = res_arr.copy()
+    out[px_stable] = (1.0 - alpha) * res_arr[px_stable] + alpha * base_arr[px_stable]
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
 # ============================================================
 # Generation helpers
 # ============================================================
@@ -320,6 +349,7 @@ def run_kv_multi_chain(
     strength: float, cutoff: float,
     vital_layers: List[int],
     threshold: float, out_dir: str,
+    bg_reanchor: float = 0.0,
     device: str = "cuda",
 ) -> Tuple[List[Image.Image], List[np.ndarray]]:
     """
@@ -409,6 +439,14 @@ def run_kv_multi_chain(
             strength=strength, cutoff=cutoff,
             vital_layers=vital_layers, device=device,
         )
+
+        if bg_reanchor > 0.0:
+            img_curr = reanchor_background(
+                img_curr, base, base_stable, h_lat, w_lat, alpha=bg_reanchor,
+            )
+            print(f"    bg_reanchor α={bg_reanchor:.2f} applied "
+                  f"({base_stable.mean()*100:.1f}% of tokens re-anchored to base)")
+
         img_curr.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_result.png"))
 
         imgs.append(img_curr)
@@ -541,7 +579,12 @@ def parse_args():
     p.add_argument("--guidance",    type=float, default=2.5)
     p.add_argument("--strength",    type=float, default=0.3,
                    help="K/V injection weight. Validated: s=0.3 best (10.56 bike_diff). "
-                        "Range [0.3, 0.7] barely matters; lower = less interference.")
+                        "Range [0.3, 0.7] barely matters; s=0.7 gives stronger background "
+                        "locking with minimal cost (10.77 bike_diff).")
+    p.add_argument("--bg_reanchor", type=float, default=0.15,
+                   help="After each inject pass, blend base-stable pixels toward the "
+                        "original base image by this fraction (0=off, 0.15=default). "
+                        "Prevents VAE-drift compounding across edit steps. Range: 0.10-0.25.")
     p.add_argument("--cutoff",      type=float, default=0.4,
                    help="Inject during first CUTOFF fraction of steps. "
                         "Validated: 0.4 slightly better than 0.6.")
@@ -576,7 +619,8 @@ def main():
     print(f"Edit sequence: {[e['name'] for e in edits]}")
     print(f"All steps: probe({args.probe_steps}) → inject  "
           f"s={args.strength}, cutoff={args.cutoff}, "
-          f"layers={'ALL_57' if args.all_layers else 'TIER_A'}")
+          f"layers={'ALL_57' if args.all_layers else 'TIER_A'}, "
+          f"bg_reanchor={args.bg_reanchor}")
 
     # ── Load model ──────────────────────────────────────────
     print("\nLoading FLUX.1-Kontext-dev …")
@@ -613,6 +657,7 @@ def main():
         strength=args.strength, cutoff=args.cutoff,
         vital_layers=vital_layers,
         threshold=args.threshold,
+        bg_reanchor=args.bg_reanchor,
         out_dir=args.out_dir, device=args.device,
     )
 
