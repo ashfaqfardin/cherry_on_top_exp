@@ -26,25 +26,27 @@ to appear anchors all prior content to img_{K-1}.
 No per-object mask management needed. background=~target is sufficient
 at every step from step 2 onward.
 
-Step 1 is always standard (no injection)
------------------------------------------
-At step 1 there is nothing to protect yet, so injection is unnecessary.
-More importantly: running a probe at 10-15 steps for a complex object
-(bicycle) doesn't produce a usable mask — the bicycle isn't formed
-clearly enough and the derived target_mask is noisy or too small.
-Injecting background K/V at the wrong locations suppresses the bicycle.
-Fix: always run step 1 as standard Kontext. Injection starts at step 2.
-
-Two-pass design for steps 2..N
----------------------------------
-  PROBE PASS (probe_steps, no injection):
+Two-pass design at every step
+------------------------------
+  PROBE PASS (no injection):
     Run standard Kontext to find the natural placement of the new object.
     Only needs to show WHERE the object lands, not high quality.
+    probe_steps_s1 (default 16) used for step 1 — bicycle needs more steps
+    than a vase or ball to form a usable shape.
+    probe_steps (default 15) used for steps 2+.
 
   INJECT PASS (num_steps, with injection):
     target_mask = pixel_to_token_mask(img_{K-1}, img_probe, threshold)
     background_mask = ~target_mask
     Re-run with K/V injection at background_mask.
+
+Why probe at 16 steps for step 1:
+  At 16/28 steps the bicycle's structure (frame, wheels, position) is
+  committed in the latent. Pixel diff vs base cleanly isolates the bicycle.
+  At 10 steps the shape is too noisy — target_mask is unreliable and
+  injection blocks the bicycle rather than protecting around it.
+  Injecting at step 1 also benefits the base scene: sofa/walls/floor
+  are anchored to the base reference while only the bicycle area is free.
 
 Validated defaults (from phase1_kv_chain.py sweep)
 ----------------------------------------------------
@@ -57,7 +59,7 @@ Validated defaults (from phase1_kv_chain.py sweep)
   earlier cutoff is slightly better        → use cutoff=0.4
   TIER_A (13 content layers) essential    → ALL_57 destroys composition
 
-Edit list (default: bicycle → vase → lamp)
+Edit list (default: bicycle → vase → ball)
 ------------------------------------------
 Configurable via EDITS list below or --config JSON.
 
@@ -148,10 +150,9 @@ EDITS: List[dict] = [
         ),
     },
     {
-        "name": "lamp",
+        "name": "ball",
         "prompt": (
-            "Add a tall floor lamp with a white shade in the right corner "
-            "of the room next to the sofa. "
+            "Add a yellow round ball in the right corner of the room next to the sofa. "
             "Keep the rest of the room exactly the same."
         ),
     },
@@ -314,7 +315,7 @@ def run_baseline_chain(pipe, base: Image.Image, edits: List[dict],
 def run_kv_multi_chain(
     pipe, base: Image.Image, edits: List[dict],
     h_lat: int, w_lat: int,
-    seed: int, num_steps: int, probe_steps: int,
+    seed: int, num_steps: int, probe_steps: int, probe_steps_s1: int,
     guidance: float, height: int, width: int,
     strength: float, cutoff: float,
     vital_layers: List[int],
@@ -322,74 +323,58 @@ def run_kv_multi_chain(
     device: str = "cuda",
 ) -> Tuple[List[Image.Image], List[np.ndarray]]:
     """
-    N-step chain with background=~target injection at steps 2..N.
+    N-step chain with background=~target probe→inject at every step.
 
-    Step 1 always runs as standard Kontext (no injection):
-      - nothing to protect yet at step 1
-      - a probe at probe_steps is too few steps for complex objects (bicycle)
-        to form a usable target mask; the resulting injection suppresses
-        the object instead of protecting surrounding content
-
-    Steps 2..N: probe then inject.
-      - probe (probe_steps, no injection): reveals natural placement
-      - inject (num_steps, with injection at background=~target)
+    Step 1 uses probe_steps_s1 (default 16) — complex objects like a bicycle
+    need ~16/28 steps to commit their global structure into the latent.
+    Steps 2+ use probe_steps (default 15) — simpler objects form faster.
 
     Returns
     -------
-    imgs      : [base, img_1, ..., img_N]       length = N+1
+    imgs      : [base, img_1, ..., img_N]            length = N+1
     obj_masks : [target_1, target_2, ..., target_N]  length = N
-                target_K marks where object K was placed (from probe or step-1 diff)
     """
     imgs, obj_masks = [base], []
 
     for i, edit in enumerate(edits):
-        name     = edit["name"]
-        prompt   = edit["prompt"]
-        img_prev = imgs[-1]
+        name      = edit["name"]
+        prompt    = edit["prompt"]
+        img_prev  = imgs[-1]
+        n_probe   = probe_steps_s1 if i == 0 else probe_steps
 
         print(f"\n  [step {i+1}/{len(edits)}] {name}")
 
-        if i == 0:
-            # ── Step 1: standard pass, no injection ──
-            print(f"    standard pass ({num_steps} steps) — step 1 never injects")
-            img_curr = run_standard(pipe, img_prev, prompt,
-                                    seed, num_steps, guidance, height, width)
-            img_curr.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_result.png"))
+        # ── Probe pass ──
+        print(f"    probe ({n_probe} steps) …")
+        img_probe = run_standard(pipe, img_prev, prompt,
+                                 seed, n_probe, guidance, height, width)
+        img_probe.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_probe.png"))
 
-            # Compute mask from diff for metrics (not used for injection here)
-            target_mask = pixel_to_token_mask(img_prev, img_curr,
-                                              h_lat, w_lat, threshold)
-        else:
-            # ── Steps 2+: probe → inject ──
-            print(f"    probe ({probe_steps} steps) …")
-            img_probe = run_standard(pipe, img_prev, prompt,
-                                     seed, probe_steps, guidance, height, width)
-            img_probe.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_probe.png"))
+        target_mask = pixel_to_token_mask(img_prev, img_probe,
+                                          h_lat, w_lat, threshold)
+        pct_tgt = target_mask.mean() * 100
+        print(f"    target region: {pct_tgt:.1f}% of tokens  "
+              f"(threshold={threshold})")
 
-            target_mask = pixel_to_token_mask(img_prev, img_probe,
-                                              h_lat, w_lat, threshold)
-            pct_tgt = target_mask.mean() * 100
-            print(f"    target region: {pct_tgt:.1f}% of tokens  "
-                  f"(threshold={threshold})")
+        # Target = new object (blue), Background = everything else (orange)
+        color_overlay(img_prev, target_mask, h_lat, w_lat,
+                      color=(0, 160, 255), alpha=0.45).save(
+            os.path.join(out_dir, f"kv_step{i+1}_{name}_target.png"))
+        color_overlay(img_prev, np.logical_not(target_mask),
+                      h_lat, w_lat, color=(255, 140, 0), alpha=0.25).save(
+            os.path.join(out_dir, f"kv_step{i+1}_{name}_background.png"))
 
-            # Target = new object (blue), Background = everything else (orange)
-            color_overlay(img_prev, target_mask, h_lat, w_lat,
-                          color=(0, 160, 255), alpha=0.45).save(
-                os.path.join(out_dir, f"kv_step{i+1}_{name}_target.png"))
-            color_overlay(img_prev, np.logical_not(target_mask),
-                          h_lat, w_lat, color=(255, 140, 0), alpha=0.25).save(
-                os.path.join(out_dir, f"kv_step{i+1}_{name}_background.png"))
-
-            background_mask = np.logical_not(target_mask)
-            print(f"    inject ({num_steps} steps, s={strength}, cutoff={cutoff}) …")
-            img_curr = run_injected(
-                pipe, img_prev, prompt, background_mask,
-                seed=seed, num_steps=num_steps,
-                guidance=guidance, height=height, width=width,
-                strength=strength, cutoff=cutoff,
-                vital_layers=vital_layers, device=device,
-            )
-            img_curr.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_result.png"))
+        # ── Inject pass ──
+        background_mask = np.logical_not(target_mask)
+        print(f"    inject ({num_steps} steps, s={strength}, cutoff={cutoff}) …")
+        img_curr = run_injected(
+            pipe, img_prev, prompt, background_mask,
+            seed=seed, num_steps=num_steps,
+            guidance=guidance, height=height, width=width,
+            strength=strength, cutoff=cutoff,
+            vital_layers=vital_layers, device=device,
+        )
+        img_curr.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_result.png"))
 
         obj_masks.append(target_mask)
         imgs.append(img_curr)
@@ -502,9 +487,11 @@ def parse_args():
                    help="JSON file list of {name, prompt}. Overrides built-in EDITS.")
     p.add_argument("--seed",        type=int,   default=42)
     p.add_argument("--num_steps",   type=int,   default=28)
-    p.add_argument("--probe_steps", type=int,   default=15,
-                   help="Steps for the probe pass at steps 2+. "
-                        "15 is enough to reveal placement of simple objects.")
+    p.add_argument("--probe_steps_s1", type=int, default=16,
+                   help="Probe steps for step 1 (bicycle / complex object). "
+                        "16/28 steps commits the global structure into the latent.")
+    p.add_argument("--probe_steps",    type=int, default=15,
+                   help="Probe steps for steps 2+ (simpler objects like vase/ball).")
     p.add_argument("--guidance",    type=float, default=2.5)
     p.add_argument("--strength",    type=float, default=0.3,
                    help="K/V injection weight. Validated: s=0.3 best (10.56 bike_diff). "
@@ -541,7 +528,8 @@ def main():
     vital_layers = ALL_LAYERS if args.all_layers else TIER_A_LAYERS
 
     print(f"Edit sequence: {[e['name'] for e in edits]}")
-    print(f"Step 1: always standard (no injection)")
+    print(f"Step 1: probe({args.probe_steps_s1}) → inject  "
+          f"[longer probe for complex objects]")
     print(f"Steps 2+: probe({args.probe_steps}) → inject  "
           f"s={args.strength}, cutoff={args.cutoff}, "
           f"layers={'ALL_57' if args.all_layers else 'TIER_A'}")
@@ -575,7 +563,8 @@ def main():
     kv_imgs, obj_masks = run_kv_multi_chain(
         pipe, base, edits,
         h_lat=h_lat, w_lat=w_lat,
-        seed=args.seed, num_steps=args.num_steps, probe_steps=args.probe_steps,
+        seed=args.seed, num_steps=args.num_steps,
+        probe_steps=args.probe_steps, probe_steps_s1=args.probe_steps_s1,
         guidance=args.guidance, height=args.height, width=args.width,
         strength=args.strength, cutoff=args.cutoff,
         vital_layers=vital_layers,
