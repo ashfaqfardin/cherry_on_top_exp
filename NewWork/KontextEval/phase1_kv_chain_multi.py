@@ -11,75 +11,83 @@ prompt draws its attention elsewhere.
 The compound invariant that fixes it
 -------------------------------------
 At step K, the reference IS img_{K-1}, which already contains every object
-added so far. If we inject ref K/V into every token EXCEPT where object K
-needs to appear, all prior content (every object + the base scene) is
-automatically anchored to img_{K-1}.
+added so far. Injecting ref K/V into every token EXCEPT where object K needs
+to appear anchors all prior content to img_{K-1}.
 
   background_mask = ~target_mask_K
 
   reference = img_{K-1}  →  carries full edit history
   injection at background_mask  →  protects everything that existed before K
 
-This means:
   step 2 reference = img_1  → protects object 1
   step 3 reference = img_2  → protects objects 1 AND 2
   step K reference = img_{K-1}  → protects objects 1..K-1
 
-No per-object mask management is needed. The background = ~target rule is
-sufficient at every step.
+No per-object mask management needed. background=~target is sufficient
+at every step from step 2 onward.
 
-Two-pass design per step
-------------------------
-We can't know the target_mask BEFORE running inference (we don't know exactly
-where Kontext will place the new object). So each step runs twice:
+Step 1 is always standard (no injection)
+-----------------------------------------
+At step 1 there is nothing to protect yet, so injection is unnecessary.
+More importantly: running a probe at 10-15 steps for a complex object
+(bicycle) doesn't produce a usable mask — the bicycle isn't formed
+clearly enough and the derived target_mask is noisy or too small.
+Injecting background K/V at the wrong locations suppresses the bicycle.
+Fix: always run step 1 as standard Kontext. Injection starts at step 2.
 
-  PROBE PASS (args.probe_steps, no injection):
-    Run standard Kontext to find the natural object placement.
-    fast — only needs to show WHERE the object lands.
+Two-pass design for steps 2..N
+---------------------------------
+  PROBE PASS (probe_steps, no injection):
+    Run standard Kontext to find the natural placement of the new object.
+    Only needs to show WHERE the object lands, not high quality.
 
-  INJECT PASS (args.num_steps, with injection):
+  INJECT PASS (num_steps, with injection):
     target_mask = pixel_to_token_mask(img_{K-1}, img_probe, threshold)
     background_mask = ~target_mask
     Re-run with K/V injection at background_mask.
-    The probe's placement is an APPROXIMATION; the inject pass may shift
-    the object slightly. That is fine — the mask just needs to free the
-    right general area.
 
-Step 1 also benefits from this pattern: the reference is the base scene,
-so injecting base K/V into non-bicycle tokens keeps the room stable while
-only the bicycle region generates freely from the prompt.
+Validated defaults (from phase1_kv_chain.py sweep)
+----------------------------------------------------
+  baseline bike_diff:              48.31  (no injection)
+  TIER_A s=0.3 cut=0.4:            10.56  ← best (78% improvement)
+  TIER_A s=0.7 cut=0.6:            10.77  (barely worse)
+  ALL_57  s=0.7 cut=0.6:           58.80  ← WORSE than baseline
 
-Edit list (default: bicycle → vase)
---------------------------------------
-Configurable via EDITS at the top of the file or --config JSON.
-Add or remove objects freely — the pipeline handles N steps identically.
+  strength is not sensitive in [0.3, 0.7] → use s=0.3 (less interference)
+  earlier cutoff is slightly better        → use cutoff=0.4
+  TIER_A (13 content layers) essential    → ALL_57 destroys composition
+
+Edit list (default: bicycle → vase → lamp)
+------------------------------------------
+Configurable via EDITS list below or --config JSON.
 
 Metrics
 -------
   stability[K]: mean abs pixel diff in object K's region between
     - step K output  (when object K was first added)
-    - FINAL output   (img_N)
-  Lower = object K is better preserved across all subsequent edits.
+    - FINAL output   (img_N, after all subsequent edits)
+  Lower = object K better preserved.
 
-  Reported for both baseline (no injection) and kv_multi chain.
+  background_stability: same diff in the base-scene region
+    (complement of all object masks) between base and FINAL.
+  Lower = original room better preserved.
 
-Validated defaults (from phase1_kv_chain.py sweep on bicycle+vase scene)
-------------------------------------------------------------------------
-  baseline bike_diff:          48.31  (no injection)
-  TIER_A s=0.3 cut=0.4:        10.56  ← best  (78% improvement)
-  TIER_A s=0.7 cut=0.6:        10.77  (also fine, barely worse)
-  ALL_57  s=0.7 cut=0.6:       58.80  ← WORSE than baseline (destroys composition)
+  improvement%: (baseline_diff - kv_diff) / baseline_diff * 100
+  Reported for background + every object.
 
-  Takeaways:
-  - strength is not sensitive in [0.3, 0.7]; use s=0.3 (less interference)
-  - earlier cutoff is slightly better; use cutoff=0.4
-  - TIER_A (13 content layers) is essential; ALL_57 injects positional
-    layers which confuse the denoising and worsen preservation
+Outputs
+-------
+  step0_base.png                     base scene
+  baseline_step{K}_{name}.png        baseline chain intermediate
+  kv_step{K}_{name}_probe.png        probe pass (steps 2+)
+  kv_step{K}_{name}_target.png       target region overlay (blue)
+  kv_step{K}_{name}_background.png   background region overlay (orange)
+  kv_step{K}_{name}_result.png       injected result
 
-Comparison
-----------
-  baseline:  standard Kontext chain, no injection
-  kv_multi:  probe-then-inject at every step with background=~target
+  KEY_RESULT_chain.png               2 rows (baseline/kv) × N+1 cols (step grid)
+  KEY_RESULT_stability.png           per-object diff panels with improvement%
+  KEY_RESULT_final.png               baseline final vs kv final
+  stability.txt                      numeric table
 
 Usage
 -----
@@ -88,15 +96,9 @@ python NewWork/KontextEval/phase1_kv_chain_multi.py \\
     --cache_dir ./models \\
     --out_dir results/phase1_kv_chain_multi
 
-Add a third object:
+Add / remove objects:
     edit EDITS list below, or pass --config my_edits.json
-
-  my_edits.json format:
-  [
-    {"name": "bicycle", "prompt": "Add a yellow bicycle leaning against the wall."},
-    {"name": "vase",    "prompt": "Add a white ceramic vase on the coffee table."},
-    {"name": "lamp",    "prompt": "Add a floor lamp next to the sofa."}
-  ]
+    JSON format: [{"name": "bicycle", "prompt": "..."}, ...]
 """
 
 from __future__ import annotations
@@ -145,26 +147,29 @@ EDITS: List[dict] = [
             "Keep the rest of the room exactly the same."
         ),
     },
+    {
+        "name": "lamp",
+        "prompt": (
+            "Add a tall floor lamp with a white shade in the right corner "
+            "of the room next to the sofa. "
+            "Keep the rest of the room exactly the same."
+        ),
+    },
 ]
 
-BASE_PROMPT = "A modern living room with a sofa and a wooden coffee table."
-
+BASE_PROMPT   = "A modern living room with a sofa and a wooden coffee table."
 TIER_A_LAYERS = list(TIER_A)
-ALL_LAYERS     = list(TIER_ALL)
+ALL_LAYERS    = list(TIER_ALL)
 
 
 # ============================================================
-# Mask utilities
+# Mask / image utilities
 # ============================================================
 
 def pixel_to_token_mask(img_a: Image.Image, img_b: Image.Image,
                         h_lat: int, w_lat: int,
                         threshold: float = 40.0) -> np.ndarray:
-    """
-    Flat bool (n_gen=h_lat*w_lat,) — True where |img_b - img_a| > threshold.
-    Pixel diff is computed in image space then downsampled to the latent
-    token grid (one token = 16×16 image pixels for FLUX Kontext).
-    """
+    """Flat bool (n_gen,) — True where |img_b − img_a| > threshold."""
     a = np.array(img_a).astype(np.float32)
     b = np.array(img_b).astype(np.float32)
     diff = np.abs(b - a).mean(axis=2)
@@ -173,30 +178,60 @@ def pixel_to_token_mask(img_a: Image.Image, img_b: Image.Image,
     return (np.array(diff_down).astype(np.float32) >= threshold).reshape(-1)
 
 
-def overlay(img: Image.Image, flat_mask: np.ndarray,
-            h_lat: int, w_lat: int,
-            color=(255, 120, 0), alpha=0.4) -> Image.Image:
-    """Orange tint where mask==True (bilinear up from token grid)."""
-    H, W = img.size[1], img.size[0]
+def _token_to_pixel(flat_mask: np.ndarray, h_lat: int, w_lat: int,
+                    H: int, W: int) -> np.ndarray:
+    """Upscale flat token mask to full-image boolean mask."""
     token_2d = flat_mask.reshape(h_lat, w_lat).astype(np.uint8) * 255
-    pixel_mask = np.array(
+    return np.array(
         Image.fromarray(token_2d, "L").resize((W, H), Image.NEAREST)
     ) > 127
+
+
+def color_overlay(img: Image.Image, flat_mask: np.ndarray,
+                  h_lat: int, w_lat: int,
+                  color=(255, 120, 0), alpha=0.4) -> Image.Image:
+    """Tinted overlay where mask==True."""
+    H, W = img.size[1], img.size[0]
+    px = _token_to_pixel(flat_mask, h_lat, w_lat, H, W)
     arr = np.array(img).astype(float)
     out = arr.copy()
-    out[pixel_mask] = arr[pixel_mask] * (1 - alpha) + np.array(color) * alpha
+    out[px] = arr[px] * (1 - alpha) + np.array(color) * alpha
     return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
+def diff_heatmap(img_a: Image.Image, img_b: Image.Image,
+                 flat_mask: np.ndarray, h_lat: int, w_lat: int,
+                 amplify: float = 5.0) -> Image.Image:
+    """
+    Red-channel diff heatmap in the masked region.
+    High diff → bright red. Outside the mask → faded grayscale original.
+    """
+    H, W = img_a.size[1], img_a.size[0]
+    px_mask = _token_to_pixel(flat_mask, h_lat, w_lat, H, W)
+    a = np.array(img_a).astype(float)
+    b = np.array(img_b).astype(float)
+    diff = np.abs(b - a).mean(axis=2)
+    diff_amp = (diff * amplify).clip(0, 255).astype(np.uint8)
+    # Red where inside mask
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    rgb[:, :, 0] = diff_amp
+    # Faded grayscale where outside mask
+    gray = (a.mean(axis=2) * 0.25).clip(0, 255).astype(np.uint8)
+    outside = ~px_mask
+    rgb[outside, 0] = gray[outside]
+    rgb[outside, 1] = gray[outside]
+    rgb[outside, 2] = gray[outside]
+    return Image.fromarray(rgb)
 
 
 def region_diff(img_a: Image.Image, img_b: Image.Image,
                 flat_mask: np.ndarray, h_lat: int, w_lat: int) -> float:
-    """Mean absolute pixel diff (0–255) in the masked region."""
+    """Mean absolute pixel diff (0–255) inside the masked region."""
     H, W = img_a.size[1], img_a.size[0]
-    token_2d = flat_mask.reshape(h_lat, w_lat).astype(np.uint8) * 255
-    px_mask = np.array(
-        Image.fromarray(token_2d, "L").resize((W, H), Image.NEAREST)
-    ) > 127
-    diff = np.abs(np.array(img_a).astype(float) - np.array(img_b).astype(float)).mean(axis=2)
+    px_mask = _token_to_pixel(flat_mask, h_lat, w_lat, H, W)
+    diff = np.abs(
+        np.array(img_a).astype(float) - np.array(img_b).astype(float)
+    ).mean(axis=2)
     return float(diff[px_mask].mean()) if px_mask.any() else 0.0
 
 
@@ -226,26 +261,17 @@ def run_injected(pipe, canvas: Image.Image, prompt: str,
                  device: str = "cuda") -> Image.Image:
     """
     Kontext denoising with K/V injection at background_mask tokens.
-
-    background_mask (flat bool, n_gen): tokens where the scene already
-      exists and must be preserved.  ~background_mask = target region where
-      the new object can generate freely.
-
-    At TIER_A layers during the first `cutoff` fraction of steps:
-      K_gen[background] ← (1-s)*K_gen + s*K_ref   (from same-call ref slice)
-      V_gen[background] ← (1-s)*V_gen + s*V_ref
+    background_mask: everything that already exists and must be preserved.
+    ~background_mask: where the new object generates freely.
     """
-    h_lat  = height // 16
-    w_lat  = width  // 16
-    n_gen  = h_lat * w_lat
-
-    target_mask = np.logical_not(background_mask)
+    h_lat = height // 16
+    w_lat = width  // 16
+    n_gen = h_lat * w_lat
 
     state = InjectionState(
         mode="edit",
         vital_layers=set(vital_layers),
-        n_gen=n_gen,
-        n_ref=n_gen,
+        n_gen=n_gen, n_ref=n_gen,
         cutoff_frac=(0.0, cutoff),
         strength=strength,
         n_steps=num_steps,
@@ -253,14 +279,13 @@ def run_injected(pipe, canvas: Image.Image, prompt: str,
     state.zones = ZoneMasks(
         background=background_mask.astype(bool),
         shell=np.zeros(n_gen, dtype=bool),
-        target=target_mask.astype(bool),
+        target=np.logical_not(background_mask).astype(bool),
     ).to_device(device)
 
     install_processor(pipe, state, max_sequence_length=max_seq_len)
     generator = set_determinism(seed)
     result = pipe(
-        image=canvas,
-        prompt=prompt,
+        image=canvas, prompt=prompt,
         num_inference_steps=num_steps,
         guidance_scale=guidance,
         height=height, width=width,
@@ -281,91 +306,109 @@ def run_baseline_chain(pipe, base: Image.Image, edits: List[dict],
     """Standard Kontext chain — no injection at any step."""
     imgs = [base]
     for edit in edits:
-        img = run_standard(pipe, imgs[-1], edit["prompt"],
-                           seed, num_steps, guidance, height, width)
-        imgs.append(img)
+        imgs.append(run_standard(pipe, imgs[-1], edit["prompt"],
+                                 seed, num_steps, guidance, height, width))
     return imgs
 
 
-def run_kv_multi_chain(pipe, base: Image.Image, edits: List[dict],
-                       h_lat: int, w_lat: int,
-                       seed: int, num_steps: int, probe_steps: int,
-                       guidance: float, height: int, width: int,
-                       strength: float, cutoff: float,
-                       vital_layers: List[int],
-                       threshold: float, out_dir: str,
-                       device: str = "cuda") -> Tuple[List[Image.Image], List[np.ndarray]]:
+def run_kv_multi_chain(
+    pipe, base: Image.Image, edits: List[dict],
+    h_lat: int, w_lat: int,
+    seed: int, num_steps: int, probe_steps: int,
+    guidance: float, height: int, width: int,
+    strength: float, cutoff: float,
+    vital_layers: List[int],
+    threshold: float, out_dir: str,
+    device: str = "cuda",
+) -> Tuple[List[Image.Image], List[np.ndarray]]:
     """
-    N-step chain with background=~target K/V injection at every step.
+    N-step chain with background=~target injection at steps 2..N.
+
+    Step 1 always runs as standard Kontext (no injection):
+      - nothing to protect yet at step 1
+      - a probe at probe_steps is too few steps for complex objects (bicycle)
+        to form a usable target mask; the resulting injection suppresses
+        the object instead of protecting surrounding content
+
+    Steps 2..N: probe then inject.
+      - probe (probe_steps, no injection): reveals natural placement
+      - inject (num_steps, with injection at background=~target)
 
     Returns
     -------
-    imgs      : [base, img_1, img_2, ...] length = len(edits)+1
-    obj_masks : [target_mask_1, target_mask_2, ...] length = len(edits)
-                Each mask marks the region where object K was placed.
+    imgs      : [base, img_1, ..., img_N]       length = N+1
+    obj_masks : [target_1, target_2, ..., target_N]  length = N
+                target_K marks where object K was placed (from probe or step-1 diff)
     """
-    imgs       = [base]
-    obj_masks  = []
+    imgs, obj_masks = [base], []
 
     for i, edit in enumerate(edits):
         name     = edit["name"]
         prompt   = edit["prompt"]
         img_prev = imgs[-1]
 
-        print(f"\n  [step {i+1}] {name}")
+        print(f"\n  [step {i+1}/{len(edits)}] {name}")
 
-        # --- Probe: find natural placement of the new object ---
-        print(f"    probe ({probe_steps} steps) …")
-        img_probe = run_standard(pipe, img_prev, prompt,
-                                 seed, probe_steps, guidance, height, width)
-        img_probe.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_probe.png"))
+        if i == 0:
+            # ── Step 1: standard pass, no injection ──
+            print(f"    standard pass ({num_steps} steps) — step 1 never injects")
+            img_curr = run_standard(pipe, img_prev, prompt,
+                                    seed, num_steps, guidance, height, width)
+            img_curr.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_result.png"))
 
-        # Target mask = tokens where the probe differs from the previous image
-        target_mask = pixel_to_token_mask(img_prev, img_probe, h_lat, w_lat, threshold)
+            # Compute mask from diff for metrics (not used for injection here)
+            target_mask = pixel_to_token_mask(img_prev, img_curr,
+                                              h_lat, w_lat, threshold)
+        else:
+            # ── Steps 2+: probe → inject ──
+            print(f"    probe ({probe_steps} steps) …")
+            img_probe = run_standard(pipe, img_prev, prompt,
+                                     seed, probe_steps, guidance, height, width)
+            img_probe.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_probe.png"))
+
+            target_mask = pixel_to_token_mask(img_prev, img_probe,
+                                              h_lat, w_lat, threshold)
+            pct_tgt = target_mask.mean() * 100
+            print(f"    target region: {pct_tgt:.1f}% of tokens  "
+                  f"(threshold={threshold})")
+
+            # Target = new object (blue), Background = everything else (orange)
+            color_overlay(img_prev, target_mask, h_lat, w_lat,
+                          color=(0, 160, 255), alpha=0.45).save(
+                os.path.join(out_dir, f"kv_step{i+1}_{name}_target.png"))
+            color_overlay(img_prev, np.logical_not(target_mask),
+                          h_lat, w_lat, color=(255, 140, 0), alpha=0.25).save(
+                os.path.join(out_dir, f"kv_step{i+1}_{name}_background.png"))
+
+            background_mask = np.logical_not(target_mask)
+            print(f"    inject ({num_steps} steps, s={strength}, cutoff={cutoff}) …")
+            img_curr = run_injected(
+                pipe, img_prev, prompt, background_mask,
+                seed=seed, num_steps=num_steps,
+                guidance=guidance, height=height, width=width,
+                strength=strength, cutoff=cutoff,
+                vital_layers=vital_layers, device=device,
+            )
+            img_curr.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_result.png"))
+
         obj_masks.append(target_mask)
-
-        pct_target = target_mask.mean() * 100
-        print(f"    target region: {pct_target:.1f}% of tokens  "
-              f"(threshold={threshold})")
-
-        # Save target overlay on the previous image so user can verify
-        overlay(img_prev, target_mask, h_lat, w_lat,
-                color=(0, 160, 255), alpha=0.45).save(
-            os.path.join(out_dir, f"kv_step{i+1}_{name}_target_overlay.png")
-        )
-        # Background overlay
-        bg_mask = np.logical_not(target_mask)
-        overlay(img_prev, bg_mask, h_lat, w_lat,
-                color=(255, 140, 0), alpha=0.25).save(
-            os.path.join(out_dir, f"kv_step{i+1}_{name}_background_overlay.png")
-        )
-
-        # --- Inject pass: protect everything except the target region ---
-        print(f"    inject ({num_steps} steps, s={strength}, cutoff={cutoff}) …")
-        background_mask = np.logical_not(target_mask)
-        img_curr = run_injected(
-            pipe, img_prev, prompt, background_mask,
-            seed=seed, num_steps=num_steps,
-            guidance=guidance, height=height, width=width,
-            strength=strength, cutoff=cutoff,
-            vital_layers=vital_layers, device=device,
-        )
-        img_curr.save(os.path.join(out_dir, f"kv_step{i+1}_{name}_result.png"))
-
         imgs.append(img_curr)
 
     return imgs, obj_masks
 
 
 # ============================================================
-# Grid / comparison helpers
+# Visualisation
 # ============================================================
 
-def save_grid(images, titles, path, ncols=None):
+def save_grid(images, titles, path, ncols=None, figsize_per_cell=(5, 5)):
     n = len(images)
     ncols = ncols or n
     nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows))
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(figsize_per_cell[0] * ncols, figsize_per_cell[1] * nrows),
+    )
     axes_flat = [axes] if n == 1 else list(np.array(axes).flat)
     for ax, img, t in zip(axes_flat, images, titles):
         ax.imshow(img); ax.axis("off"); ax.set_title(t, fontsize=8)
@@ -376,40 +419,106 @@ def save_grid(images, titles, path, ncols=None):
     plt.close(fig)
 
 
+def build_stability_grid(
+    base: Image.Image,
+    baseline_imgs: List[Image.Image],
+    kv_imgs: List[Image.Image],
+    edits: List[dict],
+    obj_masks: List[np.ndarray],
+    h_lat: int, w_lat: int,
+    out_dir: str,
+    strength: float, cutoff: float,
+):
+    """
+    Per-object (+ background) stability comparison.
+
+    For each region (background + N objects):
+      Row A (baseline): [when-added | final | diff heatmap]
+      Row B (kv_multi): [when-added | final | diff heatmap]
+      Title shows raw diff values and improvement%.
+
+    Also returns the improvement_pct dict for the summary table.
+    """
+    n = len(edits)
+
+    # Background mask: complement of union of all object masks
+    all_obj_union = np.zeros(obj_masks[0].shape, dtype=bool)
+    for m in obj_masks:
+        all_obj_union |= m
+    bg_mask = ~all_obj_union
+
+    # Build regions list: (name, ref_a_baseline, ref_a_kv, mask)
+    # ref_a = the "when added" image for this region
+    regions = [("background", base, base, bg_mask)]
+    for i, edit in enumerate(edits):
+        regions.append((edit["name"], baseline_imgs[i + 1], kv_imgs[i + 1], obj_masks[i]))
+
+    n_regions = len(regions)
+    ncols, nrows = 3, 2 * n_regions
+    images, titles = [], []
+    improvement = {}
+
+    for name, b_ref, k_ref, mask in regions:
+        b_final   = baseline_imgs[-1]
+        k_final   = kv_imgs[-1]
+
+        b_diff = region_diff(b_ref, b_final, mask, h_lat, w_lat)
+        k_diff = region_diff(k_ref, k_final, mask, h_lat, w_lat)
+        pct    = (b_diff - k_diff) / max(b_diff, 1e-6) * 100
+        improvement[name] = {"b_diff": b_diff, "k_diff": k_diff, "pct": pct}
+
+        b_heat = diff_heatmap(b_ref, b_final, mask, h_lat, w_lat)
+        k_heat = diff_heatmap(k_ref, k_final, mask, h_lat, w_lat)
+
+        images += [b_ref, b_final, b_heat]
+        titles += [
+            f"[{name}] baseline\nwhen added",
+            f"[{name}] baseline\nfinal  Δ={b_diff:.1f}",
+            f"Diff heatmap (baseline)\nΔ={b_diff:.1f}",
+        ]
+        images += [k_ref, k_final, k_heat]
+        titles += [
+            f"[{name}] kv_multi\nwhen added",
+            f"[{name}] kv_multi\nfinal  Δ={k_diff:.1f}",
+            f"Diff heatmap (kv_multi)\nΔ={k_diff:.1f}  {pct:+.0f}%",
+        ]
+
+    save_grid(images, titles,
+              os.path.join(out_dir, "KEY_RESULT_stability.png"),
+              ncols=ncols)
+    return improvement
+
+
 # ============================================================
 # Args
 # ============================================================
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--hf_token",     required=True)
-    p.add_argument("--cache_dir",    default="./models")
-    p.add_argument("--out_dir",      default="results/phase1_kv_chain_multi")
-    p.add_argument("--config",       default=None,
-                   help="JSON file with list of {name, prompt} dicts. "
-                        "Overrides the built-in EDITS list.")
-    p.add_argument("--seed",         type=int,   default=42)
-    p.add_argument("--num_steps",    type=int,   default=28)
-    p.add_argument("--probe_steps",  type=int,   default=10,
-                   help="Denoising steps for the probe pass (speed vs accuracy). "
-                        "10 is usually enough to reveal object placement.")
-    p.add_argument("--guidance",     type=float, default=2.5)
-    p.add_argument("--strength",     type=float, default=0.3,
-                   help="K/V injection weight s. "
-                        "Validated: s=0.3 best (10.56 bike_diff); s=0.7 gives 10.77. "
-                        "Range [0.3, 0.7] all give similar results; lower has less interference.")
-    p.add_argument("--cutoff",       type=float, default=0.4,
-                   help="Inject during first CUTOFF fraction of denoising steps. "
-                        "Validated: cut=0.4 best (10.63); cut=0.6 gives 10.77. "
-                        "Earlier cutoff = less interference with detail phase.")
-    p.add_argument("--threshold",    type=float, default=40.0,
-                   help="Pixel diff threshold (0-255) for target token mask.")
-    p.add_argument("--all_layers",   action="store_true",
-                   help="Use all 57 layers instead of TIER_A (13 layers). "
-                        "Expected to produce pixel-identical copy (no edit).")
-    p.add_argument("--height",       type=int,   default=1024)
-    p.add_argument("--width",        type=int,   default=1024)
-    p.add_argument("--device",       default="cuda")
+    p.add_argument("--hf_token",    required=True)
+    p.add_argument("--cache_dir",   default="./models")
+    p.add_argument("--out_dir",     default="results/phase1_kv_chain_multi")
+    p.add_argument("--config",      default=None,
+                   help="JSON file list of {name, prompt}. Overrides built-in EDITS.")
+    p.add_argument("--seed",        type=int,   default=42)
+    p.add_argument("--num_steps",   type=int,   default=28)
+    p.add_argument("--probe_steps", type=int,   default=15,
+                   help="Steps for the probe pass at steps 2+. "
+                        "15 is enough to reveal placement of simple objects.")
+    p.add_argument("--guidance",    type=float, default=2.5)
+    p.add_argument("--strength",    type=float, default=0.3,
+                   help="K/V injection weight. Validated: s=0.3 best (10.56 bike_diff). "
+                        "Range [0.3, 0.7] barely matters; lower = less interference.")
+    p.add_argument("--cutoff",      type=float, default=0.4,
+                   help="Inject during first CUTOFF fraction of steps. "
+                        "Validated: 0.4 slightly better than 0.6.")
+    p.add_argument("--threshold",   type=float, default=40.0,
+                   help="Pixel diff threshold (0-255) for target mask from probe.")
+    p.add_argument("--all_layers",  action="store_true",
+                   help="Use all 57 layers (known-bad control: bike_diff=58.80 > baseline).")
+    p.add_argument("--height",      type=int,   default=1024)
+    p.add_argument("--width",       type=int,   default=1024)
+    p.add_argument("--device",      default="cuda")
     return p.parse_args()
 
 
@@ -432,18 +541,18 @@ def main():
     vital_layers = ALL_LAYERS if args.all_layers else TIER_A_LAYERS
 
     print(f"Edit sequence: {[e['name'] for e in edits]}")
-    print(f"Injection: s={args.strength}, cutoff={args.cutoff}, "
+    print(f"Step 1: always standard (no injection)")
+    print(f"Steps 2+: probe({args.probe_steps}) → inject  "
+          f"s={args.strength}, cutoff={args.cutoff}, "
           f"layers={'ALL_57' if args.all_layers else 'TIER_A'}")
-    print(f"Probe steps: {args.probe_steps}  |  Inject steps: {args.num_steps}")
 
+    # ── Load model ──────────────────────────────────────────
     print("\nLoading FLUX.1-Kontext-dev …")
     pipe = load_kontext_pipeline(
         hf_token=args.hf_token, device=args.device, cache_dir=args.cache_dir,
     )
 
-    # ----------------------------------------------------------
-    # Base scene (step 0)
-    # ----------------------------------------------------------
+    # ── Step 0: base scene ──────────────────────────────────
     print("\n=== Step 0: Base scene ===")
     grey = Image.new("RGB", (args.width, args.height), (200, 200, 190))
     base = run_standard(pipe, grey, BASE_PROMPT,
@@ -451,9 +560,7 @@ def main():
                         args.height, args.width)
     base.save(os.path.join(args.out_dir, "step0_base.png"))
 
-    # ----------------------------------------------------------
-    # Baseline chain (no injection)
-    # ----------------------------------------------------------
+    # ── Baseline chain ───────────────────────────────────────
     print("\n=== BASELINE chain (no injection) ===")
     baseline_imgs = run_baseline_chain(
         pipe, base, edits,
@@ -461,13 +568,10 @@ def main():
     )
     for i, edit in enumerate(edits):
         baseline_imgs[i + 1].save(
-            os.path.join(args.out_dir, f"baseline_step{i+1}_{edit['name']}.png")
-        )
+            os.path.join(args.out_dir, f"baseline_step{i+1}_{edit['name']}.png"))
 
-    # ----------------------------------------------------------
-    # K/V multi chain (probe + inject at every step)
-    # ----------------------------------------------------------
-    print("\n=== K/V MULTI chain (background=~target injection) ===")
+    # ── K/V multi chain ─────────────────────────────────────
+    print("\n=== K/V MULTI chain (step1=standard, steps2+=probe→inject) ===")
     kv_imgs, obj_masks = run_kv_multi_chain(
         pipe, base, edits,
         h_lat=h_lat, w_lat=w_lat,
@@ -479,120 +583,113 @@ def main():
         out_dir=args.out_dir, device=args.device,
     )
 
-    # ----------------------------------------------------------
-    # Stability metrics
-    # ----------------------------------------------------------
-    print(f"\n{'='*65}")
-    print("STABILITY TABLE  (how much each object changed in later steps)")
-    print(f"{'='*65}")
-    print(f"  {'object':<12}  {'baseline Δ':>12}  {'kv_multi Δ':>12}  {'improvement':>12}")
-    print(f"  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}")
+    # ── Stability grid + improvement % ──────────────────────
+    print("\n=== Building stability visualisation ===")
+    improvement = build_stability_grid(
+        base, baseline_imgs, kv_imgs, edits, obj_masks,
+        h_lat, w_lat, args.out_dir, args.strength, args.cutoff,
+    )
+    print("  Saved: KEY_RESULT_stability.png")
 
-    stability_lines = [
-        "object_stability: mean abs pixel diff in object region vs FINAL image\n"
-        "lower = object better preserved across all subsequent edits\n\n"
-        f"{'object':<12}  {'baseline_diff':>14}  {'kv_multi_diff':>14}  {'improvement%':>13}\n"
-        f"{'-'*12}  {'-'*14}  {'-'*14}  {'-'*13}\n"
-    ]
-
-    for i, (edit, obj_mask) in enumerate(zip(edits, obj_masks)):
-        name = edit["name"]
-        # Compare the image at step i+1 (when object was added) vs final output
-        # baseline
-        b_step  = baseline_imgs[i + 1]
-        b_final = baseline_imgs[-1]
-        b_diff  = region_diff(b_step, b_final, obj_mask, h_lat, w_lat)
-        # kv_multi
-        k_step  = kv_imgs[i + 1]
-        k_final = kv_imgs[-1]
-        k_diff  = region_diff(k_step, k_final, obj_mask, h_lat, w_lat)
-
-        pct = (b_diff - k_diff) / max(b_diff, 1e-6) * 100
-        marker = " ← IMPROVED" if k_diff < b_diff else " ← WORSE"
-        print(f"  {name:<12}  {b_diff:>12.2f}  {k_diff:>12.2f}  {pct:>+11.1f}%{marker}")
-        stability_lines.append(
-            f"{name:<12}  {b_diff:>14.2f}  {k_diff:>14.2f}  {pct:>+12.1f}%\n"
-        )
-
-    print(f"\n  Δ = mean abs pixel diff (0-255) in the object's token region")
-    print(f"  LOWER = object more stable across later edits")
-    print()
-
-    with open(os.path.join(args.out_dir, "stability.txt"), "w") as f:
-        f.writelines(stability_lines)
-    print(f"  Saved: stability.txt")
-
-    # ----------------------------------------------------------
-    # KEY_RESULT: step-by-step comparison grid
-    # ----------------------------------------------------------
+    # ── Chain comparison grid ────────────────────────────────
     n_steps = len(edits)
-
-    # Row 1: baseline steps 0..N
-    # Row 2: kv_multi steps 0..N (results only, not probes)
-    all_imgs   = [base] + baseline_imgs[1:] + [base] + kv_imgs[1:]
-    all_titles = (
-        ["Base"] + [f"Baseline step {i+1}\n{edits[i]['name']}" for i in range(n_steps)]
-        + ["Base"] + [f"KV-Multi step {i+1}\n{edits[i]['name']}" for i in range(n_steps)]
+    chain_imgs = (
+        [base] + baseline_imgs[1:]
+        + [base] + kv_imgs[1:]
+    )
+    chain_titles = (
+        ["Base"]
+        + [f"Baseline step {i+1}\n{edits[i]['name']}" for i in range(n_steps)]
+        + ["Base"]
+        + [f"KV-Multi step {i+1}\n{edits[i]['name']}" for i in range(n_steps)]
     )
     save_grid(
-        all_imgs, all_titles,
-        os.path.join(args.out_dir, "KEY_RESULT_comparison.png"),
+        chain_imgs, chain_titles,
+        os.path.join(args.out_dir, "KEY_RESULT_chain.png"),
         ncols=n_steps + 1,
     )
-    print(f"  Saved: KEY_RESULT_comparison.png  ({2} rows × {n_steps+1} cols)")
+    print(f"  Saved: KEY_RESULT_chain.png  (2 rows × {n_steps+1} cols)")
 
-    # Final side-by-side (baseline final vs kv_multi final)
+    # Final side-by-side
     save_grid(
         [baseline_imgs[-1], kv_imgs[-1]],
-        [f"Baseline final  (no injection)",
+        ["Baseline final  (no injection)",
          f"KV-Multi final  (s={args.strength}, cutoff={args.cutoff})"],
         os.path.join(args.out_dir, "KEY_RESULT_final.png"),
     )
-    print(f"  Saved: KEY_RESULT_final.png")
+    print("  Saved: KEY_RESULT_final.png")
 
-    # ----------------------------------------------------------
-    # What to check
-    # ----------------------------------------------------------
-    print(f"\n{'='*65}")
+    # ── Numeric summary ──────────────────────────────────────
+    print(f"\n{'='*70}")
+    print("STABILITY TABLE")
+    print(f"{'='*70}")
+    print(f"  {'region':<14}  {'baseline Δ':>11}  {'kv Δ':>8}  "
+          f"{'improve %':>10}  {'verdict':>10}")
+    print(f"  {'-'*14}  {'-'*11}  {'-'*8}  {'-'*10}  {'-'*10}")
+
+    lines = [
+        "region_stability: mean abs pixel diff in region vs FINAL image\n"
+        "lower = better preserved; improvement% = (baseline-kv)/baseline*100\n\n"
+        f"{'region':<14}  {'baseline_diff':>13}  {'kv_diff':>8}  "
+        f"{'improve%':>9}  verdict\n"
+        f"{'-'*14}  {'-'*13}  {'-'*8}  {'-'*9}  {'-'*10}\n"
+    ]
+
+    for name, d in improvement.items():
+        bd, kd, pct = d["b_diff"], d["k_diff"], d["pct"]
+        verdict = "IMPROVED" if kd < bd else "WORSE"
+        print(f"  {name:<14}  {bd:>11.2f}  {kd:>8.2f}  {pct:>+9.1f}%  {verdict}")
+        lines.append(f"{name:<14}  {bd:>13.2f}  {kd:>8.2f}  {pct:>+8.1f}%  {verdict}\n")
+
+    avg_pct = np.mean([d["pct"] for d in improvement.values()])
+    print(f"\n  Average improvement across all regions: {avg_pct:+.1f}%")
+    print(f"  Δ = mean abs pixel diff (0–255); LOWER = better preserved")
+    lines.append(f"\nAverage improvement: {avg_pct:+.1f}%\n")
+
+    with open(os.path.join(args.out_dir, "stability.txt"), "w") as f:
+        f.writelines(lines)
+    print("  Saved: stability.txt")
+
+    # ── What to check ────────────────────────────────────────
+    print(f"\n{'='*70}")
     print("WHAT TO CHECK")
-    print(f"{'='*65}")
+    print(f"{'='*70}")
     print(f"""
-KEY_RESULT_comparison.png  ← most important
-  Top row: baseline chain — watch for objects drifting in later steps.
-  Bottom row: kv_multi chain — prior objects should be more stable.
-  Look at EACH object in EACH subsequent step:
-    Does the bicycle change between step 1 and step 2?  (top vs bottom row)
-    If bottom row bicycle is more stable → injection is working.
+KEY_RESULT_chain.png  ← step-by-step overview
+  Top row (baseline): each edit applied in sequence without injection.
+  Bottom row (kv_multi): same edits with background protection from step 2.
+  Compare column-by-column: are prior objects more stable in the bottom row?
+
+KEY_RESULT_stability.png  ← per-object analysis (most detailed)
+  For each region (background + each object), two rows:
+    Row 1 (baseline): when-added | final | diff heatmap (red=change)
+    Row 2 (kv_multi): when-added | final | diff heatmap
+  The diff heatmap shows exactly which pixels in that region changed.
+  improvement% in the title: positive = kv_multi preserved better.
+  Bright red in the baseline heatmap + dark baseline in kv = clear win.
 
 KEY_RESULT_final.png
-  Left: final baseline image (all objects added, no protection).
-  Right: final kv_multi image (all objects protected via injection).
-  SUCCESS = right image has clearer/more accurate versions of all objects,
-            while the new object (last step) is still correctly placed.
+  Direct comparison of the final images.
+  Both should have all 3 objects. Quality/identity of prior objects
+  (especially bicycle) should be better in kv_multi.
 
-kv_step*_target_overlay.png  (BLUE tint = target/new-object region)
-  Verify the target mask covers the new object and NOT prior objects.
-  If target_mask is too large (covers prior objects too):
-    → increase --threshold (try 50-60)
-  If target_mask is too small (misses the new object):
-    → decrease --threshold (try 25-30), or increase --probe_steps
+Probe images (kv_step*_probe.png, only for steps 2+)
+  These show where Kontext naturally places the new object.
+  Target overlay (blue) should cover the new object region.
+  If target is too noisy: increase --threshold (try 50-60).
+  If target misses the object: decrease --threshold (try 25) or increase --probe_steps.
 
-kv_step*_background_overlay.png  (ORANGE tint = background/protected region)
-  This is everything being frozen by injection.
-  It should cover: base scene + all prior objects.
-  If the background region is too large (covers the new object area):
-    → the new object may be suppressed. Reduce --threshold or --strength.
+Stability table interpretation:
+  background: how much the original room (sofa/walls/floor) drifted.
+  bicycle:    how much the bicycle changed after the vase and lamp were added.
+  vase:       how much the vase changed after the lamp was added.
+  lamp:       how much the lamp changed vs when it was first placed (step 3).
+              (lamp stability is low for both since it IS the last step)
 
-stability.txt
-  baseline_diff vs kv_multi_diff for each object.
-  A positive improvement% = kv_multi preserved that object better.
-  If kv_multi is WORSE: the injection is interfering with the edit.
-    Try: lower --strength (0.5), shorter --cutoff (0.4), higher --threshold.
-
-probe images (kv_step*_probe.png)
-  These show where Kontext naturally places each object without injection.
-  The target mask is derived from these. If the probe looks wrong
-  (wrong object placement), increase --probe_steps (try 15-20).
+If bicycle is still not forming well:
+  → check kv_step1_bicycle_result.png (step 1 is standard, should be fine)
+  → if the bicycle is fine in kv_step1, the issue is at step 2 injection
+  → try --strength 0.5 and --threshold 50 to give the bicycle a larger free zone
 """)
     print(f"All results → {args.out_dir}/")
 
