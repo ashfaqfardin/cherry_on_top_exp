@@ -63,6 +63,19 @@ Metrics
 
   Reported for both baseline (no injection) and kv_multi chain.
 
+Validated defaults (from phase1_kv_chain.py sweep on bicycle+vase scene)
+------------------------------------------------------------------------
+  baseline bike_diff:          48.31  (no injection)
+  TIER_A s=0.3 cut=0.4:        10.56  ← best  (78% improvement)
+  TIER_A s=0.7 cut=0.6:        10.77  (also fine, barely worse)
+  ALL_57  s=0.7 cut=0.6:       58.80  ← WORSE than baseline (destroys composition)
+
+  Takeaways:
+  - strength is not sensitive in [0.3, 0.7]; use s=0.3 (less interference)
+  - earlier cutoff is slightly better; use cutoff=0.4
+  - TIER_A (13 content layers) is essential; ALL_57 injects positional
+    layers which confuse the denoising and worsen preservation
+
 Comparison
 ----------
   baseline:  standard Kontext chain, no injection
@@ -381,12 +394,14 @@ def parse_args():
                    help="Denoising steps for the probe pass (speed vs accuracy). "
                         "10 is usually enough to reveal object placement.")
     p.add_argument("--guidance",     type=float, default=2.5)
-    p.add_argument("--strength",     type=float, default=0.7,
+    p.add_argument("--strength",     type=float, default=0.3,
                    help="K/V injection weight s. "
-                        "s=0: no injection (= baseline). s=1: full lock.")
-    p.add_argument("--cutoff",       type=float, default=0.6,
+                        "Validated: s=0.3 best (10.56 bike_diff); s=0.7 gives 10.77. "
+                        "Range [0.3, 0.7] all give similar results; lower has less interference.")
+    p.add_argument("--cutoff",       type=float, default=0.4,
                    help="Inject during first CUTOFF fraction of denoising steps. "
-                        "0.6 = first 60%% of steps (structure-forming phase).")
+                        "Validated: cut=0.4 best (10.63); cut=0.6 gives 10.77. "
+                        "Earlier cutoff = less interference with detail phase.")
     p.add_argument("--threshold",    type=float, default=40.0,
                    help="Pixel diff threshold (0-255) for target token mask.")
     p.add_argument("--all_layers",   action="store_true",
