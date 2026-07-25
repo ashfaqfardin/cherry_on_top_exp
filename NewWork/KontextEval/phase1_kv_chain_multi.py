@@ -152,7 +152,7 @@ EDITS: List[dict] = [
     {
         "name": "ball",
         "prompt": (
-            "Add a yellow round ball in the right corner of the room next to the sofa. "
+            "Add a yellow ball in the right corner of the room next to the sofa. "
             "Keep the rest of the room exactly the same."
         ),
     },
@@ -466,40 +466,55 @@ def build_stability_grid(
         all_obj_union |= m
     bg_mask = ~all_obj_union
 
-    # Build regions list: (name, ref_a_baseline, ref_a_kv, mask)
-    # ref_a = the "when added" image for this region
-    regions = [("background", base, base, bg_mask)]
+    # Build regions list: (name, b_ref, k_ref, b_before, k_before, mask)
+    #   b_ref    = image at the step this region was established (for stability Δ)
+    #   b_before = image BEFORE this region was established (for heatmap source)
+    #
+    # Heatmap: diff(b_before, b_final) in mask region
+    #   Always shows the object/region brightly, including for the last edit
+    #   where diff(b_ref, b_final)=0 because b_ref IS b_final.
+    #   For ball (last step): diff(vase_image, ball_image) → ball lights up.
+    #   For bicycle (step 1): diff(base, final) → bicycle lights up.
+    #   For background: diff(base, final) → any room drift lights up.
+    regions = [("background", base, base, base, base, bg_mask)]
     for i, edit in enumerate(edits):
-        regions.append((edit["name"], baseline_imgs[i + 1], kv_imgs[i + 1], obj_masks[i]))
+        regions.append((
+            edit["name"],
+            baseline_imgs[i + 1], kv_imgs[i + 1],   # ref: when added
+            baseline_imgs[i],     kv_imgs[i],          # before: just prior step
+            obj_masks[i],
+        ))
 
     n_regions = len(regions)
     ncols, nrows = 3, 2 * n_regions
     images, titles = [], []
     improvement = {}
 
-    for name, b_ref, k_ref, mask in regions:
-        b_final   = baseline_imgs[-1]
-        k_final   = kv_imgs[-1]
+    for name, b_ref, k_ref, b_before, k_before, mask in regions:
+        b_final = baseline_imgs[-1]
+        k_final = kv_imgs[-1]
 
+        # Stability metric: how much did this region change from when it was added → final
         b_diff = region_diff(b_ref, b_final, mask, h_lat, w_lat)
         k_diff = region_diff(k_ref, k_final, mask, h_lat, w_lat)
         pct    = (b_diff - k_diff) / max(b_diff, 1e-6) * 100
         improvement[name] = {"b_diff": b_diff, "k_diff": k_diff, "pct": pct}
 
-        b_heat = diff_heatmap(b_ref, b_final, mask, h_lat, w_lat)
-        k_heat = diff_heatmap(k_ref, k_final, mask, h_lat, w_lat)
+        # Heatmap: diff(before, final) — always bright because the object appeared
+        b_heat = diff_heatmap(b_before, b_final, mask, h_lat, w_lat)
+        k_heat = diff_heatmap(k_before, k_final, mask, h_lat, w_lat)
 
         images += [b_ref, b_final, b_heat]
         titles += [
             f"[{name}] baseline\nwhen added",
-            f"[{name}] baseline\nfinal  Δ={b_diff:.1f}",
-            f"Diff heatmap (baseline)\nΔ={b_diff:.1f}",
+            f"[{name}] baseline final\nstab Δ={b_diff:.1f}",
+            f"Baseline: before→final\n(bright = object present)",
         ]
         images += [k_ref, k_final, k_heat]
         titles += [
             f"[{name}] kv_multi\nwhen added",
-            f"[{name}] kv_multi\nfinal  Δ={k_diff:.1f}",
-            f"Diff heatmap (kv_multi)\nΔ={k_diff:.1f}  {pct:+.0f}%",
+            f"[{name}] kv final\nstab Δ={k_diff:.1f}  {pct:+.0f}%",
+            f"KV: before→final\n(bright = object present)",
         ]
 
     save_grid(images, titles,
