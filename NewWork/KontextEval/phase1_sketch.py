@@ -75,7 +75,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # ── import utilities from phase1_composite (avoid duplication) ────────────────
 _comp_path = str(Path(__file__).parent / "phase1_composite.py")
@@ -376,8 +376,243 @@ def _save_mask_preview(obj_img: Image.Image, mask: np.ndarray, path: str):
     combined.save(path)
 
 
+def _save_bbox_overlay(scene: Image.Image, bbox: Tuple[int, int, int, int], path: str):
+    """Draw the VLM-determined bounding box on the scene image for visual inspection."""
+    y1, y2, x1, x2 = bbox
+    img  = scene.copy()
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([x1, y1, x2, y2], outline=(255, 80, 0), width=4)
+    img.save(path)
+
+
 # ============================================================
-# Placement: generated object -> scene bounding box
+# VLM Placement Reasoning (Claude Vision)
+# ============================================================
+
+def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
+    """
+    Load an open-source Vision-Language Model for placement reasoning.
+
+    Defaults to Qwen/Qwen2-VL-2B-Instruct on CPU so it can coexist with
+    FLUX.1-Kontext-dev on the GPU without running out of VRAM.
+
+    GPU memory guide:
+      Kontext-dev  ~24 GB GPU
+      Qwen2-VL-2B  ~4 GB  (use --vlm_device cpu  for safety)
+      Qwen2-VL-7B  ~15 GB (use --vlm_device cuda  only on 40+ GB GPUs)
+
+    CPU inference is ~20-40 s per object -- acceptable for a reasoning step.
+    """
+    from transformers import AutoProcessor
+
+    print(f"  Loading VLM '{model_id}' on {device} ...")
+    try:
+        from transformers import Qwen2VLForConditionalGeneration
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+        ).to(device).eval()
+    except (ImportError, OSError, Exception):
+        from transformers import AutoModelForVision2Seq
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            cache_dir=cache_dir,
+        ).to(device).eval()
+
+    processor = AutoProcessor.from_pretrained(
+        model_id, cache_dir=cache_dir, trust_remote_code=True,
+    )
+    return model, processor
+
+
+def reason_placement_vlm(
+    vlm_model,
+    vlm_processor,
+    scene_img: Image.Image,
+    obj_img: Image.Image,
+    obj_name: str,
+    obj_description: str,
+    max_new_tokens: int = 512,
+) -> dict:
+    """
+    Ask the VLM to reason about where and how to place the object in the scene.
+
+    Tested with Qwen2-VL-2B / 7B.  Any HuggingFace multi-image VLM that
+    supports apply_chat_template should work with the same interface.
+
+    Returns dict with:
+      reasoning -- brief explanation
+      center_x  -- horizontal centre [0,1] of scene width
+      center_y  -- vertical centre   [0,1] of scene height
+      width     -- object width  as fraction of scene width
+      height    -- object height as fraction of scene height
+    """
+    device = next(vlm_model.parameters()).device
+
+    def _resize(img: Image.Image, max_side: int) -> Image.Image:
+        w, h = img.size
+        if max(w, h) > max_side:
+            s = max_side / max(w, h)
+            img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
+        return img.convert("RGB")
+
+    scene_small = _resize(scene_img, 768)
+    obj_small   = _resize(obj_img,   512)
+
+    user_msg = f"""I want to insert a {obj_description} into this indoor room scene.
+
+Image 1: the current scene.
+Image 2: the {obj_description} on a plain white background.
+
+Think step by step:
+1. Room layout -- identify walls, floor area, existing furniture.
+2. Natural placement -- where would a real {obj_name} go in this room?
+3. Perspective scale -- objects further back appear smaller and sit higher.
+4. Stability -- the object must rest on a visible floor or surface.
+
+Return ONLY valid JSON, no markdown, no extra text:
+{{
+  "reasoning": "<2-3 sentences>",
+  "center_x": <float 0.0-1.0, horizontal centre fraction of scene width>,
+  "center_y": <float 0.0-1.0, vertical centre fraction of scene height>,
+  "width":    <float 0.0-1.0, object width  fraction of scene width>,
+  "height":   <float 0.0-1.0, object height fraction of scene height>
+}}
+Origin (0,0) = top-left corner."""
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": scene_small},
+                {"type": "image", "image": obj_small},
+                {"type": "text",  "text": user_msg},
+            ],
+        }
+    ]
+
+    text = vlm_processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    # Extract PIL images in message order for the processor
+    images_in_order = [
+        item["image"]
+        for msg in messages
+        for item in msg["content"]
+        if item["type"] == "image"
+    ]
+    inputs = vlm_processor(
+        text=[text],
+        images=images_in_order,
+        padding=True,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.no_grad():
+        gen_ids = vlm_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+    # Trim input prompt tokens from output
+    out_ids  = gen_ids[:, inputs["input_ids"].shape[1]:]
+    response = vlm_processor.batch_decode(
+        out_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )[0].strip()
+
+    if "```" in response:
+        response = response[response.find("{") : response.rfind("}") + 1]
+    result = json.loads(response)
+
+    for key in ("center_x", "center_y", "width", "height"):
+        result[key] = float(np.clip(result[key], 0.02, 0.98))
+
+    print(f"    VLM:    cx={result['center_x']:.2f}  cy={result['center_y']:.2f}  "
+          f"w={result['width']:.2f}  h={result['height']:.2f}")
+    print(f"    Reason: {result['reasoning']}")
+    return result
+
+
+def vlm_placement_to_bbox(
+    placement: dict, H: int, W: int
+) -> Tuple[int, int, int, int]:
+    """Convert fractional VLM placement dict -> pixel bbox (y1, y2, x1, x2)."""
+    cx = placement["center_x"] * W
+    cy = placement["center_y"] * H
+    pw = placement["width"]    * W
+    ph = placement["height"]   * H
+    x1 = max(0, int(cx - pw / 2))
+    x2 = min(W, int(cx + pw / 2))
+    y1 = max(0, int(cy - ph / 2))
+    y2 = min(H, int(cy + ph / 2))
+    return y1, y2, x1, x2
+
+
+def bbox_to_token_mask(
+    bbox: Tuple[int, int, int, int],
+    h_lat: int, w_lat: int,
+    H: int, W: int,
+) -> np.ndarray:
+    """Convert pixel bbox (y1,y2,x1,x2) -> flat bool token mask of shape (h_lat*w_lat,)."""
+    y1, y2, x1, x2 = bbox
+    ty1 = int(y1 / H * h_lat)
+    ty2 = int(np.ceil(y2 / H * h_lat))
+    tx1 = int(x1 / W * w_lat)
+    tx2 = int(np.ceil(x2 / W * w_lat))
+    mask_2d = np.zeros((h_lat, w_lat), dtype=bool)
+    mask_2d[ty1:ty2, tx1:tx2] = True
+    return mask_2d.ravel()
+
+
+def paste_object_at_bbox(
+    scene: Image.Image,
+    obj_img: Image.Image,
+    obj_mask: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    feather_sigma: float = 8.0,
+) -> Image.Image:
+    """
+    Paste the generated object at a VLM-specified pixel bounding box.
+    No token-grid snapping: bbox is pixel-accurate.
+    """
+    y1, y2, x1, x2 = bbox
+    bh, bw = y2 - y1, x2 - x1
+    H, W   = scene.size[1], scene.size[0]
+
+    if bh <= 0 or bw <= 0:
+        print("    [paste_object_at_bbox] degenerate bbox -- skipping paste.")
+        return scene
+
+    r, c = np.where(obj_mask)
+    if len(r) == 0:
+        print("    [paste_object_at_bbox] empty RMBG mask -- skipping paste.")
+        return scene
+
+    oy1, oy2 = int(r.min()), int(r.max()) + 1
+    ox1, ox2 = int(c.min()), int(c.max()) + 1
+    obj_crop  = obj_img.crop((ox1, oy1, ox2, oy2))
+    mask_crop = Image.fromarray(obj_mask[oy1:oy2, ox1:ox2].astype(np.uint8) * 255, "L")
+
+    obj_r  = obj_crop.resize((bw, bh), Image.LANCZOS)
+    mask_r = mask_crop.resize((bw, bh), Image.BILINEAR)
+
+    alpha_small = feather_mask(np.array(mask_r) > 127, feather_sigma)
+    alpha_full  = np.zeros((H, W), dtype=float)
+    alpha_full[y1:y2, x1:x2] = alpha_small
+    alpha3 = alpha_full[:, :, np.newaxis]
+
+    scene_f = np.array(scene).astype(float)
+    paste_f = scene_f.copy()
+    paste_f[y1:y2, x1:x2] = np.array(obj_r).astype(float)
+    result  = alpha3 * paste_f + (1.0 - alpha3) * scene_f
+    return Image.fromarray(result.clip(0, 255).astype(np.uint8))
+
+
+# ============================================================
+# Placement: probe-based fallback (no VLM key)
 # ============================================================
 
 def paste_object_at_probe(
@@ -453,24 +688,43 @@ def run_sketch_chain(
     out_dir: str,
     mode_tag: str,
     device: str,
+    vlm_pair: Optional[Tuple] = None,
 ) -> Tuple[List[Image.Image], List[np.ndarray]]:
     """
-    Stage B: probe -> place -> refine (K/V inject) -> bg_replace.
+    Stage B: place each generated object into the scene sequentially.
 
-    generated: {name: (obj_img, obj_mask)} from Stage A.
-    mode_tag: short prefix for output filenames (e.g. 'lora' or 'cn').
+    Two placement modes:
+
+    VLM mode (--vlm_model provided):
+      An open-source VLM (default: Qwen2-VL-2B) looks at the current
+      accumulated scene + the generated object and reasons about WHERE to place
+      it and at what SCALE.  Returns a pixel-accurate bounding box with no
+      16-pixel token-grid snapping.
+      Flow: VLM reason -> place -> K/V inject -> bg_replace
+
+    Probe fallback (no --vlm_model):
+      Runs a lightweight text-only Kontext generation, diffs it against the
+      current scene to find the region the model would change, and uses that
+      token mask as the bounding area for placement.
+      Flow: probe -> place -> K/V inject -> bg_replace
+
+    In both cases each object is inserted one at a time into the accumulated
+    scene (img_prev = imgs[-1]), so later objects see earlier ones.
     """
+    use_vlm = vlm_pair is not None
+    placement_log: List[dict] = []
     imgs, obj_masks = [base], []
     all_obj_mask = np.zeros(h_lat * w_lat, dtype=bool)
 
     for i, edit in enumerate(edits):
-        name     = edit["name"]
-        prompt   = edit["prompt"]
+        name   = edit["name"]
+        prompt = edit["prompt"]
+        desc   = edit.get("description", name)
         img_prev = imgs[-1]
         H, W     = img_prev.size[1], img_prev.size[0]
 
         if name not in generated:
-            print(f"\n  [{mode_tag}] step {i+1}  {name}: no generated object found -- SKIPPING")
+            print(f"\n  [{mode_tag}] step {i+1}  {name}: no generated object -- SKIPPING")
             imgs.append(img_prev)
             obj_masks.append(np.zeros(h_lat * w_lat, dtype=bool))
             continue
@@ -478,40 +732,73 @@ def run_sketch_chain(
         obj_img, obj_mask = generated[name]
         print(f"\n  [{mode_tag}] step {i+1}/{len(edits)}  {name}")
 
-        # 1. PROBE: find where in the scene the object should go
-        print(f"    probe  ({probe_steps} steps) ...")
-        img_probe = run_standard(pipe, img_prev, prompt,
-                                 seed, probe_steps, guidance, height, width)
-        img_probe.save(os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_probe.png"))
+        if use_vlm:
+            # ── VLM PATH ──────────────────────────────────────────────────────
+            # 1. REASON: VLM looks at the current scene + generated object
+            #    and decides where and how big to place it.
+            print(f"    asking VLM where/how to place '{name}' ...")
+            _vlm_model, _vlm_proc = vlm_pair
+            placement = reason_placement_vlm(
+                _vlm_model, _vlm_proc,
+                img_prev, obj_img, name, desc,
+            )
+            placement_log.append({"step": i + 1, "name": name, **placement})
 
-        target_raw   = pixel_to_token_mask(img_prev, img_probe, h_lat, w_lat, threshold)
-        base_stable  = ~pixel_to_token_mask(base, img_probe, h_lat, w_lat, threshold)
-        target_clean = target_raw & ~base_stable
-        obj_masks.append(target_clean)
+            bbox           = vlm_placement_to_bbox(placement, H, W)
+            obj_token_mask = bbox_to_token_mask(bbox, h_lat, w_lat, H, W)
+            obj_masks.append(obj_token_mask)
 
-        print(f"    target={target_clean.mean()*100:.1f}%")
-        color_overlay(img_prev, target_clean, h_lat, w_lat,
-                      color=(0, 180, 255), alpha=0.45).save(
-            os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_target.png"))
+            # Debug: save the VLM-chosen bbox drawn on the scene
+            _save_bbox_overlay(img_prev, bbox,
+                os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_vlm_bbox.png"))
 
-        # 2. PLACE: paste generated object at probe-detected location
-        rough_composite = paste_object_at_probe(
-            img_prev, obj_img, obj_mask, target_clean,
-            h_lat, w_lat, feather_sigma,
-        )
+            # 2. PLACE: paste at VLM-determined pixel bbox (no token snapping)
+            rough_composite = paste_object_at_bbox(
+                img_prev, obj_img, obj_mask, bbox, feather_sigma,
+            )
+
+            # background_mask for K/V injection = everything OUTSIDE the VLM bbox
+            bg_mask_for_kv = ~obj_token_mask
+
+        else:
+            # ── PROBE FALLBACK ────────────────────────────────────────────────
+            # 1. PROBE: lightweight generation to find the natural change region
+            print(f"    probe  ({probe_steps} steps) ...")
+            img_probe = run_standard(pipe, img_prev, prompt,
+                                     seed, probe_steps, guidance, height, width)
+            img_probe.save(
+                os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_probe.png"))
+
+            target_raw   = pixel_to_token_mask(img_prev, img_probe, h_lat, w_lat, threshold)
+            base_stable  = ~pixel_to_token_mask(base, img_probe, h_lat, w_lat, threshold)
+            target_clean = target_raw & ~base_stable
+            obj_masks.append(target_clean)
+            print(f"    target={target_clean.mean()*100:.1f}%")
+            color_overlay(img_prev, target_clean, h_lat, w_lat,
+                          color=(0, 180, 255), alpha=0.45).save(
+                os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_target.png"))
+
+            # 2. PLACE: paste at probe-detected location (token-bbox)
+            rough_composite = paste_object_at_probe(
+                img_prev, obj_img, obj_mask, target_clean,
+                h_lat, w_lat, feather_sigma,
+            )
+            bg_mask_for_kv  = ~target_clean
+            obj_token_mask  = target_clean
+
         rough_composite.save(
             os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_rough.png"))
 
         # 3. REFINE: Kontext K/V inject from rough_composite
-        #    - rough_composite as canvas: pasted object is a visual hint for Kontext
-        #    - K/V injection locks background tokens to rough_composite features
-        #    - Kontext smooths seams and adjusts object lighting
+        #    The pasted object in rough_composite is a visual hint for Kontext
+        #    (shape, colour, pose).  K/V injection locks background tokens so
+        #    the scene outside the object region is not changed.
         print(f"    refine ({num_steps} steps, s={strength}, cutoff={cutoff}) ...")
         img_inject = run_kv_injected(
             pipe,
             canvas=rough_composite,
             prompt=prompt,
-            background_mask=~target_clean,
+            background_mask=bg_mask_for_kv,
             seed=seed, num_steps=num_steps,
             guidance=guidance, height=height, width=width,
             strength=strength, cutoff=cutoff,
@@ -521,8 +808,8 @@ def run_sketch_chain(
         img_inject.save(
             os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_inject.png"))
 
-        # 4. BG-REPLACE: hard pixel-copy original base over all non-object tokens
-        all_obj_mask = all_obj_mask | target_clean
+        # 4. BG-REPLACE: hard pixel-copy original base over pure-background tokens
+        all_obj_mask = all_obj_mask | obj_token_mask
         px_pure_bg   = _token_to_pixel(~all_obj_mask, h_lat, w_lat, H, W)
         inject_arr   = np.array(img_inject).astype(float)
         base_arr     = np.array(base).astype(float)
@@ -530,8 +817,13 @@ def run_sketch_chain(
         img_curr = Image.fromarray(inject_arr.clip(0, 255).astype(np.uint8))
         img_curr.save(
             os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_result.png"))
-
         imgs.append(img_curr)
+
+    if placement_log:
+        log_path = os.path.join(out_dir, f"sk_{mode_tag}_vlm_placements.json")
+        with open(log_path, "w") as f:
+            json.dump(placement_log, f, indent=2)
+        print(f"\n  VLM placements logged: {log_path}")
 
     return imgs, obj_masks
 
@@ -618,6 +910,19 @@ def parse_args():
     p.add_argument("--height",           type=int,   default=1024)
     p.add_argument("--width",            type=int,   default=1024)
     p.add_argument("--device",           default="cuda")
+    # VLM placement (optional but strongly recommended)
+    p.add_argument("--vlm_model",        default=None,
+                   help="HuggingFace model ID for open-source VLM placement reasoning. "
+                        "When set, the VLM looks at each scene + object and reasons "
+                        "about WHERE and HOW to place it (pixel-accurate, perspective-aware). "
+                        "Recommended: 'Qwen/Qwen2-VL-2B-Instruct' (fits on CPU alongside Kontext) "
+                        "or 'Qwen/Qwen2-VL-7B-Instruct' (better reasoning, needs more RAM). "
+                        "Without this flag the pipeline falls back to the probe method "
+                        "(text-only diff -- less accurate, token-grid snapping).")
+    p.add_argument("--vlm_device",       default="cpu",
+                   help="Device for VLM inference (default: cpu). "
+                        "CPU keeps VLM out of GPU VRAM so Kontext can use the full GPU. "
+                        "Set to 'cuda' only if your GPU has 40+ GB free after loading Kontext.")
     return p.parse_args()
 
 
@@ -643,8 +948,14 @@ def main():
     print(f"Mode          : {args.mode}")
     print(f"Sketch dir    : {args.sketch_dir}")
     print(f"feather_sigma : {args.feather_sigma} px")
+    print(f"VLM placement : {args.vlm_model or 'probe fallback (no --vlm_model set)'}")
 
-    # ── 0. Load RMBG-2.0 (used by all modes for mask extraction) ─────────────
+    # ── 0a. Load VLM for placement reasoning (optional) ──────────────────────
+    vlm_pair = None
+    if args.vlm_model:
+        vlm_pair = load_vlm(args.vlm_model, args.cache_dir, args.vlm_device)
+
+    # ── 0b. Load RMBG-2.0 (used by all modes for mask extraction) ────────────
     print("\nLoading RMBG-2.0 for foreground mask extraction ...")
     rmbg_model = load_rmbg(args.cache_dir, args.device)
 
@@ -698,6 +1009,7 @@ def main():
             vital_layers=vital_layers, threshold=args.threshold,
             feather_sigma=args.feather_sigma,
             out_dir=args.out_dir, mode_tag="lora", device=args.device,
+            vlm_pair=vlm_pair,
         )
         imgs_by_mode["sketch_lora"]      = imgs
         obj_masks_by_mode["sketch_lora"] = masks
@@ -745,6 +1057,7 @@ def main():
             vital_layers=vital_layers, threshold=args.threshold,
             feather_sigma=args.feather_sigma,
             out_dir=args.out_dir, mode_tag="cn", device=args.device,
+            vlm_pair=vlm_pair,
         )
         imgs_by_mode["sketch_cn"]      = imgs_cn
         obj_masks_by_mode["sketch_cn"] = masks_cn
@@ -797,26 +1110,33 @@ def main():
     print(f"{'='*72}")
     print(f"""
 sketch_gen_{{name}}.png + sketch_mask_{{name}}.png
-  Left half: Stage A generated object. Right half: RMBG-2.0 mask.
-  The mask should cleanly cover the object (including white objects like the vase).
-  If mask leaks into background: raise --rmbg_threshold (try 0.65).
-  If mask clips the object:      lower --rmbg_threshold (try 0.3).
+  Left: Stage A generated object.  Right: RMBG-2.0 mask.
+  Mask should cleanly cover the object (including white objects like the vase).
+  Leaks into background -> raise --rmbg_threshold (try 0.65).
+  Clips part of object  -> lower --rmbg_threshold (try 0.3).
+
+sk_{{mode}}_step{{i}}_{{name}}_vlm_bbox.png  [VLM mode only]
+  Orange rectangle = where the VLM decided to place the object.
+  If wrong position:  check sk_{{mode}}_vlm_placements.json for the reasoning.
+  Adjust the prompt in EDITS or rerun; the VLM reasoning is stochastic.
 
 sk_{{mode}}_step{{i}}_{{name}}_rough.png
-  The generated object pasted at the probe-detected location.
-  Verify: is the object at the right position and scale?
-  If too small/large:   the probe bbox drives the size -- check probe output.
-  If wrong position:    increase --probe_steps (try 22-24).
+  Object pasted at the VLM-determined location (before Kontext refine).
+  Should look like a rough paste -- seams visible, lighting not matched yet.
+  If object is wrong size:  adjust VLM output via prompt or --vlm_model 7B.
 
 sk_{{mode}}_step{{i}}_{{name}}_inject.png
-  After Kontext K/V injection. Seams should be smooth; lighting should match the room.
-  If hard seams visible:  increase --feather_sigma (12-16).
-  If seams gone but object looks different from sketch:  raise LoRA guidance or
-    controlnet_scale.
+  After Kontext K/V injection. Seams should be smoothed; lighting adjusted.
+  Hard seams still visible -> increase --feather_sigma (12-16 px).
+  Object shape lost        -> raise --strength (0.4-0.5).
 
-KEY_lora_final.png vs KEY_bg_replace_final.png
-  Does the sketch-mode object match the hand-drawn intent (shape/pose)?
-  Does background look identical across all edit steps? (bg_replace guarantees this.)
+sk_{{mode}}_vlm_placements.json  [VLM mode only]
+  Full VLM reasoning log: reasoning text + coordinates for each object.
+
+KEY_lora_final.png
+  Final scene after all three objects inserted.
+  Does each object match the hand-drawn sketch shape/pose?
+  Is the background pixel-identical to step0_base.png outside object regions?
 """)
 
 
