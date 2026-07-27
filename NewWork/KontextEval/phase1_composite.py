@@ -189,14 +189,16 @@ def save_grid(images, titles, path, ncols=None, figsize_per_cell=(4, 4)):
 def feather_mask(px_mask: np.ndarray, sigma: float) -> np.ndarray:
     """
     Gaussian-feathered alpha from a binary pixel mask.
-    sigma=0 → hard binary (no feathering).
-    sigma>0 → smooth [0,1] alpha with soft transition at the boundary.
+    Interior (px_mask=True) is clamped to 1.0 — only the exterior ring falls off.
+    sigma=0 -> hard binary (no feathering).
     """
     if sigma <= 0:
         return px_mask.astype(float)
     mask_img = Image.fromarray((px_mask * 255).astype(np.uint8), "L")
     blurred  = mask_img.filter(ImageFilter.GaussianBlur(radius=sigma))
-    return np.array(blurred).astype(float) / 255.0
+    alpha    = np.array(blurred).astype(float) / 255.0
+    alpha[px_mask] = 1.0   # interior stays fully opaque; falloff only on exterior ring
+    return alpha
 
 
 def composite_onto(scene: Image.Image, inject: Image.Image,
@@ -387,6 +389,98 @@ def run_kv_chain(
     return imgs, obj_masks
 
 
+def run_bg_replace_chain(
+    pipe,
+    base: Image.Image,
+    edits: List[dict],
+    h_lat: int, w_lat: int,
+    seed: int, num_steps: int, probe_steps: int,
+    guidance: float, height: int, width: int,
+    strength: float, cutoff: float,
+    vital_layers: List[int],
+    threshold: float,
+    feather_sigma: float,
+    out_dir: str,
+    device: str = "cuda",
+) -> Tuple[List[Image.Image], List[np.ndarray]]:
+    """
+    K/V injection + background pixel-replace from the original base.
+
+    At every step:
+      1. Probe  from img_prev  (natural placement, full scene context)
+      2. Inject from img_prev  (K/V injection — objects are coherent with the scene)
+      3. Accumulate all_obj_mask = union of all target_clean masks so far
+      4. pure_bg = ~all_obj_mask
+      5. inject_result[pure_bg] = base[pure_bg]   (hard pixel copy from original)
+
+    Objects come from K/V injection so they see each other and generate coherently.
+    Background is an exact copy of the original base at every step — zero drift.
+    The feather_sigma controls blending at the object/background boundary only;
+    the interior of every object zone stays 100% from the injection result.
+    """
+    imgs, obj_masks = [base], []
+    all_obj_mask = np.zeros(h_lat * w_lat, dtype=bool)
+
+    for i, edit in enumerate(edits):
+        name     = edit["name"]
+        prompt   = edit["prompt"]
+        img_prev = imgs[-1]
+        H, W     = img_prev.size[1], img_prev.size[0]
+
+        print(f"\n  [bg_replace] step {i+1}/{len(edits)}  {name}")
+
+        # 1. Probe from accumulated scene
+        print(f"    probe  ({probe_steps} steps) ...")
+        img_probe = run_standard(pipe, img_prev, prompt,
+                                 seed, probe_steps, guidance, height, width)
+        img_probe.save(os.path.join(out_dir, f"bgr_step{i+1}_{name}_probe.png"))
+
+        target_raw   = pixel_to_token_mask(img_prev, img_probe, h_lat, w_lat, threshold)
+        base_stable  = ~pixel_to_token_mask(base, img_probe, h_lat, w_lat, threshold)
+        target_clean = target_raw & ~base_stable
+        obj_masks.append(target_clean)
+
+        print(f"    target={target_clean.mean()*100:.1f}%")
+        color_overlay(img_prev, target_clean, h_lat, w_lat,
+                      color=(0, 200, 100), alpha=0.45).save(
+            os.path.join(out_dir, f"bgr_step{i+1}_{name}_target.png"))
+
+        # 2. K/V inject from accumulated scene (objects are context-aware)
+        print(f"    inject ({num_steps} steps, s={strength}, cutoff={cutoff}) ...")
+        img_inject = run_kv_injected(
+            pipe, img_prev, prompt, ~target_clean,
+            seed=seed, num_steps=num_steps,
+            guidance=guidance, height=height, width=width,
+            strength=strength, cutoff=cutoff,
+            vital_layers=vital_layers, device=device,
+        )
+        img_inject.save(os.path.join(out_dir, f"bgr_step{i+1}_{name}_inject.png"))
+
+        # 3. Accumulate every object token seen so far
+        all_obj_mask = all_obj_mask | target_clean
+
+        # 4. Replace pure background (no object ever placed there) with original base
+        px_all_obj = _token_to_pixel(all_obj_mask, h_lat, w_lat, H, W)
+        inject_arr = np.array(img_inject).astype(float)
+        base_arr   = np.array(base).astype(float)
+
+        if feather_sigma > 0:
+            # Soft boundary: blend at the object edge; interior stays inject, exterior stays base
+            alpha = feather_mask(px_all_obj, feather_sigma)   # interior=1.0, exterior falls to 0
+            alpha3 = alpha[:, :, np.newaxis]
+            result_arr = alpha3 * inject_arr + (1.0 - alpha3) * base_arr
+        else:
+            result_arr = inject_arr.copy()
+            px_pure_bg = ~px_all_obj
+            result_arr[px_pure_bg] = base_arr[px_pure_bg]
+
+        img_curr = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8))
+        img_curr.save(os.path.join(out_dir, f"bgr_step{i+1}_{name}_result.png"))
+        imgs.append(img_curr)
+
+    return imgs, obj_masks
+
+
 def run_baseline_chain(
     pipe,
     base: Image.Image,
@@ -422,9 +516,10 @@ def build_comparison_grid(
     n_steps = len(edits)
     ncols = n_steps + 1
     labels = {
-        "baseline": "Baseline\n(no inject)",
-        "kv":       f"K/V inject\n(s={strength})",
-        "composite": f"Composite\n(σ={feather_sigma}px)",
+        "baseline":   "Baseline\n(no inject)",
+        "kv":         f"K/V inject\n(s={strength})",
+        "composite":  f"Composite\n(σ={feather_sigma}px)",
+        "bg_replace": f"BG-Replace\n(s={strength},σ={feather_sigma})",
     }
 
     images, titles = [], []
@@ -455,8 +550,13 @@ def build_stability_grid(
     feather_sigma: float,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Per-region stability: diff from 'when added' to final, per mode.
-    Uses the K/V chain's obj_masks as reference region definitions.
+    Per-region WITHIN-CHAIN stability: for each mode, diff from
+    'when the region was first established in that mode's chain' to
+    that mode's final result.
+
+    Region boundaries are defined by the kv chain's masks so they are
+    comparable across modes.  Each mode uses its OWN intermediate images
+    as the 'when_added' reference — this gives true within-chain drift.
     """
     modes = list(imgs_by_mode.keys())
     ref_key   = "kv" if "kv" in obj_masks_by_mode else list(obj_masks_by_mode.keys())[0]
@@ -467,32 +567,37 @@ def build_stability_grid(
         all_obj |= m
     bg_mask = ~all_obj
 
+    # (region_name, token_mask, step_index_when_added)
+    # step=0 means base — compare base to mode's final for background
     region_specs = [("background", bg_mask, 0)]
     for i, edit in enumerate(edits):
         region_specs.append((edit["name"], ref_masks[i], i + 1))
 
-    # stability[region][mode] = float diff
     stability: Dict[str, Dict[str, float]] = {name: {} for name, _, _ in region_specs}
-    ref_imgs = imgs_by_mode[ref_key]
 
     for mode in modes:
-        final = imgs_by_mode[mode][-1]
+        mode_imgs = imgs_by_mode[mode]
+        final     = mode_imgs[-1]
         for name, mask, step_added in region_specs:
-            when_added = ref_imgs[step_added]
+            # Use THIS mode's image at step_added (not the kv chain's)
+            when_added = mode_imgs[min(step_added, len(mode_imgs) - 1)]
             stability[name][mode] = region_diff(when_added, final, mask, h_lat, w_lat)
 
-    # Visual: [when_added | baseline_final | kv_final | composite_final]
     labels = {
-        "baseline": "Baseline",
-        "kv":       f"K/V (s={strength})",
-        "composite": f"Composite (σ={feather_sigma})",
+        "baseline":   "Baseline",
+        "kv":         f"K/V (s={strength})",
+        "composite":  f"Composite (σ={feather_sigma})",
+        "bg_replace": f"BG-Replace",
     }
-    ncols = len(modes) + 1
+
+    # Visual grid: for each region, show [base/when_added | mode_final ...] per mode
+    ref_imgs = imgs_by_mode[ref_key]
+    ncols    = len(modes) + 1
     images, titles = [], []
 
     for name, mask, step_added in region_specs:
         images.append(ref_imgs[step_added])
-        titles.append(f"[{name}]\nwhen added")
+        titles.append(f"[{name}]\n(kv) when added")
         for mode in modes:
             final_img = imgs_by_mode[mode][-1]
             dval      = stability[name][mode]
@@ -521,8 +626,9 @@ def parse_args():
     p.add_argument("--config",         default=None,
                    help="JSON list of {name, prompt}. Overrides built-in EDITS.")
     p.add_argument("--mode",           default="all",
-                   choices=["all", "composite", "kv", "baseline"],
-                   help="'all' runs baseline + kv + composite in sequence.")
+                   choices=["all", "bg_replace", "composite", "kv", "baseline"],
+                   help="'all' runs baseline + kv + bg_replace. "
+                        "'composite' is the older approach (ghosting issues).")
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--num_steps",      type=int,   default=28)
     p.add_argument("--probe_steps",    type=int,   default=18)
@@ -561,7 +667,7 @@ def main():
     h_lat = args.height // 16
     w_lat = args.width  // 16
     vital_layers = ALL_LAYERS if args.all_layers else TIER_A_LAYERS
-    modes = (["baseline", "kv", "composite"] if args.mode == "all" else [args.mode])
+    modes = (["baseline", "kv", "bg_replace"] if args.mode == "all" else [args.mode])
 
     print(f"Edit sequence  : {[e['name'] for e in edits]}")
     print(f"Modes          : {modes}")
@@ -630,6 +736,22 @@ def main():
                 threshold=args.threshold,
                 feather_sigma=args.feather_sigma,
                 out_dir=args.out_dir,
+            )
+
+        elif mode == "bg_replace":
+            imgs, obj_masks = run_bg_replace_chain(
+                pipe, base, edits,
+                h_lat=h_lat, w_lat=w_lat,
+                seed=args.seed, num_steps=args.num_steps,
+                probe_steps=args.probe_steps,
+                guidance=args.guidance,
+                height=args.height, width=args.width,
+                strength=args.strength, cutoff=args.cutoff,
+                vital_layers=vital_layers,
+                threshold=args.threshold,
+                feather_sigma=args.feather_sigma,
+                out_dir=args.out_dir,
+                device=args.device,
             )
 
         else:
