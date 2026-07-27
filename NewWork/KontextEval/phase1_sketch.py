@@ -145,6 +145,14 @@ LORA_TRIGGER  = "Convert this sketch into real life version, follow exact struct
 
 def load_rmbg(cache_dir: str, device: str = "cuda"):
     """Load briaai/RMBG-2.0 for semantic foreground mask extraction."""
+    try:
+        import kornia  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "briaai/RMBG-2.0 requires 'kornia'. Install it with:\n"
+            "  pip install kornia"
+        ) from None
+
     from transformers import AutoModelForImageSegmentation
     model = AutoModelForImageSegmentation.from_pretrained(
         "briaai/RMBG-2.0",
