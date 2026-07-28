@@ -615,56 +615,273 @@ def paste_object_at_bbox(
 # Placement: probe-based fallback (no VLM key)
 # ============================================================
 
-def paste_object_at_probe(
-    scene: Image.Image,
-    obj_img: Image.Image,
-    obj_mask: np.ndarray,          # bool (H, W) from RMBG-2.0
-    probe_flat_mask: np.ndarray,   # bool (n_gen,) from probe diff
+def _probe_mask_to_bbox(
+    probe_flat_mask: np.ndarray,
     h_lat: int, w_lat: int,
-    feather_sigma: float = 8.0,
-) -> Image.Image:
-    """
-    Resize the generated object to fit the probe-detected bounding box,
-    then paste it onto the scene with a feathered alpha blend.
-
-    Interior of the object mask stays at alpha=1.0 (guaranteed by feather_mask).
-    Returns the rough composite image.
-    """
-    H, W = scene.size[1], scene.size[0]
-    px_probe = _token_to_pixel(probe_flat_mask, h_lat, w_lat, H, W)
-    rows = np.where(px_probe.any(axis=1))[0]
-    cols = np.where(px_probe.any(axis=0))[0]
+    H: int, W: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Token-level probe mask -> pixel bbox (y1,y2,x1,x2), or None if empty."""
+    px = _token_to_pixel(probe_flat_mask, h_lat, w_lat, H, W)
+    rows = np.where(px.any(axis=1))[0]
+    cols = np.where(px.any(axis=0))[0]
     if len(rows) == 0 or len(cols) == 0:
-        print("    [paste_object_at_probe] WARNING: empty probe mask -- skipping paste.")
-        return scene
+        return None
+    return int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
 
-    y1, y2 = int(rows[0]), int(rows[-1]) + 1
-    x1, x2 = int(cols[0]), int(cols[-1]) + 1
-    bh, bw = y2 - y1, x2 - x1
 
-    # Tight-crop the generated object using its RMBG mask
+def _crop_resize_obj(
+    obj_img: Image.Image,
+    obj_mask: np.ndarray,
+    bw: int, bh: int,
+    feather_sigma: float,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Tight-crop obj using RMBG mask, resize to (bw, bh).
+    Returns (obj_arr float (bh,bw,3), alpha_small float (bh,bw)), or (None,None).
+    """
     r, c = np.where(obj_mask)
     if len(r) == 0:
-        print("    [paste_object_at_probe] WARNING: empty RMBG mask -- skipping paste.")
-        return scene
+        return None, None
     oy1, oy2 = int(r.min()), int(r.max()) + 1
     ox1, ox2 = int(c.min()), int(c.max()) + 1
     obj_crop  = obj_img.crop((ox1, oy1, ox2, oy2))
     mask_crop = Image.fromarray(obj_mask[oy1:oy2, ox1:ox2].astype(np.uint8) * 255, "L")
-
-    # Resize to probe bounding box
     obj_r  = obj_crop.resize((bw, bh), Image.LANCZOS)
     mask_r = mask_crop.resize((bw, bh), Image.BILINEAR)
-
-    # Full-scene alpha with feathering (interior clamped to 1.0 by feather_mask)
     alpha_small = feather_mask(np.array(mask_r) > 127, feather_sigma)
-    alpha_full  = np.zeros((H, W), dtype=float)
+    return np.array(obj_r).astype(float), alpha_small
+
+
+def lab_luminance_transfer(
+    obj_arr: np.ndarray,
+    probe_region: np.ndarray,
+) -> np.ndarray:
+    """
+    Correct the sketch object's brightness to match the scene's local lighting.
+
+    Transfers mean + std of the L (luminance) channel from probe_region → obj_arr.
+    A/B channels (actual color) are kept from obj_arr, so a yellow bicycle stays
+    yellow but gets warm room shadows instead of studio-white brightness.
+
+    Reinhard et al. (2001), "Color Transfer between Images."
+    Only L is transferred — not A/B — to avoid unintended color casts.
+
+    Returns uint8 RGB array with corrected luminance.
+    """
+    try:
+        from skimage.color import rgb2lab, lab2rgb
+    except ImportError:
+        return obj_arr  # skimage not available; skip silently
+
+    obj_f    = obj_arr.astype(np.float32) / 255.0
+    probe_f  = probe_region.astype(np.float32) / 255.0
+
+    obj_lab   = rgb2lab(obj_f)
+    probe_lab = rgb2lab(probe_f)
+
+    obj_L   = obj_lab[:, :, 0]      # L in [0, 100]
+    probe_L = probe_lab[:, :, 0]
+
+    obj_mean,   obj_std   = float(obj_L.mean()),   float(obj_L.std())
+    probe_mean, probe_std = float(probe_L.mean()), float(probe_L.std())
+
+    # Skip degenerate cases (flat-colour or near-flat objects)
+    if obj_std > 0.5:
+        scale          = (probe_std / obj_std) if obj_std > 0 else 1.0
+        corrected_L    = (obj_L - obj_mean) * scale + probe_mean
+        obj_lab[:, :, 0] = np.clip(corrected_L, 0, 100)
+
+    return (lab2rgb(obj_lab) * 255.0).clip(0, 255).astype(np.uint8)
+
+
+def poisson_blend_into_scene(
+    scene: Image.Image,
+    obj_u8: np.ndarray,
+    obj_mask_small: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+) -> Image.Image:
+    """
+    Gradient-domain seamless cloning of obj_u8 into scene at bbox.
+
+    Uses cv2.seamlessClone (Pérez et al., SIGGRAPH 2003).  The Poisson solver
+    copies the *gradient field* of the source, then finds pixel values whose
+    gradient matches while satisfying the destination boundary conditions.
+    Result: boundary is indistinguishable from the destination even when source
+    and destination colours differ slightly.
+
+    obj_u8       : uint8 (bh, bw, 3) RGB -- tight-cropped & resized to bbox
+    obj_mask_small: bool (bh, bw) -- True where object pixels are
+    """
+    try:
+        import cv2
+    except ImportError:
+        # Graceful fallback: simple alpha paste
+        y1, y2, x1, x2 = bbox
+        H, W = scene.size[1], scene.size[0]
+        alpha = obj_mask_small.astype(float)[:, :, np.newaxis]
+        sarr  = np.array(scene).astype(float)
+        patch = sarr[y1:y2, x1:x2].copy()
+        patch = alpha * obj_u8 + (1.0 - alpha) * patch
+        sarr[y1:y2, x1:x2] = patch
+        return Image.fromarray(sarr.clip(0, 255).astype(np.uint8))
+
+    y1, y2, x1, x2 = bbox
+    bh, bw  = y2 - y1, x2 - x1
+    H, W    = scene.size[1], scene.size[0]
+
+    scene_bgr = cv2.cvtColor(np.array(scene).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+    # Full-scene source: scene with the (colour-corrected) object pasted in
+    src_bgr = scene_bgr.copy()
+    src_bgr[y1:y2, x1:x2] = cv2.cvtColor(obj_u8, cv2.COLOR_RGB2BGR)
+
+    # Full-scene mask (white = "copy from source", black = "keep destination")
+    mask_small = (obj_mask_small.astype(np.uint8) * 255)
+    # Erode 3 px so seamlessClone never tries to solve right at the RMBG boundary
+    kernel     = np.ones((5, 5), np.uint8)
+    mask_small = cv2.erode(mask_small, kernel, iterations=1)
+
+    mask_full            = np.zeros((H, W), dtype=np.uint8)
+    mask_full[y1:y2, x1:x2] = mask_small
+
+    if mask_full.sum() == 0:
+        return scene  # nothing to blend
+
+    center = (x1 + bw // 2, y1 + bh // 2)   # (cx, cy) — OpenCV x-first
+
+    try:
+        result_bgr = cv2.seamlessClone(
+            src_bgr, scene_bgr, mask_full, center, cv2.NORMAL_CLONE
+        )
+        return Image.fromarray(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
+    except cv2.error:
+        return scene   # safety fallback
+
+
+def create_harmonized_composite(
+    scene: Image.Image,
+    img_probe: Image.Image,
+    obj_img: Image.Image,
+    obj_mask: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    feather_sigma: float = 8.0,
+    harmonize: str = "lab+poisson",
+) -> Image.Image:
+    """
+    Build a scene-harmonized rough composite so Kontext only needs light
+    refinement (strength≈0.45) instead of wholesale relighting (strength≈0.8).
+
+    Pipeline:
+      1. [lab]    LAB luminance transfer from probe region → sketch object
+                  → object brightness/shadows match scene; colours unchanged
+                  (Reinhard 2001)
+      2. [poisson] Poisson seamless cloning into scene
+                  → gradient-domain boundary; no hard edge artefacts
+                  (Pérez 2003, implemented as cv2.seamlessClone)
+      Fallback:   feathered alpha blend if either lib is unavailable
+
+    harmonize: 'lab+poisson' (default, best) | 'lab' | 'poisson' | 'none'
+    """
+    y1, y2, x1, x2 = bbox
+    bh, bw = y2 - y1, x2 - x1
+    H, W   = scene.size[1], scene.size[0]
+
+    if bh <= 0 or bw <= 0:
+        return scene
+
+    obj_arr, alpha_small = _crop_resize_obj(obj_img, obj_mask, bw, bh, feather_sigma)
+    if obj_arr is None:
+        return scene
+
+    obj_u8     = obj_arr.astype(np.uint8)
+    mask_bool  = alpha_small > 0.5   # binary mask at bbox size for Poisson
+
+    # ── Step 1: LAB luminance correction ─────────────────────────────────────
+    if "lab" in harmonize:
+        probe_region = np.array(img_probe)[y1:y2, x1:x2]   # (bh, bw, 3)
+        obj_u8 = lab_luminance_transfer(obj_u8, probe_region)
+
+    # ── Step 2: Poisson seamless cloning ─────────────────────────────────────
+    if "poisson" in harmonize:
+        return poisson_blend_into_scene(scene, obj_u8, mask_bool, bbox)
+
+    # ── Fallback: feathered alpha blend ──────────────────────────────────────
+    alpha_full = np.zeros((H, W), dtype=float)
+    alpha_full[y1:y2, x1:x2] = alpha_small
+    alpha3    = alpha_full[:, :, np.newaxis]
+    scene_arr = np.array(scene).astype(float)
+    paste_arr = scene_arr.copy()
+    paste_arr[y1:y2, x1:x2] = obj_u8.astype(float)
+    result = alpha3 * paste_arr + (1.0 - alpha3) * scene_arr
+    return Image.fromarray(result.clip(0, 255).astype(np.uint8))
+
+
+def create_sketch_probe_blend(
+    scene: Image.Image,
+    img_probe: Image.Image,
+    obj_img: Image.Image,
+    obj_mask: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    feather_sigma: float = 8.0,
+    sketch_alpha: float = 0.5,
+) -> Image.Image:
+    """
+    Legacy: 50/50 alpha blend of sketch appearance + probe lighting.
+    Kept for reference; use create_harmonized_composite instead.
+    """
+    y1, y2, x1, x2 = bbox
+    bh, bw = y2 - y1, x2 - x1
+    H, W   = scene.size[1], scene.size[0]
+
+    if bh <= 0 or bw <= 0:
+        return scene
+
+    obj_arr, alpha_small = _crop_resize_obj(obj_img, obj_mask, bw, bh, feather_sigma)
+    if obj_arr is None:
+        return scene
+
+    alpha_full = np.zeros((H, W), dtype=float)
     alpha_full[y1:y2, x1:x2] = alpha_small
     alpha3 = alpha_full[:, :, np.newaxis]
 
+    scene_arr  = np.array(scene).astype(float)
+    probe_arr  = np.array(img_probe).astype(float)
+    sketch_arr = scene_arr.copy()
+    sketch_arr[y1:y2, x1:x2] = obj_arr
+
+    result = (
+        alpha3 * (sketch_alpha * sketch_arr + (1.0 - sketch_alpha) * probe_arr)
+        + (1.0 - alpha3) * scene_arr
+    )
+    return Image.fromarray(result.clip(0, 255).astype(np.uint8))
+
+
+def paste_object_at_probe(
+    scene: Image.Image,
+    obj_img: Image.Image,
+    obj_mask: np.ndarray,
+    probe_flat_mask: np.ndarray,
+    h_lat: int, w_lat: int,
+    feather_sigma: float = 8.0,
+) -> Image.Image:
+    """Legacy pure-sketch paste (no lighting blend). Used only as a last-resort fallback."""
+    H, W = scene.size[1], scene.size[0]
+    bbox = _probe_mask_to_bbox(probe_flat_mask, h_lat, w_lat, H, W)
+    if bbox is None:
+        print("    [paste_object_at_probe] WARNING: empty probe mask -- skipping paste.")
+        return scene
+    y1, y2, x1, x2 = bbox
+    bh, bw = y2 - y1, x2 - x1
+    obj_arr, alpha_small = _crop_resize_obj(obj_img, obj_mask, bw, bh, feather_sigma)
+    if obj_arr is None:
+        print("    [paste_object_at_probe] WARNING: empty RMBG mask -- skipping paste.")
+        return scene
+    alpha_full = np.zeros((H, W), dtype=float)
+    alpha_full[y1:y2, x1:x2] = alpha_small
+    alpha3 = alpha_full[:, :, np.newaxis]
     scene_f = np.array(scene).astype(float)
     paste_f = scene_f.copy()
-    paste_f[y1:y2, x1:x2] = np.array(obj_r).astype(float)
+    paste_f[y1:y2, x1:x2] = obj_arr
     result = alpha3 * paste_f + (1.0 - alpha3) * scene_f
     return Image.fromarray(result.clip(0, 255).astype(np.uint8))
 
@@ -689,6 +906,7 @@ def run_sketch_chain(
     mode_tag: str,
     device: str,
     vlm_pair: Optional[Tuple] = None,
+    sketch_alpha: float = 0.5,
 ) -> Tuple[List[Image.Image], List[np.ndarray]]:
     """
     Stage B: place each generated object into the scene sequentially.
@@ -732,10 +950,27 @@ def run_sketch_chain(
         obj_img, obj_mask = generated[name]
         print(f"\n  [{mode_tag}] step {i+1}/{len(edits)}  {name}")
 
+        # ── PROBE: always run regardless of VLM mode ──────────────────────────
+        # The probe serves two purposes:
+        #   (a) Placement/mask detection (probe-only mode)
+        #   (b) Lighting reference for create_sketch_probe_blend (both modes)
+        # Running Kontext on the scene + text prompt gives us the object at the
+        # RIGHT LOCATION with CORRECT SCENE LIGHTING.  We borrow that lighting
+        # even when VLM handles the placement decision.
+        print(f"    probe  ({probe_steps} steps) ...")
+        img_probe = run_standard(pipe, img_prev, prompt,
+                                 seed, probe_steps, guidance, height, width)
+        img_probe.save(os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_probe.png"))
+
+        target_raw  = pixel_to_token_mask(img_prev, img_probe, h_lat, w_lat, threshold)
+        base_stable = ~pixel_to_token_mask(base, img_probe, h_lat, w_lat, threshold)
+        target_clean = target_raw & ~base_stable
+        print(f"    probe target={target_clean.mean()*100:.1f}%")
+
         if use_vlm:
             # ── VLM PATH ──────────────────────────────────────────────────────
-            # 1. REASON: VLM looks at the current scene + generated object
-            #    and decides where and how big to place it.
+            # VLM decides WHERE and HOW BIG.
+            # Probe provides SCENE-CONSISTENT LIGHTING for the blend.
             print(f"    asking VLM where/how to place '{name}' ...")
             _vlm_model, _vlm_proc = vlm_pair
             placement = reason_placement_vlm(
@@ -748,43 +983,39 @@ def run_sketch_chain(
             obj_token_mask = bbox_to_token_mask(bbox, h_lat, w_lat, H, W)
             obj_masks.append(obj_token_mask)
 
-            # Debug: save the VLM-chosen bbox drawn on the scene
             _save_bbox_overlay(img_prev, bbox,
                 os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_vlm_bbox.png"))
 
-            # 2. PLACE: paste at VLM-determined pixel bbox (no token snapping)
-            rough_composite = paste_object_at_bbox(
-                img_prev, obj_img, obj_mask, bbox, feather_sigma,
-            )
-
-            # background_mask for K/V injection = everything OUTSIDE the VLM bbox
-            bg_mask_for_kv = ~obj_token_mask
-
         else:
-            # ── PROBE FALLBACK ────────────────────────────────────────────────
-            # 1. PROBE: lightweight generation to find the natural change region
-            print(f"    probe  ({probe_steps} steps) ...")
-            img_probe = run_standard(pipe, img_prev, prompt,
-                                     seed, probe_steps, guidance, height, width)
-            img_probe.save(
-                os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_probe.png"))
-
-            target_raw   = pixel_to_token_mask(img_prev, img_probe, h_lat, w_lat, threshold)
-            base_stable  = ~pixel_to_token_mask(base, img_probe, h_lat, w_lat, threshold)
-            target_clean = target_raw & ~base_stable
+            # ── PROBE PATH ────────────────────────────────────────────────────
+            # Probe decides WHERE and HOW BIG (Kontext's natural placement).
             obj_masks.append(target_clean)
-            print(f"    target={target_clean.mean()*100:.1f}%")
             color_overlay(img_prev, target_clean, h_lat, w_lat,
                           color=(0, 180, 255), alpha=0.45).save(
                 os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_target.png"))
 
-            # 2. PLACE: paste at probe-detected location (token-bbox)
-            rough_composite = paste_object_at_probe(
-                img_prev, obj_img, obj_mask, target_clean,
-                h_lat, w_lat, feather_sigma,
-            )
-            bg_mask_for_kv  = ~target_clean
-            obj_token_mask  = target_clean
+            bbox = _probe_mask_to_bbox(target_clean, h_lat, w_lat, H, W)
+            if bbox is None:
+                print(f"    WARNING: empty probe mask for '{name}' -- skipping.")
+                imgs.append(img_prev)
+                continue
+            obj_token_mask = bbox_to_token_mask(bbox, h_lat, w_lat, H, W)
+
+        # ── PLACE: probe lighting + sketch appearance blend ────────────────────
+        # The sketch object has studio white-bg lighting.
+        # The probe image has scene-consistent room lighting at the right location.
+        # Blend both: sketch_alpha * sketch + (1-sketch_alpha) * probe
+        # so that Kontext's integration step starts from a better base.
+        rough_composite = create_sketch_probe_blend(
+            scene=img_prev,
+            img_probe=img_probe,
+            obj_img=obj_img,
+            obj_mask=obj_mask,
+            bbox=bbox,
+            feather_sigma=feather_sigma,
+            sketch_alpha=sketch_alpha,
+        )
+        bg_mask_for_kv = ~obj_token_mask
 
         rough_composite.save(
             os.path.join(out_dir, f"sk_{mode_tag}_step{i+1}_{name}_rough.png"))
@@ -894,17 +1125,27 @@ def parse_args():
                    help="RMBG-2.0 alpha threshold for mask binarisation [0,1].")
     p.add_argument("--seed",             type=int,   default=42)
     p.add_argument("--num_steps",        type=int,   default=28)
-    p.add_argument("--probe_steps",      type=int,   default=18)
+    p.add_argument("--probe_steps",      type=int,   default=28,
+                   help="Denoising steps for the probe pass (default 28 = full quality, "
+                        "gives accurate placement and better lighting reference).")
     p.add_argument("--guidance",         type=float, default=2.5,
                    help="guidance_scale for Stage B (scene insertion).")
-    p.add_argument("--strength",         type=float, default=0.3,
-                   help="K/V injection strength (Stage B).")
-    p.add_argument("--cutoff",           type=float, default=0.4,
-                   help="Inject first CUTOFF fraction of steps (Stage B).")
+    p.add_argument("--strength",         type=float, default=0.8,
+                   help="K/V injection strength for background locking (default 0.8). "
+                        "Higher = background locked tighter, Kontext has more freedom to "
+                        "relight and integrate the object. 0.3 was too weak (copy-paste look).")
+    p.add_argument("--cutoff",           type=float, default=0.65,
+                   help="Inject K/V for first CUTOFF fraction of denoising steps (default 0.65).")
     p.add_argument("--threshold",        type=float, default=40.0,
                    help="Pixel diff threshold for probe mask detection.")
     p.add_argument("--feather_sigma",    type=float, default=8.0,
                    help="Gaussian blur radius (px) for object boundary feathering.")
+    p.add_argument("--sketch_alpha",     type=float, default=0.5,
+                   help="Blend weight for sketch appearance vs probe lighting in the rough "
+                        "composite (default 0.5 = equal blend). "
+                        "1.0 = pure sketch (original appearance, wrong lighting). "
+                        "0.0 = pure probe (correct lighting, Kontext appearance). "
+                        "0.3-0.5 recommended for natural integration.")
     p.add_argument("--all_layers",       action="store_true",
                    help="Use all 57 layers for K/V injection (TIER_A is default).")
     p.add_argument("--height",           type=int,   default=1024)
@@ -1009,7 +1250,7 @@ def main():
             vital_layers=vital_layers, threshold=args.threshold,
             feather_sigma=args.feather_sigma,
             out_dir=args.out_dir, mode_tag="lora", device=args.device,
-            vlm_pair=vlm_pair,
+            vlm_pair=vlm_pair, sketch_alpha=args.sketch_alpha,
         )
         imgs_by_mode["sketch_lora"]      = imgs
         obj_masks_by_mode["sketch_lora"] = masks
@@ -1057,7 +1298,7 @@ def main():
             vital_layers=vital_layers, threshold=args.threshold,
             feather_sigma=args.feather_sigma,
             out_dir=args.out_dir, mode_tag="cn", device=args.device,
-            vlm_pair=vlm_pair,
+            vlm_pair=vlm_pair, sketch_alpha=args.sketch_alpha,
         )
         imgs_by_mode["sketch_cn"]      = imgs_cn
         obj_masks_by_mode["sketch_cn"] = masks_cn
