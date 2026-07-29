@@ -524,11 +524,13 @@ def run_obj_kv_chain(
         name = edit["name"]
         desc = edit["description"]
         sketch_path = os.path.join(sketch_dir, f"{name}.png")
+        if not os.path.isfile(sketch_path):
+            sketch_path = os.path.join(sketch_dir, f"sketch_{name}.png")
 
         if not os.path.isfile(sketch_path):
             raise FileNotFoundError(
-                f"Sketch not found: {sketch_path}\n"
-                f"Save your sketch as '{name}.png' in --sketch_dir."
+                f"Sketch not found in {sketch_dir!r}.\n"
+                f"Expected '{name}.png' or 'sketch_{name}.png'."
             )
 
         print(f"\n{'─'*60}")
