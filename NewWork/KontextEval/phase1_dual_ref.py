@@ -433,8 +433,28 @@ def main():
 
     if args.config is not None:
         # ── Multi-step ──────────────────────────────────────────────────────
+        config_dir = os.path.dirname(os.path.abspath(args.config))
         with open(args.config) as f:
             edits = json.load(f)
+
+        # Resolve sketch/obj paths relative to the config file's directory
+        for edit in edits:
+            for key in ("sketch", "obj"):
+                if key in edit and not os.path.isabs(edit[key]):
+                    edit[key] = os.path.join(config_dir, edit[key])
+
+        # Validate all input files exist before starting
+        missing = []
+        for edit in edits:
+            for key in ("sketch", "obj"):
+                if key in edit and not os.path.exists(edit[key]):
+                    missing.append(f"  [{edit['name']}] {key}: {edit[key]}")
+        if missing:
+            raise FileNotFoundError(
+                "Missing input files — put these in the inputs/ directory:\n"
+                + "\n".join(missing)
+            )
+
         run_multi_step(
             pipe, base_scene, edits,
             mode=args.mode,
