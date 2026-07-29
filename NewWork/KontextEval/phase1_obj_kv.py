@@ -134,6 +134,36 @@ def _neutralize_white_bg(img: Image.Image, threshold: int = 240,
 
 # ── Stage K: capture K/V from obj_img ─────────────────────────────────────────
 
+def _compute_obj_token_mask(
+    obj_img: Image.Image,
+    h_lat: int,
+    w_lat: int,
+    grey: tuple = (128, 128, 128),
+    tolerance: int = 10,
+    min_frac: float = 0.05,
+) -> np.ndarray:
+    """
+    Returns bool mask (h_lat * w_lat,) where True = object token (non-grey).
+    Called on the ORIGINAL obj_img (before white→grey neutralization) so the
+    threshold catches the white background that becomes grey after neutralization.
+    Falls back to center 50% crop if object region < min_frac (degenerate case).
+    """
+    arr = np.array(obj_img.convert("RGB").resize((w_lat, h_lat), Image.LANCZOS))
+    is_grey = (
+        (np.abs(arr[:, :, 0].astype(int) - grey[0]) <= tolerance) &
+        (np.abs(arr[:, :, 1].astype(int) - grey[1]) <= tolerance) &
+        (np.abs(arr[:, :, 2].astype(int) - grey[2]) <= tolerance)
+    )
+    # Also catch near-white pixels (the original LoRA output background before neutralization)
+    is_white = (arr[:, :, 0] >= 230) & (arr[:, :, 1] >= 230) & (arr[:, :, 2] >= 230)
+    mask = ~(is_grey | is_white)
+    if mask.mean() < min_frac:
+        mask[:] = False
+        h0, h1 = h_lat // 4, 3 * h_lat // 4
+        w0, w1 = w_lat // 4, 3 * w_lat // 4
+        mask[h0:h1, w0:w1] = True
+    return mask.reshape(-1)  # (h_lat * w_lat,) bool
+
 class _ObjKVCapture:
     """
     Minimal attention processor that performs standard attention AND captures
@@ -245,13 +275,21 @@ def capture_obj_kv(
     very strongly in the K/V — the noisy gen latents have not yet established
     any structure, so the reference dominates.  One step is enough.
 
-    Returns: {layer_idx: (K_cpu, V_cpu)} for each TIER_A layer captured.
+    Returns: ({layer_idx: (K_cpu, V_cpu)}, obj_mask_np) where obj_mask_np is a
+    bool array (n_gen,) marking which token positions are non-background in obj_img.
     """
     vae_sf  = getattr(pipe, "vae_scale_factor", 8)
     # Kontext packs 2×2 latent patches into one token — divide by vae_sf then by 2.
     # Do NOT use pipe.transformer.config.patch_size: it reports 1 in this diffusers
     # version (it describes the VAE-to-latent step, not the token-packing step).
-    n_gen   = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+    h_lat   = height // (vae_sf * 2)
+    w_lat   = width  // (vae_sf * 2)
+    n_gen   = h_lat * w_lat
+
+    # Compute object-region mask from ORIGINAL pixels (before background fill)
+    obj_mask_np  = _compute_obj_token_mask(obj_img, h_lat, w_lat)
+    pct = 100.0 * obj_mask_np.mean()
+    print(f"    [K] Object-region mask: {obj_mask_np.sum()} / {n_gen} tokens ({pct:.1f}%)")
 
     obj_neutral  = _neutralize_white_bg(obj_img)
     capture_proc = _ObjKVCapture(n_gen=n_gen, tier_a=set(vital_layers), single_txt_len=512)
@@ -272,7 +310,7 @@ def capture_obj_kv(
 
     captured = dict(capture_proc.kv)
     print(f"    [K] Captured K/V at {len(captured)}/{len(vital_layers)} TIER_A layers.")
-    return captured
+    return captured, obj_mask_np
 
 
 # ── Injection processor ───────────────────────────────────────────────────────
@@ -300,9 +338,11 @@ class ObjKVInject(KontextInjectionProcessor):
 
     def __init__(self, state: InjectionState,
                  obj_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+                 obj_mask_np: np.ndarray,
                  obj_strength: float = 0.7):
         super().__init__(state, total_layers=N_LAYERS)
-        self.obj_kv      = obj_kv
+        self.obj_kv       = obj_kv
+        self.obj_mask_np  = obj_mask_np
         self.obj_strength = obj_strength
 
     def _inject(self, k, v, img_offset: int):
@@ -335,17 +375,24 @@ class ObjKVInject(KontextInjectionProcessor):
             sh    = zones.shell.view(1, 1, -1, 1)
             k_gen = torch.where(sh, (1 - s_bg) * k_gen + s_bg * k_ref, k_gen)
 
-        # ── Target: inject mean-pooled obj K/V (object appearance lock) ───────
+        # ── Target: inject obj K/V (object appearance lock) ──────────────────
         if (zones is not None and zones.target.any() and layer in self.obj_kv):
             k_obj_raw, v_obj_raw = self.obj_kv[layer]
             k_obj_raw = k_obj_raw.to(k.device, k.dtype)
             v_obj_raw = v_obj_raw.to(v.device, v.dtype)
 
-            # Mean-pool over spatial positions so every target token gets
-            # the same global appearance summary — robust to the mismatch
-            # between obj_img's spatial layout and the target zone's location.
-            k_obj = k_obj_raw.mean(dim=2, keepdim=True).expand_as(k_gen)
-            v_obj = v_obj_raw.mean(dim=2, keepdim=True).expand_as(v_gen)
+            # Filter to object-region tokens only (non-background in obj_img).
+            # Mean-pooling the full spatial sequence dilutes the appearance signal
+            # with grey-background tokens — filter first, then pool.
+            obj_idx = torch.from_numpy(np.where(self.obj_mask_np)[0]).to(k.device)
+            if obj_idx.numel() > 0:
+                k_obj_filt = k_obj_raw[:, :, obj_idx, :]   # (1, H, n_obj, d)
+                v_obj_filt = v_obj_raw[:, :, obj_idx, :]
+            else:
+                k_obj_filt = k_obj_raw  # fallback: use all tokens
+                v_obj_filt = v_obj_raw
+            k_obj = k_obj_filt.mean(dim=2, keepdim=True).expand_as(k_gen)
+            v_obj = v_obj_filt.mean(dim=2, keepdim=True).expand_as(v_gen)
 
             tgt   = zones.target.view(1, 1, -1, 1)
             s_obj = self.obj_strength
@@ -367,6 +414,7 @@ def run_obj_appearance_edit(
     scene:         Image.Image,
     prompt:        str,
     obj_kv:        Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    obj_mask_np:   np.ndarray,
     obj_noun:      str,
     vital_layers:  List[int],
     height:        int,
@@ -415,7 +463,7 @@ def run_obj_appearance_edit(
         state.zones = ZoneMasks(
             background=everywhere, shell=nothing, target=nothing,
         ).to_device(device)
-        proc = ObjKVInject(state, obj_kv=obj_kv, obj_strength=0.0)
+        proc = ObjKVInject(state, obj_kv=obj_kv, obj_mask_np=obj_mask_np, obj_strength=0.0)
         proc._single_txt_len = 512
         pipe.transformer.set_attn_processor(proc)
         generator = set_determinism(seed)
@@ -444,7 +492,7 @@ def run_obj_appearance_edit(
         background=everywhere, shell=nothing, target=nothing,
     ).to_device(device)
 
-    proc = ObjKVInject(state, obj_kv=obj_kv, obj_strength=obj_strength)
+    proc = ObjKVInject(state, obj_kv=obj_kv, obj_mask_np=obj_mask_np, obj_strength=obj_strength)
     proc._single_txt_len = 512
     pipe.transformer.set_attn_processor(proc)
 
@@ -566,9 +614,9 @@ def run_obj_kv_chain(
             f.write(kontext_prompt)
         print(f"      Saved: {prompt_path}")
 
-        # Stage K: capture obj K/V
+        # Stage K: capture obj K/V + object-region mask
         print(f"  [K] Capturing obj K/V from {name} image ({capture_steps}-step pass) ...")
-        obj_kv = capture_obj_kv(
+        obj_kv, obj_mask_np = capture_obj_kv(
             pipe=pipe, obj_img=obj_img, height=height, width=width,
             device=device, vital_layers=vital_layers, seed=seed,
             capture_steps=capture_steps,
@@ -580,7 +628,7 @@ def run_obj_kv_chain(
         print(f"  [B] Editing scene  (obj_noun='{obj_noun}', obj_strength={obj_strength}) ...")
         next_scene = run_obj_appearance_edit(
             pipe=pipe, scene=scene, prompt=kontext_prompt, obj_kv=obj_kv,
-            obj_noun=obj_noun, vital_layers=vital_layers,
+            obj_mask_np=obj_mask_np, obj_noun=obj_noun, vital_layers=vital_layers,
             height=height, width=width, seed=seed, num_steps=num_steps,
             guidance=scene_guidance, inject_strength=inject_strength,
             obj_strength=obj_strength, cutoff_frac=cutoff_frac,
