@@ -248,8 +248,10 @@ def capture_obj_kv(
     Returns: {layer_idx: (K_cpu, V_cpu)} for each TIER_A layer captured.
     """
     vae_sf  = getattr(pipe, "vae_scale_factor", 8)
-    patch   = getattr(pipe.transformer.config, "patch_size", 2)
-    n_gen   = (height // (vae_sf * patch)) * (width // (vae_sf * patch))
+    # Kontext packs 2×2 latent patches into one token — divide by vae_sf then by 2.
+    # Do NOT use pipe.transformer.config.patch_size: it reports 1 in this diffusers
+    # version (it describes the VAE-to-latent step, not the token-packing step).
+    n_gen   = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
 
     obj_neutral  = _neutralize_white_bg(obj_img)
     capture_proc = _ObjKVCapture(n_gen=n_gen, tier_a=set(vital_layers), single_txt_len=512)
@@ -390,9 +392,8 @@ def run_obj_appearance_edit(
                                target     → obj K/V injection
     """
     vae_sf = getattr(pipe, "vae_scale_factor", 8)
-    patch  = getattr(pipe.transformer.config, "patch_size", 2)
-    h_lat  = height // (vae_sf * patch)
-    w_lat  = width  // (vae_sf * patch)
+    h_lat  = height // (vae_sf * 2)   # 2 = 2×2 token-packing factor
+    w_lat  = width  // (vae_sf * 2)
     n_gen  = h_lat * w_lat
 
     everywhere = np.ones(n_gen, dtype=bool)
