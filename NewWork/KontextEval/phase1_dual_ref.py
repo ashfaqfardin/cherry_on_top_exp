@@ -185,8 +185,25 @@ def run_dual_ref(pipe, scene: Image.Image, obj_img: Image.Image, prompt: str,
     gen_ids     = _img_ids(pipe, gen_latents, device, dtype)        # (1, 4096, 3)
     n_gen       = gen_packed.shape[1]                               # 4096
 
-    # ── 5. Scheduler ──────────────────────────────────────────────────────────
-    pipe.scheduler.set_timesteps(num_inference_steps=num_steps, device=device)
+    # ── 5. Scheduler (dynamic shift requires mu) ──────────────────────────────
+    try:
+        from diffusers.pipelines.flux.pipeline_flux import calculate_shift
+    except ImportError:
+        from diffusers.pipelines.flux.pipeline_flux_kontext import calculate_shift
+
+    vae_sf     = getattr(pipe, "vae_scale_factor", 8)
+    patch_size = getattr(pipe.transformer.config, "patch_size", 2)
+    image_seq_len = (height // vae_sf // patch_size) * (width // vae_sf // patch_size)
+
+    mu = calculate_shift(
+        image_seq_len,
+        pipe.scheduler.config.get("base_image_seq_len", 256),
+        pipe.scheduler.config.get("max_image_seq_len", 4096),
+        pipe.scheduler.config.get("base_shift",         0.5),
+        pipe.scheduler.config.get("max_shift",          1.16),
+    )
+    sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
+    pipe.scheduler.set_timesteps(sigmas=sigmas, device=device, mu=mu)
     timesteps = pipe.scheduler.timesteps
 
     # ── 6. Guidance embedding (FLUX.1-dev has guidance_embeds=True) ───────────
