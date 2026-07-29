@@ -71,9 +71,11 @@ def _pack(pipe, latents: torch.Tensor) -> torch.Tensor:
 
 
 def _img_ids(pipe, latents: torch.Tensor, device, dtype) -> torch.Tensor:
-    """Build 2-D RoPE position grid (B, n_tokens, 3) for a latent tensor."""
+    """Build 2-D RoPE position grid (n_tokens, 3) for a latent tensor.
+    The transformer expects ids WITHOUT a batch dimension; squeeze if present."""
     B, C, H, W = latents.shape
-    return pipe._prepare_latent_image_ids(B, H // 2, W // 2, device, dtype)
+    ids = pipe._prepare_latent_image_ids(B, H // 2, W // 2, device, dtype)
+    return ids.squeeze(0) if ids.ndim == 3 else ids   # → (n_tokens, 3)
 
 
 def _noise_latents(pipe, height: int, width: int,
@@ -216,8 +218,8 @@ def run_dual_ref(pipe, scene: Image.Image, obj_img: Image.Image, prompt: str,
 
     for i, t in enumerate(timesteps):
         # Build 12288-token sequence: [gen | ref_scene | ref_obj]
-        model_input = torch.cat([latents, ref1_packed, ref2_packed], dim=1)
-        img_ids     = torch.cat([gen_ids, ref1_ids,   ref2_ids   ], dim=1)
+        model_input = torch.cat([latents, ref1_packed, ref2_packed], dim=1)  # (1, 12288, 64)
+        img_ids     = torch.cat([gen_ids, ref1_ids,   ref2_ids   ], dim=0)  # (12288, 3) — no batch dim
 
         t_batch = t.expand(1)
 
