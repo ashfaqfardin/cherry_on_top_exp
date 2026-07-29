@@ -64,9 +64,10 @@ def _vae_encode(pipe, image_pil: Image.Image, height: int, width: int,
 
 
 def _pack(pipe, latents: torch.Tensor) -> torch.Tensor:
-    """Pack (B, C, H, W) VAE latents → (B, H//2 * W//2, C*4) tokens."""
+    """Pack (B, C, H, W) VAE latents → (B, H//2 * W//2, C*4) tokens.
+    _pack_latents halves H/W internally, so pass the full latent dims."""
     B, C, H, W = latents.shape
-    return pipe._pack_latents(latents, B, C, H // 2, W // 2)
+    return pipe._pack_latents(latents, B, C, H, W)
 
 
 def _img_ids(pipe, latents: torch.Tensor, device, dtype) -> torch.Tensor:
