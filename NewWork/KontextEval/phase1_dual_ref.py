@@ -54,13 +54,30 @@ LORA_TRIGGER = "Convert this sketch into real life version, follow exact structu
 
 def _vae_encode(pipe, image_pil: Image.Image, height: int, width: int,
                 device, dtype) -> torch.Tensor:
-    """Preprocess PIL image and encode through VAE.  Returns latents (B,C,H,W)."""
+    """Preprocess PIL image and encode through VAE.  Returns latents (B,C,H,W).
+    Uses .mode() (deterministic) so reference encoding is stable across runs."""
     img_t = pipe.image_processor.preprocess(image_pil, height=height, width=width)
     img_t = img_t.to(device=device, dtype=dtype)
     with torch.no_grad():
-        latents = pipe.vae.encode(img_t).latent_dist.sample()
+        dist = pipe.vae.encode(img_t).latent_dist
+        latents = dist.mode()       # deterministic mean, not stochastic .sample()
     latents = (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
     return latents
+
+
+def _neutralize_white_bg(image_pil: Image.Image,
+                          threshold: int = 240,
+                          fill: tuple = (128, 128, 128)) -> Image.Image:
+    """Replace near-white pixels with neutral grey.
+    LoRA generates objects on white background; that white occupies ~90% of ref2
+    tokens and drowns out the object signal in cross-attention.  Grey is neutral
+    and much less likely to bleed into the generated scene."""
+    arr = np.array(image_pil.convert("RGB"), dtype=np.uint8)
+    is_white = (arr[:, :, 0] >= threshold) & \
+               (arr[:, :, 1] >= threshold) & \
+               (arr[:, :, 2] >= threshold)
+    arr[is_white] = fill
+    return Image.fromarray(arr)
 
 
 def _pack(pipe, latents: torch.Tensor) -> torch.Tensor:
@@ -175,11 +192,14 @@ def run_dual_ref(pipe, scene: Image.Image, obj_img: Image.Image, prompt: str,
     ref1_ids     = _img_ids(pipe, ref1_latents, device, dtype)      # (1, 4096, 3)
 
     # ── 3. Reference 2 — object ───────────────────────────────────────────────
-    ref2_latents = _vae_encode(pipe, obj_img, height, width, device, dtype)
+    obj_clean    = _neutralize_white_bg(obj_img)          # grey bg instead of white
+    ref2_latents = _vae_encode(pipe, obj_clean, height, width, device, dtype)
     ref2_packed  = _pack(pipe, ref2_latents)                        # (1, 4096, 64)
-    ref2_ids     = _img_ids(pipe, ref2_latents, device, dtype)      # (1, 4096, 3)
-    # ref2_ids shares the same [0, y, x] grid as ref1_ids.
-    # The model sees them as two separate context images via sequence order.
+    ref2_ids     = _img_ids(pipe, ref2_latents, device, dtype)      # (n_tokens, 3)
+    # Give ref2 a distinct frame id (dim-0 = 1) so RoPE can spatially distinguish
+    # it from ref1 and gen which both use frame id = 0.
+    ref2_ids     = ref2_ids.clone()
+    ref2_ids[:, 0] = 1
 
     # ── 4. Noisy generation latents ───────────────────────────────────────────
     gen_latents = _noise_latents(pipe, height, width, device, dtype, generator)
@@ -232,6 +252,7 @@ def run_dual_ref(pipe, scene: Image.Image, obj_img: Image.Image, prompt: str,
                 encoder_hidden_states= prompt_embeds,
                 txt_ids              = text_ids,
                 img_ids              = img_ids,
+                return_dict          = False,
             )[0]                                        # (1, 12288, 64)
 
         # Extract noise prediction for gen tokens only
@@ -368,6 +389,9 @@ def run_multi_step(pipe, base_scene: Image.Image, edits: list[dict],
 
         history.append(result)
         current = result
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Final comparison grid: base + each step side by side
     n = len(history)
