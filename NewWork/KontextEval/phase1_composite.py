@@ -153,12 +153,14 @@ def region_diff(img_a: Image.Image, img_b: Image.Image,
 
 def run_standard(pipe, canvas: Image.Image, prompt: str,
                  seed: int, num_steps: int, guidance: float,
-                 height: int, width: int) -> Image.Image:
+                 height: int, width: int,
+                 prompt_2: str | None = None) -> Image.Image:
     return generate(
         pipe, prompt, canvas,
         seed=seed, num_steps=num_steps,
         guidance_scale=guidance,
         height=height, width=width,
+        prompt_2=prompt_2,
     )
 
 

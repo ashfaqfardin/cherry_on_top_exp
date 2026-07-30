@@ -296,23 +296,34 @@ def build_collage_scene(
 
 # ── Kontext blending prompt ───────────────────────────────────────────────────
 
-def _blend_prompt(obj_description: str, vlm_placement: str) -> str:
+def _blend_prompt(obj_description: str, vlm_placement: str) -> tuple[str, str]:
     """
-    Build a Kontext prompt for the blending pass.
+    Return (clip_prompt, t5_prompt).
 
-    Uses the full VLM output (appearance + placement + lighting + shadow +
-    environment interaction) so FLUX receives all the detail it needs to
-    produce a realistic composite.  Prepends an integration directive so the
-    model understands the object is already shown in the reference collage and
-    must be blended, not invented from scratch.
+    clip_prompt — short, ≤ 55 words, fed to CLIP (77-token hard limit).
+                  Carries the essential intent: what, where, blend naturally.
+    t5_prompt   — full detail, fed to T5 only (no token limit).
+                  Contains all VLM output: lighting, shadow, material, reflections.
+
+    Split needed because CLIP silently truncates anything past 77 tokens, dropping
+    lighting/shadow detail the VLM worked hard to produce.
     """
-    # Strip the boilerplate preservation tail if the VLM included it —
-    # we'll re-append it ourselves at a controlled position.
+    # Strip boilerplate preservation tail — we re-add it at the right position.
     cleaned = vlm_placement.replace("Do not change any other part of the room.", "").strip()
     if cleaned.endswith("."):
         cleaned = cleaned[:-1].strip()
 
-    return (
+    # Extract first sentence for the CLIP summary (placement gist)
+    first = cleaned.split(".")[0].strip()
+
+    clip_prompt = (
+        f"Naturally integrate the {obj_description} shown in the reference image "
+        f"into the room. {first}. "
+        f"Match lighting and cast a contact shadow. "
+        f"Do not change any other part of the room."
+    )
+
+    t5_prompt = (
         f"Naturally integrate the {obj_description} shown in the reference image "
         f"into the room, blending it so it looks like it was always there. "
         f"{cleaned}. "
@@ -320,6 +331,8 @@ def _blend_prompt(obj_description: str, vlm_placement: str) -> str:
         f"exactly to the room's existing illumination. "
         f"Do not change any other part of the room."
     )
+
+    return clip_prompt, t5_prompt
 
 
 # ── Main incremental pipeline ─────────────────────────────────────────────────
@@ -426,16 +439,18 @@ def run_collage_chain(
         print(f"      Saved collage: collage_{name}.png")
 
         # Stage K: FLUX Kontext with collage as reference
-        blend_p = _blend_prompt(desc, vlm_prompt)
+        clip_p, t5_p = _blend_prompt(desc, vlm_prompt)
         print(f"  [K] Kontext integration pass ...")
-        print(f"      Prompt: {blend_p[:100]}...")
+        print(f"      CLIP prompt ({len(clip_p.split())} words): {clip_p}")
+        print(f"      T5 prompt  ({len(t5_p.split())} words): {t5_p[:120]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
-            f.write(blend_p)
+            f.write(f"=== CLIP (≤77 tokens) ===\n{clip_p}\n\n=== T5 (full detail) ===\n{t5_p}\n")
 
         next_scene = run_standard(
             pipe      = pipe,
             canvas    = collage_scene,   # <── the AnyDoor collage IS the reference
-            prompt    = blend_p,
+            prompt    = clip_p,
+            prompt_2  = t5_p,
             seed      = seed,
             num_steps = num_steps,
             guidance  = scene_guidance,
