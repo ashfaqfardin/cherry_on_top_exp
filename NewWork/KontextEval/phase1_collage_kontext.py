@@ -235,12 +235,26 @@ def _vlm_bbox(
             print(f"    [VLM-bbox] grounding: x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
             return bbox
 
-    # Parser 2: plain [x1, y1, x2, y2] in resized image pixel space
-    bm2 = re.search(r'\[(\d+)[,\s]+(\d+)[,\s]+(\d+)[,\s]+(\d+)\]', raw)
+    # Parser 2: bracket format — floats or ints
+    # Model may output normalized [0,1] coords or pixel coords in resized space.
+    NUM = r'(\d+\.?\d*)'
+    SEP = r'[,\s]+'
+    bm2 = re.search(rf'\[{NUM}{SEP}{NUM}{SEP}{NUM}{SEP}{NUM}\]', raw)
     if bm2:
-        bbox = _rescale(*(int(bm2.group(i)) for i in range(1, 5)))
+        v = [float(bm2.group(i)) for i in range(1, 5)]
+        rx1, ry1, rx2, ry2 = v
+        if max(v) <= 1.0:
+            # normalized [0,1] → multiply directly by full image dimensions
+            x1 = max(0,      int(rx1 * width))
+            y1 = max(0,      int(ry1 * height))
+            x2 = min(width,  int(rx2 * width))
+            y2 = min(height, int(ry2 * height))
+            bbox = (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+        else:
+            # pixel coords in resized image space → rescale
+            bbox = _rescale(rx1, ry1, rx2, ry2)
         if bbox:
-            print(f"    [VLM-bbox] plain:     x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
+            print(f"    [VLM-bbox] bracket:   x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
             return bbox
 
     print(f"    [VLM-bbox] parse failed — center-floor fallback")

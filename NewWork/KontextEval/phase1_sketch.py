@@ -412,17 +412,27 @@ def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
 
     def _load_model(load_kwargs: dict, to_device: bool) -> object:
         """Try model classes in order; return first that succeeds."""
+        # Pick class order based on model_id: Qwen2-VL (not 2.5) should use
+        # Qwen2VLForConditionalGeneration to avoid visual-encoder shape mismatches.
+        is_qwen25 = "Qwen2.5" in model_id or "Qwen2_5" in model_id
         classes = []
-        try:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            classes.append(Qwen2_5_VLForConditionalGeneration)
-        except ImportError:
-            pass
+        if is_qwen25:
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                classes.append(Qwen2_5_VLForConditionalGeneration)
+            except ImportError:
+                pass
         try:
             from transformers import Qwen2VLForConditionalGeneration
             classes.append(Qwen2VLForConditionalGeneration)
         except ImportError:
             pass
+        if not is_qwen25:
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                classes.append(Qwen2_5_VLForConditionalGeneration)
+            except ImportError:
+                pass
 
         last_err = None
         for cls in classes:
