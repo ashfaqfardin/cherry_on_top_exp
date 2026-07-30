@@ -95,11 +95,10 @@ _comp = _load_mod("phase1_composite")
 _vlm  = _load_mod("phase1_sketch_vlm")
 _sk   = _load_mod("phase1_sketch")
 
-run_standard                = _comp.run_standard
-save_grid                   = _comp.save_grid
-generate_from_sketch        = _vlm.generate_from_sketch
-vlm_generate_kontext_prompt = _vlm.vlm_generate_kontext_prompt
-load_vlm                    = _sk.load_vlm
+run_standard         = _comp.run_standard
+save_grid            = _comp.save_grid
+generate_from_sketch = _vlm.generate_from_sketch
+load_vlm             = _sk.load_vlm
 
 sys.path.insert(0, str(_base.parent.parent))
 from NewWork.KontextEval.utils.model_utils import load_kontext_pipeline  # noqa: E402
@@ -132,30 +131,39 @@ def _compute_obj_mask(obj_img: Image.Image,
     return (~(is_grey | is_white)).astype(np.uint8)
 
 
-# ── Placement: VLM native grounding → direct pixel bbox ─────────────────────
+# ── Combined VLM call: prompt + placement bbox in one pass ───────────────────
 
-def _vlm_placement_bbox(
+def _vlm_prompt_and_bbox(
     vlm_model,
     vlm_processor,
     scene_img:   Image.Image,
+    obj_img:     Image.Image,
     description: str,
     width:       int,
     height:      int,
-    max_new_tokens: int = 64,
-) -> Tuple[int, int, int, int]:
+    max_new_tokens: int = 512,
+) -> tuple[str, Tuple[int, int, int, int]]:
     """
-    Ask Qwen2-VL WHERE to place `description` using its native grounding tokens.
+    Single VLM call that returns BOTH the Kontext blending prompt AND the
+    placement bounding box from one shared reasoning pass.
 
-    Qwen2-VL outputs bounding boxes as:
-        <|box_start|>(x1,y1),(x2,y2)<|box_end|>
-    Coordinates are normalised to [0, 1000) — rescaled here to pixel space.
+    Why one call instead of two:
+    - Two separate calls are independent inferences that can contradict each
+      other: the text might say "left wall" while the bbox lands center-right.
+    - One call shares the same reasoning: wherever the model decides to place
+      the object in text, it grounds the bbox to that exact same location.
 
-    Why native tokens beat JSON or keyword parsing:
-    - Trained grounding head → reliable spatial coordinates.
-    - Model sees the actual scene pixels, not a text description of it.
-    - No brittle keyword → zone mapping that misses anything not in the list.
+    Output format the model is asked to produce:
+        PROMPT: <text describing appearance, placement, orientation, scale>
+        BBOX: <|box_start|>(x1,y1),(x2,y2)<|box_end|>
 
-    Falls back to center-floor zone if no grounding tokens are produced.
+    Bbox coords are normalised [0,1000) → rescaled to pixel space.
+    Parsing is tolerant: bbox tokens are extracted independently of text
+    structure, so minor format deviations still yield valid coordinates.
+
+    Returns (prompt_text, (x1, y1, x2, y2)).
+    Fallback bbox: center-floor zone if no grounding tokens found.
+    Fallback prompt: raw model output if "PROMPT:" prefix missing.
     """
     import re
 
@@ -169,13 +177,21 @@ def _vlm_placement_bbox(
         return img.convert("RGB")
 
     scene_small = _resize(scene_img, 768)
+    obj_small   = _resize(obj_img,   512)
 
     instruction = (
-        f"This is a room scene. I want to place a {description} in this room.\n"
-        f"Find the most suitable empty location where the {description} can stand "
-        f"naturally on a surface (floor, table top, or shelf) without overlapping "
-        f"any existing furniture.\n"
-        f"Output the bounding box of the best placement area."
+        f"You are an expert image composition assistant.\n\n"
+        f"Image 1: A room scene where I want to insert a new object.\n"
+        f"Image 2: The {description} I want to insert (on a white background).\n\n"
+        f"Decide WHERE in the room to place the {description}, then output "
+        f"EXACTLY two lines:\n\n"
+        f"PROMPT: <a single complete sentence describing: the {description}'s "
+        f"exact appearance from Image 2, the chosen placement location in the "
+        f"room, orientation and surface contact, realistic scale, ending with: "
+        f"'Do not change any other part of the room.'>\n"
+        f"BBOX: <bounding box of that exact placement location in Image 1>\n\n"
+        f"The PROMPT and BBOX must describe the SAME location. "
+        f"Output nothing else."
     )
 
     messages = [
@@ -183,6 +199,7 @@ def _vlm_placement_bbox(
             "role": "user",
             "content": [
                 {"type": "image", "image": scene_small},
+                {"type": "image", "image": obj_small},
                 {"type": "text",  "text": instruction},
             ],
         }
@@ -191,9 +208,10 @@ def _vlm_placement_bbox(
     text = vlm_processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
+    images_in_order = [scene_small, obj_small]
     inputs = vlm_processor(
         text=[text],
-        images=[scene_small],
+        images=images_in_order,
         padding=True,
         return_tensors="pt",
     ).to(device)
@@ -206,32 +224,52 @@ def _vlm_placement_bbox(
         )
 
     out_ids = gen_ids[:, inputs["input_ids"].shape[1]:]
-    # skip_special_tokens=False keeps <|box_start|>/<|box_end|> in the string
+    # skip_special_tokens=False so <|box_start|>/<|box_end|> survive
     raw = vlm_processor.batch_decode(
         out_ids,
         skip_special_tokens=False,
         clean_up_tokenization_spaces=False,
     )[0].strip()
 
-    print(f"    [VLM-bbox] raw: {raw!r}")
+    print(f"    [VLM] raw output:\n      {raw!r}")
 
-    # Parse <|box_start|>(x1,y1),(x2,y2)<|box_end|>
-    m = re.search(
+    # ── Extract prompt text ───────────────────────────────────────────────────
+    pm = re.search(r'PROMPT:\s*(.*?)(?=\nBBOX:|\Z)', raw, re.DOTALL | re.IGNORECASE)
+    if pm:
+        prompt_text = pm.group(1).strip()
+    else:
+        # Tolerant fallback: strip bbox line if present, use rest as prompt
+        prompt_text = re.sub(
+            r'\nBBOX:.*', '', raw, flags=re.DOTALL | re.IGNORECASE
+        ).strip()
+        if not prompt_text:
+            prompt_text = (
+                f"Naturally integrate the {description} into the room scene. "
+                f"Do not change any other part of the room."
+            )
+
+    # Strip stray special tokens from prompt text
+    prompt_text = re.sub(r'<\|[^|]+\|>', '', prompt_text).strip()
+
+    # ── Extract bbox grounding tokens ─────────────────────────────────────────
+    bm = re.search(
         r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>',
         raw,
     )
-    if m:
-        x1n, y1n, x2n, y2n = (int(m.group(i)) for i in range(1, 5))
+    if bm:
+        x1n, y1n, x2n, y2n = (int(bm.group(i)) for i in range(1, 5))
         x1 = max(0,      int(x1n * width  / 1000))
         y1 = max(0,      int(y1n * height / 1000))
         x2 = min(width,  int(x2n * width  / 1000))
         y2 = min(height, int(y2n * height / 1000))
         if x2 > x1 and y2 > y1:
-            print(f"    [VLM-bbox] grounding: x=[{x1},{x2}] y=[{y1},{y2}]")
-            return x1, y1, x2, y2
+            print(f"    [VLM] prompt: {prompt_text[:80]}...")
+            print(f"    [VLM] bbox:   x=[{x1},{x2}] y=[{y1},{y2}]")
+            return prompt_text, (x1, y1, x2, y2)
 
-    print(f"    [VLM-bbox] no grounding tokens — center-floor fallback")
-    return width // 6, height // 2, 5 * width // 6, height
+    print(f"    [VLM] no grounding tokens — center-floor fallback")
+    fallback_bbox = (width // 6, height // 2, 5 * width // 6, height)
+    return prompt_text, fallback_bbox
 
 
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
@@ -273,7 +311,7 @@ def build_collage_scene(
     AnyDoor-style: build a collage scene with the object pasted at the
     target location.  Returns (collage_pil, (x1, y1, x2, y2) paste bbox).
 
-    target_bbox   — (x1, y1, x2, y2) from _vlm_placement_bbox.
+    target_bbox   — (x1, y1, x2, y2) from _vlm_prompt_and_bbox.
     collage_mode:
       'full'  — paste actual obj pixels (colour + texture)
       'sobel' — paste Sobel edge map only (structure, matches AnyDoor exactly)
@@ -454,11 +492,12 @@ def run_collage_chain(
             ref_mask = np.zeros((height, width), dtype=np.uint8)
             ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
 
-        # Stage VLM: placement description
-        print(f"  [VLM] Generating placement description ...")
-        vlm_prompt = vlm_generate_kontext_prompt(
+        # Stage VLM: prompt + bbox in one consistent pass
+        print(f"  [VLM] Generating prompt and placement bbox ...")
+        vlm_prompt, (bx1, by1, bx2, by2) = _vlm_prompt_and_bbox(
             vlm_model=vlm_model, vlm_processor=vlm_proc,
             scene_img=scene, obj_img=obj_img, description=desc,
+            width=width, height=height,
         )
         print(f"\n  {_SEP}")
         print(f"  [VLM → Prompt]  {name}")
@@ -467,17 +506,7 @@ def run_collage_chain(
             print(f"  {line}")
         print(f"  {_SEP}\n")
         with open(os.path.join(out_dir, f"vlm_prompt_{name}.txt"), "w") as f:
-            f.write(vlm_prompt)
-
-        # Stage BBOX: VLM grounding → direct pixel coordinates
-        print(f"  [BBOX] Asking VLM for placement bbox ...")
-        bx1, by1, bx2, by2 = _vlm_placement_bbox(
-            vlm_model=vlm_model, vlm_processor=vlm_proc,
-            scene_img=scene, description=desc,
-            width=width, height=height,
-        )
-        with open(os.path.join(out_dir, f"bbox_{name}.txt"), "w") as f:
-            f.write(f"x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
+            f.write(f"{vlm_prompt}\n\nbbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
         # Stage COL: build collage scene (AnyDoor's core idea in Kontext)
         print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
