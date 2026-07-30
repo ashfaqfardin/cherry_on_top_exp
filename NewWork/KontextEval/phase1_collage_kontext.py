@@ -99,6 +99,7 @@ run_standard                = _comp.run_standard
 save_grid                   = _comp.save_grid
 generate_from_sketch        = _vlm.generate_from_sketch
 vlm_generate_kontext_prompt = _vlm.vlm_generate_kontext_prompt
+vlm_get_placement_bbox      = _vlm.vlm_get_placement_bbox
 load_vlm                    = _sk.load_vlm
 
 sys.path.insert(0, str(_base.parent.parent))
@@ -132,41 +133,6 @@ def _compute_obj_mask(obj_img: Image.Image,
     return (~(is_grey | is_white)).astype(np.uint8)
 
 
-# ── Placement: VLM text → target bbox in scene ───────────────────────────────
-
-def _text_to_bbox(text: str, W: int, H: int) -> Tuple[int, int, int, int]:
-    """
-    Parse VLM placement description → (y1, y2, x1, x2) pixel bbox.
-    Covers common room placements.  Conservative zones so the pasted obj
-    fits fully inside the scene without clipping.
-    """
-    d = text.lower()
-
-    # Horizontal
-    if any(w in d for w in ("left wall", "left side", "left corner",
-                             "against the left", "on the left", "leftmost")):
-        x1, x2 = 0, W // 3
-    elif any(w in d for w in ("right wall", "right side", "right corner",
-                               "against the right", "on the right", "rightmost")):
-        x1, x2 = 2 * W // 3, W
-    else:
-        x1, x2 = W // 6, 5 * W // 6
-
-    # Vertical
-    if any(w in d for w in ("coffee table", "on the table", "table surface",
-                             "table top")):
-        y1, y2 = int(H * 0.35), int(H * 0.65)
-    elif any(w in d for w in ("sofa", "couch", "on the sofa", "on the couch")):
-        y1, y2 = int(H * 0.30), int(H * 0.60)
-    elif any(w in d for w in ("shelf", "bookcase")):
-        y1, y2 = int(H * 0.15), int(H * 0.45)
-    else:
-        # Floor level — lower 45% of image
-        y1, y2 = int(H * 0.50), H
-
-    return max(0, y1), min(H, y2), max(0, x1), min(W, x2)
-
-
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
 
 def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 30) -> np.ndarray:
@@ -197,15 +163,16 @@ def build_collage_scene(
     scene:        Image.Image,
     obj_img:      Image.Image,
     ref_mask:     np.ndarray,
-    placement_desc: str,
+    target_bbox:  Tuple[int, int, int, int],
     collage_mode: str  = "full",
     paste_alpha:  float = 0.85,
     feather:      int   = 25,
 ) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
     AnyDoor-style: build a collage scene with the object pasted at the
-    target location.  Returns (collage_pil, (y1, y2, x1, x2) paste bbox).
+    target location.  Returns (collage_pil, (x1, y1, x2, y2) paste bbox).
 
+    target_bbox   — (x1, y1, x2, y2) pixel coords from vlm_get_placement_bbox.
     collage_mode:
       'full'  — paste actual obj pixels (colour + texture)
       'sobel' — paste Sobel edge map only (structure, matches AnyDoor exactly)
@@ -230,8 +197,8 @@ def build_collage_scene(
     obj_crop   = obj_np[oy1:oy2, ox1:ox2]           # (oh, ow, 3)
     mask_crop  = ref_mask[oy1:oy2, ox1:ox2]         # (oh, ow) uint8
 
-    # Target placement bbox in scene
-    y1, y2, x1, x2 = _text_to_bbox(placement_desc, W, H)
+    # Target placement bbox — directly from VLM pixel coordinates
+    x1, y1, x2, y2 = target_bbox
     zone_h, zone_w  = y2 - y1, x2 - x1
     print(f"    [COLLAGE] Target zone: y=[{y1},{y2}] x=[{x1},{x2}]  "
           f"{zone_w}×{zone_h} px")
@@ -296,43 +263,19 @@ def build_collage_scene(
 
 # ── Kontext blending prompt ───────────────────────────────────────────────────
 
-def _blend_prompt(obj_description: str, vlm_placement: str) -> tuple[str, str]:
+def _blend_prompt(obj_description: str, vlm_placement: str) -> str:
     """
-    Return (clip_prompt, t5_prompt).
-
-    clip_prompt — short, ≤ 55 words, fed to CLIP (77-token hard limit).
-                  Carries the essential intent: what, where, blend naturally.
-    t5_prompt   — full detail, fed to T5 only (no token limit).
-                  Contains all VLM output: lighting, shadow, material, reflections.
-
-    Split needed because CLIP silently truncates anything past 77 tokens, dropping
-    lighting/shadow detail the VLM worked hard to produce.
+    Build a Kontext prompt that asks the model to naturally integrate the
+    pre-pasted object shown in the reference image.
     """
-    # Strip boilerplate preservation tail — we re-add it at the right position.
-    cleaned = vlm_placement.replace("Do not change any other part of the room.", "").strip()
-    if cleaned.endswith("."):
-        cleaned = cleaned[:-1].strip()
-
-    # Extract first sentence for the CLIP summary (placement gist)
-    first = cleaned.split(".")[0].strip()
-
-    clip_prompt = (
-        f"Naturally integrate the {obj_description} shown in the reference image "
-        f"into the room. {first}. "
-        f"Match lighting and cast a contact shadow. "
+    first_sentence = vlm_placement.split(".")[0].strip()
+    return (
+        f"{first_sentence}. "
+        f"Naturally integrate the {obj_description} into the room scene — "
+        f"blend it realistically with correct perspective, contact shadows, "
+        f"and lighting that matches the rest of the room. "
         f"Do not change any other part of the room."
     )
-
-    t5_prompt = (
-        f"Naturally integrate the {obj_description} shown in the reference image "
-        f"into the room, blending it so it looks like it was always there. "
-        f"{cleaned}. "
-        f"Match the object's lighting, contact shadow, and reflective surfaces "
-        f"exactly to the room's existing illumination. "
-        f"Do not change any other part of the room."
-    )
-
-    return clip_prompt, t5_prompt
 
 
 # ── Main incremental pipeline ─────────────────────────────────────────────────
@@ -409,8 +352,8 @@ def run_collage_chain(
             ref_mask = np.zeros((height, width), dtype=np.uint8)
             ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
 
-        # Stage VLM: placement description
-        print(f"  [VLM] Generating placement description ...")
+        # Stage VLM-A: Kontext blending prompt (appearance + placement text)
+        print(f"  [VLM-A] Generating blending prompt ...")
         vlm_prompt = vlm_generate_kontext_prompt(
             vlm_model=vlm_model, vlm_processor=vlm_proc,
             scene_img=scene, obj_img=obj_img, description=desc,
@@ -424,33 +367,41 @@ def run_collage_chain(
         with open(os.path.join(out_dir, f"vlm_prompt_{name}.txt"), "w") as f:
             f.write(vlm_prompt)
 
+        # Stage VLM-B: direct pixel bbox from VLM spatial reasoning
+        print(f"  [VLM-B] Asking VLM for placement bbox ...")
+        bx1, by1, bx2, by2 = vlm_get_placement_bbox(
+            vlm_model=vlm_model, vlm_processor=vlm_proc,
+            scene_img=scene, description=desc,
+            width=width, height=height,
+        )
+        with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
+            f.write(f"x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
+
         # Stage COL: build collage scene (AnyDoor's core idea in Kontext)
         print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
         collage_scene, paste_box = build_collage_scene(
-            scene         = scene,
-            obj_img       = obj_img,
-            ref_mask      = ref_mask,
-            placement_desc= vlm_prompt,
-            collage_mode  = collage_mode,
-            paste_alpha   = paste_alpha,
-            feather       = feather,
+            scene        = scene,
+            obj_img      = obj_img,
+            ref_mask     = ref_mask,
+            target_bbox  = (bx1, by1, bx2, by2),
+            collage_mode = collage_mode,
+            paste_alpha  = paste_alpha,
+            feather      = feather,
         )
         collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
         print(f"      Saved collage: collage_{name}.png")
 
         # Stage K: FLUX Kontext with collage as reference
-        clip_p, t5_p = _blend_prompt(desc, vlm_prompt)
+        blend_p = _blend_prompt(desc, vlm_prompt)
         print(f"  [K] Kontext integration pass ...")
-        print(f"      CLIP prompt ({len(clip_p.split())} words): {clip_p}")
-        print(f"      T5 prompt  ({len(t5_p.split())} words): {t5_p[:120]}...")
+        print(f"      Prompt: {blend_p[:100]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
-            f.write(f"=== CLIP (≤77 tokens) ===\n{clip_p}\n\n=== T5 (full detail) ===\n{t5_p}\n")
+            f.write(blend_p)
 
         next_scene = run_standard(
             pipe      = pipe,
             canvas    = collage_scene,   # <── the AnyDoor collage IS the reference
-            prompt    = clip_p,
-            prompt_2  = t5_p,
+            prompt    = blend_p,
             seed      = seed,
             num_steps = num_steps,
             guidance  = scene_guidance,

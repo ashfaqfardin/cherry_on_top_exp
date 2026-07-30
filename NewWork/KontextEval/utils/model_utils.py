@@ -40,20 +40,11 @@ def generate(
     guidance_scale: float = 2.5,
     height: int = 1024,
     width: int = 1024,
-    prompt_2: str | None = None,
 ):
-    """
-    Single image edit call with a fixed seed.
-
-    prompt   — fed to both CLIP (77-token limit) and T5. Keep ≤ 55 words.
-    prompt_2 — fed to T5 only (no token limit). Use for extended detail:
-               lighting, shadows, material descriptions, environment interaction.
-               If None, T5 uses `prompt` as well.
-    """
+    """Single image edit call with a fixed seed."""
     generator = torch.Generator(device=pipe.device).manual_seed(seed)
     result = pipe(
         prompt=prompt,
-        prompt_2=prompt_2,
         image=image,
         num_inference_steps=num_steps,
         guidance_scale=guidance_scale,
