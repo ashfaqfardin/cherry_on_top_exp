@@ -99,7 +99,6 @@ run_standard                = _comp.run_standard
 save_grid                   = _comp.save_grid
 generate_from_sketch        = _vlm.generate_from_sketch
 vlm_generate_kontext_prompt = _vlm.vlm_generate_kontext_prompt
-vlm_get_placement_bbox      = _vlm.vlm_get_placement_bbox
 load_vlm                    = _sk.load_vlm
 
 sys.path.insert(0, str(_base.parent.parent))
@@ -131,6 +130,108 @@ def _compute_obj_mask(obj_img: Image.Image,
                 (np.abs(arr[:, :, 2] - grey[2]) <= tolerance))
     is_white = (arr[:, :, 0] >= 230) & (arr[:, :, 1] >= 230) & (arr[:, :, 2] >= 230)
     return (~(is_grey | is_white)).astype(np.uint8)
+
+
+# ── Placement: VLM native grounding → direct pixel bbox ─────────────────────
+
+def _vlm_placement_bbox(
+    vlm_model,
+    vlm_processor,
+    scene_img:   Image.Image,
+    description: str,
+    width:       int,
+    height:      int,
+    max_new_tokens: int = 64,
+) -> Tuple[int, int, int, int]:
+    """
+    Ask Qwen2-VL WHERE to place `description` using its native grounding tokens.
+
+    Qwen2-VL outputs bounding boxes as:
+        <|box_start|>(x1,y1),(x2,y2)<|box_end|>
+    Coordinates are normalised to [0, 1000) — rescaled here to pixel space.
+
+    Why native tokens beat JSON or keyword parsing:
+    - Trained grounding head → reliable spatial coordinates.
+    - Model sees the actual scene pixels, not a text description of it.
+    - No brittle keyword → zone mapping that misses anything not in the list.
+
+    Falls back to center-floor zone if no grounding tokens are produced.
+    """
+    import re
+
+    device = next(vlm_model.parameters()).device
+
+    def _resize(img, max_side):
+        w, h = img.size
+        if max(w, h) > max_side:
+            s = max_side / max(w, h)
+            img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
+        return img.convert("RGB")
+
+    scene_small = _resize(scene_img, 768)
+
+    instruction = (
+        f"This is a room scene. I want to place a {description} in this room.\n"
+        f"Find the most suitable empty location where the {description} can stand "
+        f"naturally on a surface (floor, table top, or shelf) without overlapping "
+        f"any existing furniture.\n"
+        f"Output the bounding box of the best placement area."
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": scene_small},
+                {"type": "text",  "text": instruction},
+            ],
+        }
+    ]
+
+    text = vlm_processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = vlm_processor(
+        text=[text],
+        images=[scene_small],
+        padding=True,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.no_grad():
+        gen_ids = vlm_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+
+    out_ids = gen_ids[:, inputs["input_ids"].shape[1]:]
+    # skip_special_tokens=False keeps <|box_start|>/<|box_end|> in the string
+    raw = vlm_processor.batch_decode(
+        out_ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )[0].strip()
+
+    print(f"    [VLM-bbox] raw: {raw!r}")
+
+    # Parse <|box_start|>(x1,y1),(x2,y2)<|box_end|>
+    m = re.search(
+        r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>',
+        raw,
+    )
+    if m:
+        x1n, y1n, x2n, y2n = (int(m.group(i)) for i in range(1, 5))
+        x1 = max(0,      int(x1n * width  / 1000))
+        y1 = max(0,      int(y1n * height / 1000))
+        x2 = min(width,  int(x2n * width  / 1000))
+        y2 = min(height, int(y2n * height / 1000))
+        if x2 > x1 and y2 > y1:
+            print(f"    [VLM-bbox] grounding: x=[{x1},{x2}] y=[{y1},{y2}]")
+            return x1, y1, x2, y2
+
+    print(f"    [VLM-bbox] no grounding tokens — center-floor fallback")
+    return width // 6, height // 2, 5 * width // 6, height
 
 
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
@@ -172,7 +273,7 @@ def build_collage_scene(
     AnyDoor-style: build a collage scene with the object pasted at the
     target location.  Returns (collage_pil, (x1, y1, x2, y2) paste bbox).
 
-    target_bbox   — (x1, y1, x2, y2) pixel coords from vlm_get_placement_bbox.
+    target_bbox   — (x1, y1, x2, y2) from _vlm_placement_bbox.
     collage_mode:
       'full'  — paste actual obj pixels (colour + texture)
       'sobel' — paste Sobel edge map only (structure, matches AnyDoor exactly)
@@ -197,7 +298,7 @@ def build_collage_scene(
     obj_crop   = obj_np[oy1:oy2, ox1:ox2]           # (oh, ow, 3)
     mask_crop  = ref_mask[oy1:oy2, ox1:ox2]         # (oh, ow) uint8
 
-    # Target placement bbox — directly from VLM pixel coordinates
+    # Target placement bbox — directly from VLM grounding
     x1, y1, x2, y2 = target_bbox
     zone_h, zone_w  = y2 - y1, x2 - x1
     print(f"    [COLLAGE] Target zone: y=[{y1},{y2}] x=[{x1},{x2}]  "
@@ -268,6 +369,7 @@ def _blend_prompt(obj_description: str, vlm_placement: str) -> str:
     Build a Kontext prompt that asks the model to naturally integrate the
     pre-pasted object shown in the reference image.
     """
+    # Use first sentence of VLM prompt (placement description) + integration instruction
     first_sentence = vlm_placement.split(".")[0].strip()
     return (
         f"{first_sentence}. "
@@ -352,8 +454,8 @@ def run_collage_chain(
             ref_mask = np.zeros((height, width), dtype=np.uint8)
             ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
 
-        # Stage VLM-A: Kontext blending prompt (appearance + placement text)
-        print(f"  [VLM-A] Generating blending prompt ...")
+        # Stage VLM: placement description
+        print(f"  [VLM] Generating placement description ...")
         vlm_prompt = vlm_generate_kontext_prompt(
             vlm_model=vlm_model, vlm_processor=vlm_proc,
             scene_img=scene, obj_img=obj_img, description=desc,
@@ -367,14 +469,14 @@ def run_collage_chain(
         with open(os.path.join(out_dir, f"vlm_prompt_{name}.txt"), "w") as f:
             f.write(vlm_prompt)
 
-        # Stage VLM-B: direct pixel bbox from VLM spatial reasoning
-        print(f"  [VLM-B] Asking VLM for placement bbox ...")
-        bx1, by1, bx2, by2 = vlm_get_placement_bbox(
+        # Stage BBOX: VLM grounding → direct pixel coordinates
+        print(f"  [BBOX] Asking VLM for placement bbox ...")
+        bx1, by1, bx2, by2 = _vlm_placement_bbox(
             vlm_model=vlm_model, vlm_processor=vlm_proc,
             scene_img=scene, description=desc,
             width=width, height=height,
         )
-        with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
+        with open(os.path.join(out_dir, f"bbox_{name}.txt"), "w") as f:
             f.write(f"x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
         # Stage COL: build collage scene (AnyDoor's core idea in Kontext)
