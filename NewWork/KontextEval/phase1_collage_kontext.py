@@ -55,7 +55,7 @@ Usage
       --hf_token $HF_TOKEN \\
       --cache_dir ./models \\
       --out_dir results/phase1_collage \\
-      --vlm_model Qwen/Qwen2-VL-2B-Instruct
+      --vlm_model Qwen/Qwen2.5-VL-7B-Instruct
 
 Key flags
 ----------
@@ -584,7 +584,7 @@ def parse_args():
     p.add_argument("--height",        type=int,   default=1024)
     p.add_argument("--width",         type=int,   default=1024)
     p.add_argument("--device",        default="cuda")
-    p.add_argument("--vlm_model",     default="Qwen/Qwen2-VL-2B-Instruct")
+    p.add_argument("--vlm_model",     default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--vlm_device",    default="cpu")
     return p.parse_args()
 

@@ -391,40 +391,71 @@ def _save_bbox_overlay(scene: Image.Image, bbox: Tuple[int, int, int, int], path
 
 def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
     """
-    Load an open-source Vision-Language Model for placement reasoning.
+    Load a VLM for placement reasoning.
 
-    Defaults to Qwen/Qwen2-VL-2B-Instruct on CPU so it can coexist with
-    FLUX.1-Kontext-dev on the GPU without running out of VRAM.
+    device="cpu"  → bfloat16 on CPU.  Safe alongside FLUX on any GPU.
+                    Inference: ~30-60 s per object.
+    device="cuda" → 4-bit NF4 quantization via BitsAndBytes.
+                    Qwen2.5-VL-7B fits in ~4 GB VRAM (vs ~15 GB fp16).
+                    Requires: pip install bitsandbytes>=0.43.0
 
-    GPU memory guide:
-      Kontext-dev  ~24 GB GPU
-      Qwen2-VL-2B  ~4 GB  (use --vlm_device cpu  for safety)
-      Qwen2-VL-7B  ~15 GB (use --vlm_device cuda  only on 40+ GB GPUs)
-
-    CPU inference is ~20-40 s per object -- acceptable for a reasoning step.
+    GPU memory with 4-bit:
+      Kontext-dev          ~24 GB
+      Qwen2.5-VL-7B int4   ~4 GB
+      Total                ~28 GB  (fits on a 40 GB A100/H100)
     """
     from transformers import AutoProcessor
 
     print(f"  Loading VLM '{model_id}' on {device} ...")
+
+    if device == "cuda":
+        from transformers import BitsAndBytesConfig
+        quant_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        load_kwargs = dict(
+            quantization_config=quant_cfg,
+            device_map="auto",        # BitsAndBytes requires device_map
+            cache_dir=cache_dir,
+        )
+        to_device = False             # device_map handles placement
+    else:
+        load_kwargs = dict(
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+        )
+        to_device = True
+
     try:
-        from transformers import Qwen2VLForConditionalGeneration
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-        ).to(device).eval()
-    except (ImportError, OSError, Exception):
-        from transformers import AutoModelForVision2Seq
-        model = AutoModelForVision2Seq.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            cache_dir=cache_dir,
-        ).to(device).eval()
+        # Qwen2.5-VL (7B default)
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id, **load_kwargs
+        )
+    except (ImportError, AttributeError):
+        try:
+            # Qwen2-VL (2B legacy)
+            from transformers import Qwen2VLForConditionalGeneration
+            model = Qwen2VLForConditionalGeneration.from_pretrained(
+                model_id, **load_kwargs
+            )
+        except (ImportError, AttributeError):
+            from transformers import AutoModelForVision2Seq
+            model = AutoModelForVision2Seq.from_pretrained(
+                model_id, trust_remote_code=True, **load_kwargs
+            )
+
+    if to_device:
+        model = model.to(device)
+    model.eval()
 
     processor = AutoProcessor.from_pretrained(
         model_id, cache_dir=cache_dir, trust_remote_code=True,
     )
+    print(f"  VLM loaded  ({'4-bit GPU' if device == 'cuda' else 'bf16 CPU'})")
     return model, processor
 
 
