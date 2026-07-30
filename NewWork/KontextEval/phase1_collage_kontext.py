@@ -251,25 +251,47 @@ def _vlm_prompt_and_bbox(
     # Strip stray special tokens from prompt text
     prompt_text = re.sub(r'<\|[^|]+\|>', '', prompt_text).strip()
 
-    # ── Extract bbox grounding tokens ─────────────────────────────────────────
+    # Resized scene dimensions — needed to rescale plain-text coords back
+    sw, sh = scene_small.size
+
+    def _rescale(rx1, ry1, rx2, ry2):
+        x1 = max(0,      int(rx1 * width  / sw))
+        y1 = max(0,      int(ry1 * height / sh))
+        x2 = min(width,  int(rx2 * width  / sw))
+        y2 = min(height, int(ry2 * height / sh))
+        return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+
+    # ── Parser 1: native Qwen grounding tokens <|box_start|>(x,y),(x,y)<|box_end|>
+    # Coords normalised [0, 1000) relative to the resized image.
     bm = re.search(
         r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>',
         raw,
     )
     if bm:
         x1n, y1n, x2n, y2n = (int(bm.group(i)) for i in range(1, 5))
-        x1 = max(0,      int(x1n * width  / 1000))
-        y1 = max(0,      int(y1n * height / 1000))
-        x2 = min(width,  int(x2n * width  / 1000))
-        y2 = min(height, int(y2n * height / 1000))
-        if x2 > x1 and y2 > y1:
-            print(f"    [VLM] prompt: {prompt_text[:80]}...")
-            print(f"    [VLM] bbox:   x=[{x1},{x2}] y=[{y1},{y2}]")
-            return prompt_text, (x1, y1, x2, y2)
+        bbox = _rescale(
+            int(x1n * sw / 1000), int(y1n * sh / 1000),
+            int(x2n * sw / 1000), int(y2n * sh / 1000),
+        )
+        if bbox:
+            print(f"    [VLM] bbox (grounding tokens): x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
+            return prompt_text, bbox
 
-    print(f"    [VLM] no grounding tokens — center-floor fallback")
-    fallback_bbox = (width // 6, height // 2, 5 * width // 6, height)
-    return prompt_text, fallback_bbox
+    # ── Parser 2: plain [x1, y1, x2, y2] — model outputs pixel coords in
+    # resized image space when asked to produce a BBOX: line as text.
+    bm2 = re.search(
+        r'BBOX\s*:\s*\[(\d+)[,\s]+(\d+)[,\s]+(\d+)[,\s]+(\d+)\]',
+        raw, re.IGNORECASE,
+    )
+    if bm2:
+        rx1, ry1, rx2, ry2 = (int(bm2.group(i)) for i in range(1, 5))
+        bbox = _rescale(rx1, ry1, rx2, ry2)
+        if bbox:
+            print(f"    [VLM] bbox (plain): x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
+            return prompt_text, bbox
+
+    print(f"    [VLM] bbox parse failed — center-floor fallback")
+    return prompt_text, (width // 6, height // 2, 5 * width // 6, height)
 
 
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
@@ -404,16 +426,20 @@ def build_collage_scene(
 
 def _blend_prompt(obj_description: str, vlm_placement: str) -> str:
     """
-    Build a Kontext prompt that asks the model to naturally integrate the
-    pre-pasted object shown in the reference image.
+    Build a Kontext blending prompt that stays under CLIP's 77-token limit.
+
+    Takes the first sentence of the VLM output and caps it at 35 words so
+    the full prompt stays ~60 tokens (first sentence ~35 words + fixed
+    integration suffix ~25 tokens = safely under 77).
     """
-    # Use first sentence of VLM prompt (placement description) + integration instruction
     first_sentence = vlm_placement.split(".")[0].strip()
+    words = first_sentence.split()
+    if len(words) > 35:
+        first_sentence = " ".join(words[:35])
     return (
         f"{first_sentence}. "
-        f"Naturally integrate the {obj_description} into the room scene — "
-        f"blend it realistically with correct perspective, contact shadows, "
-        f"and lighting that matches the rest of the room. "
+        f"Naturally integrate the {obj_description} — "
+        f"blend with correct perspective, shadows, and lighting. "
         f"Do not change any other part of the room."
     )
 
