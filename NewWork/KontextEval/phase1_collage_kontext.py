@@ -133,7 +133,7 @@ def _compute_obj_mask(obj_img: Image.Image,
 
 # ── Combined VLM call: prompt + placement bbox in one pass ───────────────────
 
-def _vlm_prompt_and_bbox(
+def _vlm_bbox(
     vlm_model,
     vlm_processor,
     scene_img:   Image.Image,
@@ -141,29 +141,18 @@ def _vlm_prompt_and_bbox(
     description: str,
     width:       int,
     height:      int,
-    max_new_tokens: int = 512,
-) -> tuple[str, Tuple[int, int, int, int]]:
+    max_new_tokens: int = 64,
+) -> Tuple[int, int, int, int]:
     """
-    Single VLM call that returns BOTH the Kontext blending prompt AND the
-    placement bounding box from one shared reasoning pass.
+    Ask the VLM only WHERE to place `description` — returns a pixel bbox.
+    No text prompt generation; the collage already encodes appearance + position
+    visually, so Kontext gets a fixed integration template instead.
 
-    Why one call instead of two:
-    - Two separate calls are independent inferences that can contradict each
-      other: the text might say "left wall" while the bbox lands center-right.
-    - One call shares the same reasoning: wherever the model decides to place
-      the object in text, it grounds the bbox to that exact same location.
-
-    Output format the model is asked to produce:
-        PROMPT: <text describing appearance, placement, orientation, scale>
-        BBOX: <|box_start|>(x1,y1),(x2,y2)<|box_end|>
-
-    Bbox coords are normalised [0,1000) → rescaled to pixel space.
-    Parsing is tolerant: bbox tokens are extracted independently of text
-    structure, so minor format deviations still yield valid coordinates.
-
-    Returns (prompt_text, (x1, y1, x2, y2)).
-    Fallback bbox: center-floor zone if no grounding tokens found.
-    Fallback prompt: raw model output if "PROMPT:" prefix missing.
+    Parses two output formats the model may produce:
+      - Native grounding tokens: <|box_start|>(x,y),(x,y)<|box_end|>  [0,1000)
+      - Plain bracket format:    BBOX: [x1, y1, x2, y2]  (resized image pixels)
+    Both are rescaled to full (width × height) pixel space.
+    Falls back to center-floor zone if neither format is found.
     """
     import re
 
@@ -178,20 +167,14 @@ def _vlm_prompt_and_bbox(
 
     scene_small = _resize(scene_img, 768)
     obj_small   = _resize(obj_img,   512)
+    sw, sh      = scene_small.size
 
     instruction = (
-        f"You are an expert image composition assistant.\n\n"
-        f"Image 1: A room scene where I want to insert a new object.\n"
-        f"Image 2: The {description} I want to insert (on a white background).\n\n"
-        f"Decide WHERE in the room to place the {description}, then output "
-        f"EXACTLY two lines:\n\n"
-        f"PROMPT: <a single complete sentence describing: the {description}'s "
-        f"exact appearance from Image 2, the chosen placement location in the "
-        f"room, orientation and surface contact, realistic scale, ending with: "
-        f"'Do not change any other part of the room.'>\n"
-        f"BBOX: <bounding box of that exact placement location in Image 1>\n\n"
-        f"The PROMPT and BBOX must describe the SAME location. "
-        f"Output nothing else."
+        f"Image 1 is a room scene. Image 2 is a {description} on a white background.\n\n"
+        f"Find the best empty location in Image 1 to place the {description} "
+        f"so it sits naturally on a surface (floor, table, or shelf) without "
+        f"overlapping existing furniture.\n\n"
+        f"Output ONLY the bounding box of that location in Image 1. Nothing else."
     )
 
     messages = [
@@ -208,10 +191,9 @@ def _vlm_prompt_and_bbox(
     text = vlm_processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    images_in_order = [scene_small, obj_small]
     inputs = vlm_processor(
         text=[text],
-        images=images_in_order,
+        images=[scene_small, obj_small],
         padding=True,
         return_tensors="pt",
     ).to(device)
@@ -224,35 +206,13 @@ def _vlm_prompt_and_bbox(
         )
 
     out_ids = gen_ids[:, inputs["input_ids"].shape[1]:]
-    # skip_special_tokens=False so <|box_start|>/<|box_end|> survive
     raw = vlm_processor.batch_decode(
         out_ids,
         skip_special_tokens=False,
         clean_up_tokenization_spaces=False,
     )[0].strip()
 
-    print(f"    [VLM] raw output:\n      {raw!r}")
-
-    # ── Extract prompt text ───────────────────────────────────────────────────
-    pm = re.search(r'PROMPT:\s*(.*?)(?=\nBBOX:|\Z)', raw, re.DOTALL | re.IGNORECASE)
-    if pm:
-        prompt_text = pm.group(1).strip()
-    else:
-        # Tolerant fallback: strip bbox line if present, use rest as prompt
-        prompt_text = re.sub(
-            r'\nBBOX:.*', '', raw, flags=re.DOTALL | re.IGNORECASE
-        ).strip()
-        if not prompt_text:
-            prompt_text = (
-                f"Naturally integrate the {description} into the room scene. "
-                f"Do not change any other part of the room."
-            )
-
-    # Strip stray special tokens from prompt text
-    prompt_text = re.sub(r'<\|[^|]+\|>', '', prompt_text).strip()
-
-    # Resized scene dimensions — needed to rescale plain-text coords back
-    sw, sh = scene_small.size
+    print(f"    [VLM-bbox] raw: {raw!r}")
 
     def _rescale(rx1, ry1, rx2, ry2):
         x1 = max(0,      int(rx1 * width  / sw))
@@ -261,11 +221,9 @@ def _vlm_prompt_and_bbox(
         y2 = min(height, int(ry2 * height / sh))
         return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
 
-    # ── Parser 1: native Qwen grounding tokens <|box_start|>(x,y),(x,y)<|box_end|>
-    # Coords normalised [0, 1000) relative to the resized image.
+    # Parser 1: native grounding tokens — coords normalised [0, 1000)
     bm = re.search(
-        r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>',
-        raw,
+        r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>', raw
     )
     if bm:
         x1n, y1n, x2n, y2n = (int(bm.group(i)) for i in range(1, 5))
@@ -274,24 +232,19 @@ def _vlm_prompt_and_bbox(
             int(x2n * sw / 1000), int(y2n * sh / 1000),
         )
         if bbox:
-            print(f"    [VLM] bbox (grounding tokens): x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
-            return prompt_text, bbox
+            print(f"    [VLM-bbox] grounding: x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
+            return bbox
 
-    # ── Parser 2: plain [x1, y1, x2, y2] — model outputs pixel coords in
-    # resized image space when asked to produce a BBOX: line as text.
-    bm2 = re.search(
-        r'BBOX\s*:\s*\[(\d+)[,\s]+(\d+)[,\s]+(\d+)[,\s]+(\d+)\]',
-        raw, re.IGNORECASE,
-    )
+    # Parser 2: plain [x1, y1, x2, y2] in resized image pixel space
+    bm2 = re.search(r'\[(\d+)[,\s]+(\d+)[,\s]+(\d+)[,\s]+(\d+)\]', raw)
     if bm2:
-        rx1, ry1, rx2, ry2 = (int(bm2.group(i)) for i in range(1, 5))
-        bbox = _rescale(rx1, ry1, rx2, ry2)
+        bbox = _rescale(*(int(bm2.group(i)) for i in range(1, 5)))
         if bbox:
-            print(f"    [VLM] bbox (plain): x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
-            return prompt_text, bbox
+            print(f"    [VLM-bbox] plain:     x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
+            return bbox
 
-    print(f"    [VLM] bbox parse failed — center-floor fallback")
-    return prompt_text, (width // 6, height // 2, 5 * width // 6, height)
+    print(f"    [VLM-bbox] parse failed — center-floor fallback")
+    return width // 6, height // 2, 5 * width // 6, height
 
 
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
@@ -422,28 +375,6 @@ def build_collage_scene(
     return Image.fromarray(collage_np), (y1, y2, x1, x2)
 
 
-# ── Kontext blending prompt ───────────────────────────────────────────────────
-
-def _blend_prompt(obj_description: str, vlm_placement: str) -> str:
-    """
-    Build a Kontext blending prompt that stays under CLIP's 77-token limit.
-
-    Takes the first sentence of the VLM output and caps it at 35 words so
-    the full prompt stays ~60 tokens (first sentence ~35 words + fixed
-    integration suffix ~25 tokens = safely under 77).
-    """
-    first_sentence = vlm_placement.split(".")[0].strip()
-    words = first_sentence.split()
-    if len(words) > 35:
-        first_sentence = " ".join(words[:35])
-    return (
-        f"{first_sentence}. "
-        f"Naturally integrate the {obj_description} — "
-        f"blend with correct perspective, shadows, and lighting. "
-        f"Do not change any other part of the room."
-    )
-
-
 # ── Main incremental pipeline ─────────────────────────────────────────────────
 
 def run_collage_chain(
@@ -518,21 +449,16 @@ def run_collage_chain(
             ref_mask = np.zeros((height, width), dtype=np.uint8)
             ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
 
-        # Stage VLM: prompt + bbox in one consistent pass
-        print(f"  [VLM] Generating prompt and placement bbox ...")
-        vlm_prompt, (bx1, by1, bx2, by2) = _vlm_prompt_and_bbox(
+        # Stage VLM: bbox placement only — appearance is handled by the collage
+        print(f"  [VLM] Generating placement bbox ...")
+        bx1, by1, bx2, by2 = _vlm_bbox(
             vlm_model=vlm_model, vlm_processor=vlm_proc,
             scene_img=scene, obj_img=obj_img, description=desc,
             width=width, height=height,
         )
-        print(f"\n  {_SEP}")
-        print(f"  [VLM → Prompt]  {name}")
-        print(f"  {_SEP}")
-        for line in vlm_prompt.splitlines():
-            print(f"  {line}")
-        print(f"  {_SEP}\n")
-        with open(os.path.join(out_dir, f"vlm_prompt_{name}.txt"), "w") as f:
-            f.write(f"{vlm_prompt}\n\nbbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
+        print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
+        with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
+            f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
         # Stage COL: build collage scene (AnyDoor's core idea in Kontext)
         print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
@@ -549,7 +475,11 @@ def run_collage_chain(
         print(f"      Saved collage: collage_{name}.png")
 
         # Stage K: FLUX Kontext with collage as reference
-        blend_p = _blend_prompt(desc, vlm_prompt)
+        blend_p = (
+            f"Naturally integrate the {desc} shown in the scene "
+            f"with correct lighting, contact shadow, and perspective. "
+            f"Do not change any other part of the room."
+        )
         print(f"  [K] Kontext integration pass ...")
         print(f"      Prompt: {blend_p[:100]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
