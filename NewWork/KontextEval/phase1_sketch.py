@@ -393,69 +393,107 @@ def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
     """
     Load a VLM for placement reasoning.
 
-    device="cpu"  → bfloat16 on CPU.  Safe alongside FLUX on any GPU.
-                    Inference: ~30-60 s per object.
-    device="cuda" → 4-bit NF4 quantization via BitsAndBytes.
-                    Qwen2.5-VL-7B fits in ~4 GB VRAM (vs ~15 GB fp16).
-                    Requires: pip install bitsandbytes>=0.43.0
+    device="cpu"  → bfloat16 on CPU. Safe alongside FLUX on any GPU.
+                    Inference ~30-60 s per object.
+    device="cuda" → tries 4-bit NF4 (bitsandbytes) first.
+                    Qwen2.5-VL-7B: ~4 GB VRAM in 4-bit vs ~15 GB in fp16.
+                    If bitsandbytes is missing/outdated, falls back to
+                    bf16 with device_map="auto" automatically.
+                    To enable 4-bit: pip install -U bitsandbytes>=0.46.1
 
-    GPU memory with 4-bit:
+    GPU memory (4-bit path):
       Kontext-dev          ~24 GB
       Qwen2.5-VL-7B int4   ~4 GB
-      Total                ~28 GB  (fits on a 40 GB A100/H100)
+      Total                ~28 GB  (fits on 40 GB A100/H100)
     """
     from transformers import AutoProcessor
 
     print(f"  Loading VLM '{model_id}' on {device} ...")
 
-    if device == "cuda":
-        from transformers import BitsAndBytesConfig
-        quant_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        load_kwargs = dict(
-            quantization_config=quant_cfg,
-            device_map="auto",        # BitsAndBytes requires device_map
-            cache_dir=cache_dir,
-        )
-        to_device = False             # device_map handles placement
-    else:
-        load_kwargs = dict(
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-        )
-        to_device = True
-
-    try:
-        # Qwen2.5-VL (7B default)
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id, **load_kwargs
-        )
-    except (ImportError, AttributeError):
+    def _load_model(load_kwargs: dict, to_device: bool) -> object:
+        """Try model classes in order; return first that succeeds."""
+        classes = []
         try:
-            # Qwen2-VL (2B legacy)
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            classes.append(Qwen2_5_VLForConditionalGeneration)
+        except ImportError:
+            pass
+        try:
             from transformers import Qwen2VLForConditionalGeneration
-            model = Qwen2VLForConditionalGeneration.from_pretrained(
-                model_id, **load_kwargs
-            )
-        except (ImportError, AttributeError):
-            from transformers import AutoModelForVision2Seq
-            model = AutoModelForVision2Seq.from_pretrained(
+            classes.append(Qwen2VLForConditionalGeneration)
+        except ImportError:
+            pass
+
+        last_err = None
+        for cls in classes:
+            try:
+                m = cls.from_pretrained(model_id, **load_kwargs)
+                if to_device:
+                    m = m.to(device)
+                return m.eval()
+            except Exception as e:
+                last_err = e
+                continue
+
+        # Final fallback: AutoModel with trust_remote_code
+        try:
+            from transformers import AutoModel
+            m = AutoModel.from_pretrained(
                 model_id, trust_remote_code=True, **load_kwargs
             )
+            if to_device:
+                m = m.to(device)
+            return m.eval()
+        except Exception as e:
+            last_err = e
 
-    if to_device:
-        model = model.to(device)
-    model.eval()
+        raise RuntimeError(
+            f"Could not load VLM '{model_id}'. Last error: {last_err}"
+        )
+
+    model = None
+    mode  = ""
+
+    if device == "cuda":
+        # ── Attempt 1: 4-bit NF4 via bitsandbytes ────────────────────────
+        try:
+            from transformers import BitsAndBytesConfig
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            model = _load_model(
+                dict(quantization_config=quant_cfg,
+                     device_map="auto", cache_dir=cache_dir),
+                to_device=False,
+            )
+            mode = "4-bit NF4 GPU"
+        except Exception as e:
+            print(f"    [VLM] 4-bit load failed ({e!s:.80})")
+            print(f"    [VLM] Falling back to bf16 on GPU "
+                  f"(run: pip install -U bitsandbytes>=0.46.1 for 4-bit)")
+
+        # ── Attempt 2: bf16 with device_map (no quantization) ────────────
+        if model is None:
+            model = _load_model(
+                dict(torch_dtype=torch.bfloat16,
+                     device_map="auto", cache_dir=cache_dir),
+                to_device=False,
+            )
+            mode = "bf16 GPU"
+    else:
+        model = _load_model(
+            dict(torch_dtype=torch.bfloat16, cache_dir=cache_dir),
+            to_device=True,
+        )
+        mode = "bf16 CPU"
 
     processor = AutoProcessor.from_pretrained(
         model_id, cache_dir=cache_dir, trust_remote_code=True,
     )
-    print(f"  VLM loaded  ({'4-bit GPU' if device == 'cuda' else 'bf16 CPU'})")
+    print(f"  VLM loaded  ({mode})")
     return model, processor
 
 
