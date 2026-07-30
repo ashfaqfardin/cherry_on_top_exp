@@ -312,6 +312,7 @@ def run_roi_kontext(
     sigma_lo:    float = 0.10,
     sigma_hi:    float = 0.65,
     inject_mode: str   = "velocity",
+    init_sigma:  float = 0.80,
     seed:        int   = 42,
     num_steps:   int   = 28,
     guidance:    float = 2.5,
@@ -326,7 +327,18 @@ def run_roi_kontext(
     Residual Object Anchoring (ROA) Kontext insertion.
 
     Token layout: standard Kontext 8192-token [gen (4096) | ref_scene (4096)]
-    Init: pure Gaussian noise (NOT noisy obj_img — scene structure forms naturally)
+
+    Init strategy (init_sigma):
+        init_sigma > 0 (default 0.80): seed gen latent from noisy z_obj at that σ level.
+            latents = (1 - init_sigma) * z_obj + init_sigma * noise
+            This gives FLUX a bicycle prior so it knows WHAT to generate.
+            The scene reference + ROA correction then guides WHERE and HOW.
+        init_sigma = 0.0 or 1.0: pure noise (FLUX decides everything — often ignores obj).
+
+    Why noisy-obj init is needed:
+        Kontext's scene reference is a STRONG attractor — without any object prior in the
+        gen latent, FLUX just reproduces the scene. A noisy-obj init (σ≈0.8) gives a loose
+        bicycle structure that Kontext refines into a naturally-integrated object.
 
     Three injection modes (--inject_mode flag):
 
@@ -442,12 +454,24 @@ def run_roi_kontext(
     pipe.scheduler.set_timesteps(sigmas=sigmas_np, device=device_t, mu=mu)
     timesteps = pipe.scheduler.timesteps  # (T,)
 
-    # ── 7. Gen latent IDs (pure noise init — NOT noisy obj) ───────────────────
-    gen_ids  = _img_ids(pipe, ref_latents, device_t, dtype)   # (4096, 3) position grid
-
+    # ── 7. Gen latent IDs and init ────────────────────────────────────────────
+    gen_ids   = _img_ids(pipe, ref_latents, device_t, dtype)   # (4096, 3) position grid
     generator = torch.Generator(device=device_t).manual_seed(seed)
-    latents   = torch.randn(1, n_gen, z_obj_packed.shape[-1],
+    noise     = torch.randn(1, n_gen, z_obj_packed.shape[-1],
                              device=device_t, dtype=dtype, generator=generator)
+
+    # Noisy-obj init: give FLUX a bicycle prior so the scene reference doesn't
+    # completely suppress the object. Pure noise (init_sigma≈1) → FLUX just
+    # reproduces the scene; low sigma (≈0.5) → too rigid, wrong position.
+    # Default init_sigma=0.80 gives loose bicycle structure + full scene integration.
+    _s = float(np.clip(init_sigma, 0.0, 1.0))
+    if _s < 0.95:
+        latents = (1.0 - _s) * z_obj_packed + _s * noise
+        print(f"    [ROA] Init: noisy-obj  init_sigma={_s:.2f}  "
+              f"(1-σ)*z_obj + σ*noise")
+    else:
+        latents = noise
+        print(f"    [ROA] Init: pure noise  (init_sigma={_s:.2f})")
 
     # ── 8. Guidance embedding ─────────────────────────────────────────────────
     guidance_tensor = None
@@ -554,17 +578,19 @@ def run_alpha_sweep(
     sigma_lo:    float = 0.10,
     sigma_hi:    float = 0.65,
     inject_mode: str   = "velocity",
+    init_sigma:  float = 0.80,
     device:      str   = "cuda",
 ) -> None:
     results = [scene]
     titles  = ["scene"]
     for alpha in alphas:
-        print(f"  [sweep] alpha_max={alpha:.2f}  mode={inject_mode} ...")
+        print(f"  [sweep] alpha_max={alpha:.2f}  mode={inject_mode}  "
+              f"init_sigma={init_sigma:.2f} ...")
         r = run_roi_kontext(
             pipe=pipe, scene=scene, obj_img=obj_img, prompt=prompt,
             obj_noun=obj_noun, alpha_max=alpha,
             sigma_lo=sigma_lo, sigma_hi=sigma_hi,
-            inject_mode=inject_mode,
+            inject_mode=inject_mode, init_sigma=init_sigma,
             seed=seed, num_steps=num_steps, guidance=guidance,
             height=height, width=width, vital_layers=vital_layers,
             device=device,
@@ -598,6 +624,7 @@ def run_roi_chain(
     sigma_lo:       float,
     sigma_hi:       float,
     inject_mode:    str,
+    init_sigma:     float,
     derive_step:    int,
     top_k_frac:     float,
     height:         int,
@@ -671,12 +698,12 @@ def run_roi_chain(
         # Stage ROA: DAAM probe + residual anchoring loop
         print(f"  [ROA] Inserting '{name}' with Residual Object Anchoring ...")
         print(f"        mode={inject_mode}  alpha_max={alpha_max}  "
-              f"sigma=[{sigma_lo},{sigma_hi}]")
+              f"sigma=[{sigma_lo},{sigma_hi}]  init_sigma={init_sigma}")
         next_scene = run_roi_kontext(
             pipe=pipe, scene=scene, obj_img=obj_img, prompt=final_prompt,
             obj_noun=obj_noun, alpha_max=alpha_max,
             sigma_lo=sigma_lo, sigma_hi=sigma_hi,
-            inject_mode=inject_mode,
+            inject_mode=inject_mode, init_sigma=init_sigma,
             seed=seed, num_steps=num_steps,
             guidance=scene_guidance,
             height=height, width=width,
@@ -722,6 +749,9 @@ def parse_args():
                    help="Lower sigma bound for injection window. Default 0.10.")
     p.add_argument("--sigma_hi",      type=float, default=0.65,
                    help="Upper sigma bound for injection window. Default 0.65.")
+    p.add_argument("--init_sigma",     type=float, default=0.80,
+                   help="Noisy-obj init level. 0.80=default (loose bicycle structure). "
+                        "0.5=tighter identity (may look pasted). 0.95+=pure noise (no obj).")
     p.add_argument("--inject_mode",   default="velocity",
                    choices=["velocity", "latent", "blend"],
                    help="Injection mode. 'velocity' (default, FreqEdit-inspired): steer "
@@ -821,7 +851,7 @@ def main():
             height=args.height, width=args.width,
             out_dir=args.out_dir, vital_layers=vital_layers,
             sigma_lo=args.sigma_lo, sigma_hi=args.sigma_hi,
-            inject_mode=args.inject_mode,
+            inject_mode=args.inject_mode, init_sigma=args.init_sigma,
             device=args.device,
         )
         print("\nSweep complete — inspect grid then re-run without --alpha_sweep.")
@@ -836,7 +866,7 @@ def main():
         scene_guidance=args.guidance,
         alpha_max=args.alpha_max,
         sigma_lo=args.sigma_lo, sigma_hi=args.sigma_hi,
-        inject_mode=args.inject_mode,
+        inject_mode=args.inject_mode, init_sigma=args.init_sigma,
         derive_step=args.derive_step, top_k_frac=args.top_k_frac,
         height=args.height, width=args.width,
         out_dir=args.out_dir, device=args.device,
