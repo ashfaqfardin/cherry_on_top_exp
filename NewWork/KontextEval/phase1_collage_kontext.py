@@ -298,16 +298,26 @@ def build_collage_scene(
 
 def _blend_prompt(obj_description: str, vlm_placement: str) -> str:
     """
-    Build a Kontext prompt that asks the model to naturally integrate the
-    pre-pasted object shown in the reference image.
+    Build a Kontext prompt for the blending pass.
+
+    Uses the full VLM output (appearance + placement + lighting + shadow +
+    environment interaction) so FLUX receives all the detail it needs to
+    produce a realistic composite.  Prepends an integration directive so the
+    model understands the object is already shown in the reference collage and
+    must be blended, not invented from scratch.
     """
-    # Use first sentence of VLM prompt (placement description) + integration instruction
-    first_sentence = vlm_placement.split(".")[0].strip()
+    # Strip the boilerplate preservation tail if the VLM included it —
+    # we'll re-append it ourselves at a controlled position.
+    cleaned = vlm_placement.replace("Do not change any other part of the room.", "").strip()
+    if cleaned.endswith("."):
+        cleaned = cleaned[:-1].strip()
+
     return (
-        f"{first_sentence}. "
-        f"Naturally integrate the {obj_description} into the room scene — "
-        f"blend it realistically with correct perspective, contact shadows, "
-        f"and lighting that matches the rest of the room. "
+        f"Naturally integrate the {obj_description} shown in the reference image "
+        f"into the room, blending it so it looks like it was always there. "
+        f"{cleaned}. "
+        f"Match the object's lighting, contact shadow, and reflective surfaces "
+        f"exactly to the room's existing illumination. "
         f"Do not change any other part of the room."
     )
 

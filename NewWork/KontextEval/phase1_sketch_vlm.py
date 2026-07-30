@@ -148,7 +148,7 @@ def vlm_generate_kontext_prompt(
     scene_img: Image.Image,
     obj_img: Image.Image,
     description: str,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 768,
 ) -> str:
     """
     Ask a Vision-Language Model to write a Kontext insertion prompt.
@@ -178,21 +178,52 @@ def vlm_generate_kontext_prompt(
     obj_small   = _resize(obj_img,   512)
 
     instruction = (
-        f"You are an expert image composition assistant.\n\n"
+        f"You are an expert photorealistic image compositing assistant.\n\n"
         f"Image 1: A room scene where I want to insert a new object.\n"
         f"Image 2: The {description} I want to insert (on a white background).\n\n"
-        f"Write a single, complete prompt for an AI image editor called Kontext "
-        f"that will add the {description} from Image 2 into the room in Image 1.\n\n"
-        f"Your prompt MUST:\n"
-        f"1. Describe the {description}'s exact visual appearance (color, texture, "
-        f"style, proportions) as seen in Image 2\n"
-        f"2. Specify WHERE in the room to place it (which wall / surface / corner, "
-        f"relative to existing furniture)\n"
-        f"3. Specify orientation and how it contacts the floor or surface\n"
-        f"4. Set a realistic perspective-correct scale given the room's depth\n"
-        f"5. End with exactly this sentence: "
+        f"Write a detailed, precise prompt for an AI image editor called Kontext "
+        f"that will naturally composite the {description} from Image 2 into the room "
+        f"in Image 1 so it looks like it was always there.\n\n"
+        f"Structure your output as follows:\n\n"
+        f"FIRST SENTENCE (required): One concise sentence in the form: "
+        f"'A [exact color and material] {description} [specific location in room], "
+        f"[how it contacts the surface], [facing direction].' "
+        f"Use ONLY these location keywords: left wall, right wall, center, "
+        f"coffee table, floor, sofa, shelf.\n\n"
+        f"Then expand with ALL of the following details:\n\n"
+        f"1. APPEARANCE: Describe the {description}'s exact visual properties as seen "
+        f"in Image 2 — specific color names (e.g. 'matte charcoal grey' not just "
+        f"'dark'), material finish (matte/glossy/metallic/fabric), texture detail, "
+        f"distinctive markings or features, and proportions relative to a known "
+        f"household object.\n\n"
+        f"2. PLACEMENT: Specify exactly where in the room — which surface "
+        f"(floor / coffee table top / sofa seat / shelf), which zone "
+        f"(left side / right side / center), distance from the nearest landmark "
+        f"furniture piece (e.g. '40 cm to the right of the sofa arm'), "
+        f"and which furniture it must NOT overlap (list by name).\n\n"
+        f"3. ORIENTATION AND CONTACT: Which direction does it face (toward viewer / "
+        f"sideways / angled at 45 degrees)? Which parts physically touch the surface? "
+        f"Is it resting flat, leaning, or upright? Describe the exact contact points.\n\n"
+        f"4. SCALE: What is its height relative to nearby furniture? "
+        f"(e.g. 'reaches to the top of the sofa backrest', 'half the height of the "
+        f"coffee table'). Apply perspective foreshortening if placed in the background.\n\n"
+        f"5. LIGHTING: Study Image 1 carefully. Describe the dominant light source "
+        f"direction (top-left / top-right / overhead / window at right / etc.) and "
+        f"color temperature (warm yellow / cool daylight / neutral white). "
+        f"Then specify exactly how the {description}'s surfaces should be lit: "
+        f"which faces are bright, which are in shadow, the highlight color on "
+        f"glossy/metallic parts.\n\n"
+        f"6. SHADOW: Describe the contact shadow the {description} casts on the "
+        f"surface beneath it — shape (round / elongated), softness (sharp / diffuse), "
+        f"direction matching the light source, and approximate length relative to "
+        f"the object's size.\n\n"
+        f"7. ENVIRONMENT INTERACTION: Describe one specific way the room environment "
+        f"appears in the {description}'s most reflective surface (e.g. the chrome "
+        f"handlebars reflect the warm ceiling light and a blurred rectangle of the "
+        f"nearby sofa).\n\n"
+        f"8. End with exactly this sentence: "
         f"'Do not change any other part of the room.'\n\n"
-        f"Output ONLY the prompt text. No JSON, no explanation, no markdown."
+        f"Output ONLY the prompt text. No JSON, no headers, no markdown, no explanation."
     )
 
     messages = [
