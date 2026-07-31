@@ -41,10 +41,14 @@ Collage modes (--collage_mode)
 
 Pipeline
 ---------
-  Stage A   : Sketch → LoRA FLUX → obj_img   (same as all other phases)
-  Stage MASK: Threshold obj_img → ref_mask    (non-white/grey pixels)
-  Stage VLM : VLM(scene, obj_img) → placement description
-  Stage COL : Build collage_scene by pasting obj at placement bbox
+  Stage A   : Sketch → LoRA FLUX → obj_img
+  Stage BBOX: Placement mask → bbox           (no VLM — mask_{name}.png required)
+  Stage POSE: scene_crop = scene[y1:y2, x1:x2] expanded by 20%
+              mini_collage = obj pasted into upscaled crop
+              Kontext(mini_collage, pose_prompt) → posed result
+              diff(posed, scene_crop) → obj_posed on white bg
+  Stage MASK: Threshold obj_posed → ref_mask
+  Stage COL : Build collage_scene by pasting obj_posed at placement bbox
   Stage K   : FLUX Kontext(reference=collage_scene, prompt=blend_prompt) → result
   Loop      : result → next scene
 
@@ -737,19 +741,134 @@ def run_with_kv_injection(
     return result
 
 
+# ── Stage POSE: Kontext-based pose adjustment ────────────────────────────────
+
+@torch.no_grad()
+def _pose_object_in_context(
+    pipe,
+    obj_img:     Image.Image,
+    scene:       Image.Image,
+    bbox:        Tuple[int, int, int, int],
+    description: str,
+    seed:        int,
+    num_steps:   int,
+    guidance:    float,
+    height:      int,
+    width:       int,
+    expand_frac: float = 0.2,
+) -> Image.Image:
+    """
+    Ask Kontext to naturally pose obj_img at the target bbox zone in scene.
+
+    1. Expand bbox by expand_frac → crop scene for local context.
+    2. Upscale crop to (height×width); paste obj_img at zone within crop.
+    3. Kontext(mini_collage, pose_prompt) → posed result.
+    4. Diff posed vs upscaled scene_crop, restricted to zone ROI
+       → extract obj pixels → white background → obj_posed.
+
+    Falls back to original obj_img if diff extraction yields < 100 px.
+    """
+    x1, y1, x2, y2 = bbox
+    scene_np = np.array(scene.convert("RGB"))
+    H_sc, W_sc = scene_np.shape[:2]
+
+    # 1. Expand bbox for context
+    pad_x = int((x2 - x1) * expand_frac)
+    pad_y = int((y2 - y1) * expand_frac)
+    cx1 = max(0,    x1 - pad_x);  cx2 = min(W_sc, x2 + pad_x)
+    cy1 = max(0,    y1 - pad_y);  cy2 = min(H_sc, y2 + pad_y)
+    scene_crop  = scene_np[cy1:cy2, cx1:cx2]
+    crop_h, crop_w = scene_crop.shape[:2]
+
+    # Map bbox zone into upscaled-crop space
+    sx = width  / crop_w
+    sy = height / crop_h
+    zx1 = int((x1 - cx1) * sx);  zx2 = int((x2 - cx1) * sx)
+    zy1 = int((y1 - cy1) * sy);  zy2 = int((y2 - cy1) * sy)
+    zone_w = max(4, zx2 - zx1);  zone_h = max(4, zy2 - zy1)
+
+    # 2. Tight-crop obj_img (strip white bg)
+    obj_arr = np.array(obj_img.convert("RGB"), dtype=np.int32)
+    is_bg   = (obj_arr[:,:,0] >= 230) & (obj_arr[:,:,1] >= 230) & (obj_arr[:,:,2] >= 230)
+    ys_o, xs_o = np.where(~is_bg)
+    if len(ys_o) > 0:
+        obj_crop = obj_arr.astype(np.uint8)[
+            ys_o.min():ys_o.max()+1, xs_o.min():xs_o.max()+1]
+    else:
+        oh, ow = obj_arr.shape[:2]
+        obj_crop = obj_arr.astype(np.uint8)[oh//4:3*oh//4, ow//4:3*ow//4]
+
+    # Build mini_collage: upscale crop, paste obj at 80% zone fill, centered
+    mini_np = cv2.resize(scene_crop, (width, height))
+    oh_c, ow_c = obj_crop.shape[:2]
+    scale = min((zone_h * 0.8) / oh_c, (zone_w * 0.8) / ow_c)
+    pw = max(4, int(ow_c * scale));  ph = max(4, int(oh_c * scale))
+    obj_rs = cv2.resize(obj_crop, (pw, ph))
+    py1_m = max(0,      zy1 + (zone_h - ph) // 2)
+    px1_m = max(0,      zx1 + (zone_w - pw) // 2)
+    py2_m = min(height, py1_m + ph)
+    px2_m = min(width,  px1_m + pw)
+    mini_np[py1_m:py2_m, px1_m:px2_m] = obj_rs[:py2_m-py1_m, :px2_m-px1_m]
+
+    # 3. Kontext pose pass on mini_collage
+    pose_prompt = (
+        f"Naturally integrate the {description} shown in this scene. "
+        f"Adjust its pose and perspective so it sits properly on the floor "
+        f"with correct contact shadow. Preserve all {description} details."
+    )
+    gen = torch.Generator(device=pipe.device).manual_seed(seed)
+    posed_pil = pipe(
+        image=Image.fromarray(mini_np), prompt=pose_prompt,
+        num_inference_steps=num_steps, guidance_scale=guidance,
+        height=height, width=width, max_sequence_length=512,
+        generator=gen, output_type="pil",
+    ).images[0]
+
+    # 4. Diff to extract object — restrict to zone ROI + margin
+    posed_np = np.array(posed_pil.convert("RGB"))
+    scene_up = cv2.resize(scene_crop, (width, height))
+    diff_mag = np.abs(posed_np.astype(int) - scene_up.astype(int)).max(axis=-1)
+    obj_mask = (diff_mag > 20).astype(np.uint8)
+
+    margin   = max(30, int(min(zone_w, zone_h) * 0.3))
+    zone_roi = np.zeros((height, width), dtype=np.uint8)
+    zone_roi[max(0, zy1-margin):min(height, zy2+margin),
+             max(0, zx1-margin):min(width,  zx2+margin)] = 1
+    obj_mask = obj_mask * zone_roi
+
+    k5 = np.ones((5, 5), np.uint8)
+    obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_CLOSE, k5)
+    obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+
+    n_obj = int(obj_mask.sum())
+    print(f"    [POSE] diff mask: {n_obj} px ({100*n_obj/(height*width):.1f}%)")
+
+    if n_obj < 100:
+        print(f"    [POSE] diff too sparse — returning original obj_img")
+        return obj_img
+
+    # Compose object pixels onto white background
+    obj_posed_np = np.full((height, width, 3), 255, dtype=np.uint8)
+    obj_posed_np[obj_mask > 0] = posed_np[obj_mask > 0]
+    return Image.fromarray(obj_posed_np)
+
+
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
 
-def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 50) -> np.ndarray:
+def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 30) -> np.ndarray:
     """
-    AnyDoor's exact high-frequency detail map (datasets/data_utils.py::sobel).
+    AnyDoor-style high-frequency detail map (datasets/data_utils.py::sobel).
     Sobel-filtered RGB: texture edges where object is, black elsewhere.
-    thresh=50 matches AnyDoor's default.
+    thresh=30 (vs AnyDoor's 50) because LoRA-generated objects have smoother
+    gradients than real photos — 50 produces all-black on synthetic output.
+    Erosion guard: falls back to un-eroded mask if erosion kills the object.
     """
     H, W = img.shape[:2]
     small   = cv2.resize(img,  (256, 256))
     mask_s  = (cv2.resize(mask.astype(np.uint8), (256, 256)) > 0.5).astype(np.uint8)
     kernel  = np.ones((5, 5), np.uint8)
-    mask_s  = cv2.erode(mask_s, kernel, iterations=2)
+    eroded  = cv2.erode(mask_s, kernel, iterations=2)
+    mask_s  = eroded if eroded.any() else mask_s
 
     sx = cv2.Sobel(small, cv2.CV_64F, 1, 0, ksize=3)
     sy = cv2.Sobel(small, cv2.CV_64F, 0, 1, ksize=3)
@@ -882,7 +1001,6 @@ def run_collage_chain(
     edits:          List[dict],
     sketch_dir:     str,
     lora_id:        str,
-    vlm_pair:       tuple,
     seed:           int,
     num_steps:      int,
     lora_guidance:  float,
@@ -897,22 +1015,23 @@ def run_collage_chain(
     use_kv:         bool  = False,
     obj_strength:   float = 0.7,
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
+    pose_steps:     int   = 15,
+    pose_guidance:  float = 2.5,
+    pose_expand:    float = 0.2,
+    skip_pose:      bool  = False,
 ) -> List[Image.Image]:
     """
-    AnyDoor-inspired incremental object insertion via FLUX Kontext.
+    Incremental object insertion via FLUX Kontext with Kontext-based pose adjustment.
 
     Per object:
       Stage A   : Sketch → LoRA FLUX → obj_img
-      Stage MASK: Threshold obj_img → ref_mask
-      Stage VLM : VLM(scene, obj_img) → placement description
-      Stage COL : paste obj into scene at placement → collage_scene
+      Stage BBOX: Placement mask → bbox  (mask_{name}.png required)
+      Stage POSE: Kontext(scene_crop+obj, pose_prompt) → obj_posed
+                  diff extraction → obj on white bg with natural pose
+      Stage MASK: Threshold obj_posed → ref_mask
+      Stage COL : paste obj_posed into scene at bbox → collage_scene
       Stage K   : FLUX Kontext(reference=collage_scene, prompt) → result
-
-    The collage_scene gives Kontext the full visual prior: WHERE the object
-    is, WHAT it looks like, and its approximate SIZE — then FLUX generates
-    a version where it is naturally integrated with proper lighting.
     """
-    vlm_model, vlm_proc = vlm_pair
     results = [base]
     scene   = base
 
@@ -942,8 +1061,35 @@ def run_collage_chain(
         )
         obj_img.save(os.path.join(out_dir, f"obj_gen_{name}.png"))
 
-        # Stage MASK: extract object mask
-        ref_mask = _compute_obj_mask(obj_img)
+        # Stage BBOX: placement mask required
+        mask_path = os.path.join(sketch_dir, f"mask_{name}.png")
+        if not os.path.isfile(mask_path):
+            raise FileNotFoundError(
+                f"Placement mask not found: {mask_path}\n"
+                f"Draw a white region on a black image to mark where '{name}' should go."
+            )
+        print(f"  [BBOX] Placement mask: mask_{name}.png")
+        bx1, by1, bx2, by2 = _bbox_from_placement_mask(mask_path, width, height)
+        print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
+        with open(os.path.join(out_dir, f"bbox_{name}.txt"), "w") as f:
+            f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
+
+        # Stage POSE: Kontext poses the object in context of the target zone
+        if not skip_pose:
+            print(f"  [POSE] Adjusting pose via Kontext mini-collage ...")
+            obj_posed = _pose_object_in_context(
+                pipe=pipe, obj_img=obj_img, scene=scene,
+                bbox=(bx1, by1, bx2, by2), description=desc,
+                seed=seed, num_steps=pose_steps, guidance=pose_guidance,
+                height=height, width=width, expand_frac=pose_expand,
+            )
+            obj_posed.save(os.path.join(out_dir, f"obj_posed_{name}.png"))
+            print(f"      Saved: obj_posed_{name}.png")
+        else:
+            obj_posed = obj_img
+
+        # Stage MASK: extract mask from posed object
+        ref_mask = _compute_obj_mask(obj_posed)
         n_px = ref_mask.sum()
         print(f"  [MASK] Object pixels: {n_px} ({100*n_px/(height*width):.1f}%)")
         if n_px < 50:
@@ -951,30 +1097,11 @@ def run_collage_chain(
             ref_mask = np.zeros((height, width), dtype=np.uint8)
             ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
 
-        # Stage BBOX: placement mask → bbox (VLM fallback if mask absent)
-        mask_path = os.path.join(sketch_dir, f"mask_{name}.png")
-        if os.path.isfile(mask_path):
-            print(f"  [BBOX] Using placement mask: mask_{name}.png")
-            bx1, by1, bx2, by2 = _bbox_from_placement_mask(mask_path, width, height)
-            print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
-            with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
-                f.write(f"bbox (mask): x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
-        else:
-            print(f"  [VLM] No placement mask found — running VLM bbox ...")
-            bx1, by1, bx2, by2 = _vlm_bbox(
-                vlm_model=vlm_model, vlm_processor=vlm_proc,
-                scene_img=scene, obj_img=obj_img, description=desc,
-                width=width, height=height,
-            )
-            print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
-            with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
-                f.write(f"bbox (vlm): x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
-
-        # Stage COL: build collage scene (AnyDoor's core idea in Kontext)
+        # Stage COL: build collage scene with posed object
         print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
         collage_scene, paste_box = build_collage_scene(
             scene        = scene,
-            obj_img      = obj_img,
+            obj_img      = obj_posed,
             ref_mask     = ref_mask,
             target_bbox  = (bx1, by1, bx2, by2),
             collage_mode = collage_mode,
@@ -984,7 +1111,7 @@ def run_collage_chain(
         collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
         print(f"      Saved collage: collage_{name}.png")
 
-        # Stage K: FLUX Kontext with collage as reference
+        # Stage K: FLUX Kontext integration pass
         blend_p = (
             f"Naturally integrate the {desc} shown in the scene "
             f"with correct lighting, contact shadow, and perspective. "
@@ -996,44 +1123,27 @@ def run_collage_chain(
             f.write(blend_p)
 
         if use_kv:
-            # Compute object token mask (non-background tokens in obj_img)
-            vae_sf = getattr(pipe, "vae_scale_factor", 8)
-            h_lat  = height // (vae_sf * 2)
-            w_lat  = width  // (vae_sf * 2)
-            tok_mask = _obj_token_mask(obj_img, h_lat, w_lat)
-            pct = 100.0 * tok_mask.mean()
+            vae_sf   = getattr(pipe, "vae_scale_factor", 8)
+            h_lat    = height // (vae_sf * 2)
+            w_lat    = width  // (vae_sf * 2)
+            tok_mask = _obj_token_mask(obj_posed, h_lat, w_lat)
+            pct      = 100.0 * tok_mask.mean()
             print(f"      obj token mask: {tok_mask.sum()} / {h_lat*w_lat} ({pct:.1f}%)")
-
-            # Target zone: from placement mask if available, else scale bbox to token space
-            if os.path.isfile(mask_path):
-                target_zone = _placement_mask_to_token_zone(mask_path, height, width, pipe)
-            else:
-                zone_np = np.zeros((h_lat, w_lat), dtype=bool)
-                tx1 = max(0,     int(bx1 * w_lat / width))
-                ty1 = max(0,     int(by1 * h_lat / height))
-                tx2 = min(w_lat, int(bx2 * w_lat / width))
-                ty2 = min(h_lat, int(by2 * h_lat / height))
-                zone_np[ty1:ty2, tx1:tx2] = True
-                target_zone = zone_np.reshape(-1)
-
+            target_zone = _placement_mask_to_token_zone(mask_path, height, width, pipe)
             next_scene = run_with_kv_injection(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
-                obj_img=obj_img, obj_mask_np=tok_mask, target_zone=target_zone,
+                obj_img=obj_posed, obj_mask_np=tok_mask, target_zone=target_zone,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
                 height=height, width=width,
                 obj_strength=obj_strength, cutoff_frac=cutoff_frac,
             )
         else:
             next_scene = run_standard(
-                pipe      = pipe,
-                canvas    = collage_scene,
-                prompt    = blend_p,
-                seed      = seed,
-                num_steps = num_steps,
-                guidance  = scene_guidance,
-                height    = height,
-                width     = width,
+                pipe=pipe, canvas=collage_scene, prompt=blend_p,
+                seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                height=height, width=width,
             )
+
         result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
@@ -1080,13 +1190,19 @@ def parse_args():
                    help="K/V injection strength at target zone (0-1). Default 0.7.")
     p.add_argument("--cutoff_frac",   default="0.0,0.6",
                    help="Injection active window as 'start,end' step fractions. Default '0.0,0.6'.")
+    p.add_argument("--skip_pose",      action="store_true",
+                   help="Skip Stage POSE; use raw obj_img directly in collage.")
+    p.add_argument("--pose_steps",    type=int,   default=15,
+                   help="Kontext steps for the pose-adjustment pass. Default 15.")
+    p.add_argument("--pose_guidance", type=float, default=2.5,
+                   help="Guidance scale for the pose pass. Default 2.5.")
+    p.add_argument("--pose_expand",   type=float, default=0.2,
+                   help="Fraction to expand bbox when cropping scene for pose context. Default 0.2.")
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--num_steps",     type=int,   default=28)
     p.add_argument("--height",        type=int,   default=1024)
     p.add_argument("--width",         type=int,   default=1024)
     p.add_argument("--device",        default="cuda")
-    p.add_argument("--vlm_model",     default="Qwen/Qwen2.5-VL-7B-Instruct")
-    p.add_argument("--vlm_device",    default="cpu")
     return p.parse_args()
 
 
@@ -1108,17 +1224,14 @@ def main():
     print(f"  Sketch dir   : {args.sketch_dir}")
     print(f"  Collage mode : {args.collage_mode}  alpha={args.paste_alpha}  feather={args.feather}")
     print(f"  Guidance     : {args.guidance}")
+    print(f"  Pose pass    : {'skip' if args.skip_pose else f'steps={args.pose_steps}  guidance={args.pose_guidance}  expand={args.pose_expand}'}")
     print(f"  KV injection : {args.kv_injection}"
           + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
              if args.kv_injection else ""))
-    print(f"  VLM          : {args.vlm_model}  [{args.vlm_device}]")
     print(f"  Output       : {args.out_dir}")
     print(f"{_SEP}\n")
 
-    print("Loading VLM ...")
-    vlm_pair = load_vlm(args.vlm_model, args.cache_dir, args.vlm_device)
-
-    print("\nLoading FLUX.1-Kontext-dev ...")
+    print("Loading FLUX.1-Kontext-dev ...")
     pipe = load_kontext_pipeline(
         hf_token  = args.hf_token,
         device    = args.device,
@@ -1142,7 +1255,6 @@ def main():
     results = run_collage_chain(
         pipe=pipe, base=base, edits=edits,
         sketch_dir=args.sketch_dir, lora_id=args.lora_id,
-        vlm_pair=vlm_pair,
         seed=args.seed, num_steps=args.num_steps,
         lora_guidance=args.lora_guidance,
         scene_guidance=args.guidance,
@@ -1154,6 +1266,10 @@ def main():
         use_kv=args.kv_injection,
         obj_strength=args.obj_strength,
         cutoff_frac=cutoff_frac,
+        pose_steps=args.pose_steps,
+        pose_guidance=args.pose_guidance,
+        pose_expand=args.pose_expand,
+        skip_pose=args.skip_pose,
     )
 
     all_imgs = results
