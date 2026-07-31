@@ -71,7 +71,7 @@ import argparse
 import gc
 import json
 import os
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import matplotlib
@@ -79,7 +79,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers import FluxKontextPipeline
+from diffusers.models.attention_processor import Attention
+from diffusers.models.embeddings import apply_rotary_emb
 from PIL import Image
 
 
@@ -440,6 +443,300 @@ def _vlm_bbox(
     return width // 6, height // 2, 5 * width // 6, height
 
 
+# ── K/V injection: capture + inject obj appearance at target zone ─────────────
+#
+# Optional second pass on top of the collage:
+#   1. 1-step capture: run FLUX with obj_img as canvas, record K/V at TIER_A layers
+#   2. Full denoising: run FLUX with collage_scene as canvas,
+#      inject captured K/V at target-zone gen tokens
+#
+# Why this helps on top of collage:
+#   The collage gives FLUX the visual prior (shape, colour, position).
+#   K/V injection reinforces the appearance signal in attention space at the
+#   exact target zone so FLUX doesn't drift the colour/texture during denoising.
+
+_TIER_A        = {0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56}
+_SINGLE_TXT_LEN = 512   # T5 sequence length used by FluxKontextPipeline
+
+
+def _neutralize_white_bg(img: Image.Image, threshold: int = 240,
+                          fill: tuple = (128, 128, 128)) -> Image.Image:
+    arr = np.array(img.convert("RGB"), dtype=np.uint8)
+    white = (arr[:, :, 0] >= threshold) & (arr[:, :, 1] >= threshold) & (arr[:, :, 2] >= threshold)
+    arr[white] = fill
+    return Image.fromarray(arr)
+
+
+def _obj_token_mask(obj_img: Image.Image, h_lat: int, w_lat: int,
+                    grey: tuple = (128, 128, 128), tol: int = 10,
+                    min_frac: float = 0.05) -> np.ndarray:
+    """Bool mask (h_lat*w_lat,): True = object token, False = background."""
+    arr = np.array(obj_img.convert("RGB").resize((w_lat, h_lat), Image.LANCZOS))
+    is_grey  = (np.abs(arr[:,:,0].astype(int) - grey[0]) <= tol) & \
+               (np.abs(arr[:,:,1].astype(int) - grey[1]) <= tol) & \
+               (np.abs(arr[:,:,2].astype(int) - grey[2]) <= tol)
+    is_white = (arr[:,:,0] >= 230) & (arr[:,:,1] >= 230) & (arr[:,:,2] >= 230)
+    mask = ~(is_grey | is_white)
+    if mask.mean() < min_frac:
+        mask[:] = False
+        mask[h_lat//4:3*h_lat//4, w_lat//4:3*w_lat//4] = True
+    return mask.reshape(-1)
+
+
+def _placement_mask_to_token_zone(mask_path: str, height: int, width: int,
+                                   pipe) -> np.ndarray:
+    """Convert a user-drawn placement mask to a flat bool token mask (n_gen,)."""
+    vae_sf    = getattr(pipe, "vae_scale_factor", 8)
+    h_lat, w_lat = height // (vae_sf * 2), width // (vae_sf * 2)
+    mask_down = Image.open(mask_path).convert("L").resize((w_lat, h_lat), Image.NEAREST)
+    zone = (np.array(mask_down) > 127).reshape(-1)
+    print(f"    [KV-zone] {zone.sum()} / {h_lat * w_lat} tokens ({100*zone.mean():.1f}%)")
+    return zone
+
+
+class _KVCapture:
+    """
+    Attention processor: performs standard attention AND records K/V from the
+    Kontext ref-token slice at TIER_A layers during a 1-step capture pass.
+
+    In Kontext hidden_states = [gen_tokens | ref_tokens]. Ref starts at
+    img_offset + n_gen.  We store (K, V) on CPU for later injection.
+    """
+    def __init__(self, n_gen: int):
+        self.n_gen = n_gen
+        self.kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._layer = 0
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None):
+        is_double = encoder_hidden_states is not None
+        B = hidden_states.shape[0]
+
+        q = attn.to_q(hidden_states)
+        k = attn.to_k(hidden_states)
+        v = attn.to_v(hidden_states)
+        hd = k.shape[-1] // attn.heads
+        q = q.view(B, -1, attn.heads, hd).transpose(1, 2)
+        k = k.view(B, -1, attn.heads, hd).transpose(1, 2)
+        v = v.view(B, -1, attn.heads, hd).transpose(1, 2)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+
+        txt_len = 0
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            ek = attn.add_k_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            ev = attn.add_v_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            txt_len = eq.shape[2]
+            q = torch.cat([eq, q], dim=2)
+            k = torch.cat([ek, k], dim=2)
+            v = torch.cat([ev, v], dim=2)
+
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q, image_rotary_emb)
+            k = apply_rotary_emb(k, image_rotary_emb)
+
+        if self._layer in _TIER_A:
+            img_off = txt_len if is_double else _SINGLE_TXT_LEN
+            r_lo, r_hi = img_off + self.n_gen, img_off + 2 * self.n_gen
+            if k.shape[2] >= r_hi:
+                self.kv[self._layer] = (
+                    k[:, :, r_lo:r_hi, :].detach().cpu(),
+                    v[:, :, r_lo:r_hi, :].detach().cpu(),
+                )
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, -1, attn.heads * hd).to(q.dtype)
+
+        if is_double:
+            enc_out = out[:, :encoder_hidden_states.shape[1]]
+            out     = out[:, encoder_hidden_states.shape[1]:]
+            out     = attn.to_out[1](attn.to_out[0](out))
+            enc_out = attn.to_add_out(enc_out)
+            self._layer += 1
+            return out, enc_out
+        self._layer += 1
+        return out
+
+
+class _KVInject:
+    """
+    Attention processor: injects captured obj K/V into target-zone gen tokens
+    at TIER_A layers during the active denoising window (cutoff_frac).
+    """
+    def __init__(self, n_gen: int,
+                 obj_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+                 obj_mask_np: np.ndarray,
+                 target_zone: np.ndarray, obj_strength: float,
+                 n_steps: int, cutoff_frac: Tuple[float, float]):
+        self.n_gen       = n_gen
+        self.obj_kv      = obj_kv
+        self.obj_mask_np = obj_mask_np
+        self.target_zone = target_zone   # bool (n_gen,)
+        self.obj_strength = obj_strength
+        self.n_steps     = n_steps
+        self.cutoff_frac = cutoff_frac
+        self._layer = 0
+        self._step  = 0
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None):
+        is_double = encoder_hidden_states is not None
+        B = hidden_states.shape[0]
+
+        q = attn.to_q(hidden_states)
+        k = attn.to_k(hidden_states)
+        v = attn.to_v(hidden_states)
+        hd = k.shape[-1] // attn.heads
+        q = q.view(B, -1, attn.heads, hd).transpose(1, 2)
+        k = k.view(B, -1, attn.heads, hd).transpose(1, 2)
+        v = v.view(B, -1, attn.heads, hd).transpose(1, 2)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+
+        txt_len = 0
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            ek = attn.add_k_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            ev = attn.add_v_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            txt_len = eq.shape[2]
+            q = torch.cat([eq, q], dim=2)
+            k = torch.cat([ek, k], dim=2)
+            v = torch.cat([ev, v], dim=2)
+
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q, image_rotary_emb)
+            k = apply_rotary_emb(k, image_rotary_emb)
+
+        lo = int(self.cutoff_frac[0] * self.n_steps)
+        hi = int(self.cutoff_frac[1] * self.n_steps)
+        if lo <= self._step < hi and self._layer in self.obj_kv:
+            img_off = txt_len if is_double else _SINGLE_TXT_LEN
+            g_lo, g_hi = img_off, img_off + self.n_gen
+
+            k_gen = k[:, :, g_lo:g_hi, :].clone()
+            v_gen = v[:, :, g_lo:g_hi, :].clone()
+
+            k_obj_raw, v_obj_raw = self.obj_kv[self._layer]
+            k_obj_raw = k_obj_raw.to(k.device, k.dtype)
+            v_obj_raw = v_obj_raw.to(v.device, v.dtype)
+
+            obj_idx = torch.from_numpy(np.where(self.obj_mask_np)[0]).to(k.device)
+            if obj_idx.numel() > 0:
+                k_obj = k_obj_raw[:, :, obj_idx, :].mean(dim=2, keepdim=True).expand_as(k_gen)
+                v_obj = v_obj_raw[:, :, obj_idx, :].mean(dim=2, keepdim=True).expand_as(v_gen)
+            else:
+                k_obj = k_obj_raw.mean(dim=2, keepdim=True).expand_as(k_gen)
+                v_obj = v_obj_raw.mean(dim=2, keepdim=True).expand_as(v_gen)
+
+            tgt   = torch.from_numpy(self.target_zone).to(k.device).view(1, 1, -1, 1)
+            s     = self.obj_strength
+            k_gen = torch.where(tgt, (1 - s) * k_gen + s * k_obj, k_gen)
+            v_gen = torch.where(tgt, (1 - s) * v_gen + s * v_obj, v_gen)
+
+            k = k.clone(); v = v.clone()
+            k[:, :, g_lo:g_hi, :] = k_gen
+            v[:, :, g_lo:g_hi, :] = v_gen
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, -1, attn.heads * hd).to(q.dtype)
+
+        if is_double:
+            enc_out = out[:, :encoder_hidden_states.shape[1]]
+            out     = out[:, encoder_hidden_states.shape[1]:]
+            out     = attn.to_out[1](attn.to_out[0](out))
+            enc_out = attn.to_add_out(enc_out)
+            self._layer += 1
+            return out, enc_out
+        self._layer += 1
+        return out
+
+
+@torch.no_grad()
+def run_with_kv_injection(
+    pipe,
+    canvas:       Image.Image,
+    prompt:       str,
+    obj_img:      Image.Image,
+    obj_mask_np:  np.ndarray,
+    target_zone:  np.ndarray,
+    seed:         int,
+    num_steps:    int,
+    guidance:     float,
+    height:       int,
+    width:        int,
+    obj_strength: float = 0.7,
+    cutoff_frac:  Tuple[float, float] = (0.0, 0.6),
+) -> Image.Image:
+    """
+    FLUX Kontext with K/V injection from obj_img at target_zone tokens.
+
+    Step 1 — 1-step capture pass:
+        obj_img (white bg neutralised) as canvas → record K/V at TIER_A layers
+        from the ref-token slice.
+
+    Step 2 — Full denoising (num_steps):
+        canvas (the collage scene) as reference → at TIER_A layers, blend
+        captured K/V into gen tokens that fall inside target_zone.
+        Injection active for the first cutoff_frac fraction of steps.
+
+    The captured K/V encode the object's appearance at the feature level.
+    The collage already placed the object visually — this reinforces that
+    appearance signal in attention space so FLUX doesn't drift it during denoising.
+    """
+    vae_sf      = getattr(pipe, "vae_scale_factor", 8)
+    h_lat       = height // (vae_sf * 2)
+    w_lat       = width  // (vae_sf * 2)
+    n_gen       = h_lat * w_lat
+
+    orig_procs  = pipe.transformer.attn_processors   # save to restore later
+
+    # ── Stage K-cap: capture K/V from obj_img ────────────────────────────────
+    obj_neutral  = _neutralize_white_bg(obj_img)
+    capture_proc = _KVCapture(n_gen=n_gen)
+    pipe.transformer.set_attn_processor(capture_proc)
+    gen0 = torch.Generator(device=pipe.device).manual_seed(seed)
+    pipe(
+        image=obj_neutral,
+        prompt="photorealistic object, studio lighting",
+        num_inference_steps=1, guidance_scale=1.0,
+        height=height, width=width, max_sequence_length=512,
+        generator=gen0, output_type="latent",
+    )
+    obj_kv = dict(capture_proc.kv)
+    print(f"    [KV] Captured at {len(obj_kv)}/{len(_TIER_A)} TIER_A layers")
+
+    # ── Stage K-inj: denoising with obj K/V injection ────────────────────────
+    inject_proc = _KVInject(
+        n_gen=n_gen, obj_kv=obj_kv, obj_mask_np=obj_mask_np,
+        target_zone=target_zone, obj_strength=obj_strength,
+        n_steps=num_steps, cutoff_frac=cutoff_frac,
+    )
+    pipe.transformer.set_attn_processor(inject_proc)
+
+    def _step_callback(pipe_ref, step_index, timestep, callback_kwargs):
+        inject_proc._step  = step_index + 1
+        inject_proc._layer = 0
+        return callback_kwargs
+
+    gen1 = torch.Generator(device=pipe.device).manual_seed(seed)
+    result = pipe(
+        image=canvas, prompt=prompt,
+        num_inference_steps=num_steps, guidance_scale=guidance,
+        height=height, width=width, max_sequence_length=512,
+        generator=gen1, output_type="pil",
+        callback_on_step_end=_step_callback,
+        callback_on_step_end_tensor_inputs=[],
+    ).images[0]
+
+    pipe.transformer.set_attn_processor(orig_procs)   # restore
+    return result
+
+
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
 
 def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 30) -> np.ndarray:
@@ -588,6 +885,9 @@ def run_collage_chain(
     width:          int,
     out_dir:        str,
     device:         str,
+    use_kv:         bool  = False,
+    obj_strength:   float = 0.7,
+    cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
 ) -> List[Image.Image]:
     """
     AnyDoor-inspired incremental object insertion via FLUX Kontext.
@@ -681,21 +981,50 @@ def run_collage_chain(
             f"with correct lighting, contact shadow, and perspective. "
             f"Do not change any other part of the room."
         )
-        print(f"  [K] Kontext integration pass ...")
+        print(f"  [K] Kontext integration pass (kv={use_kv}) ...")
         print(f"      Prompt: {blend_p[:100]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
             f.write(blend_p)
 
-        next_scene = run_standard(
-            pipe      = pipe,
-            canvas    = collage_scene,   # <── the AnyDoor collage IS the reference
-            prompt    = blend_p,
-            seed      = seed,
-            num_steps = num_steps,
-            guidance  = scene_guidance,
-            height    = height,
-            width     = width,
-        )
+        if use_kv:
+            # Compute object token mask (non-background tokens in obj_img)
+            vae_sf = getattr(pipe, "vae_scale_factor", 8)
+            h_lat  = height // (vae_sf * 2)
+            w_lat  = width  // (vae_sf * 2)
+            tok_mask = _obj_token_mask(obj_img, h_lat, w_lat)
+            pct = 100.0 * tok_mask.mean()
+            print(f"      obj token mask: {tok_mask.sum()} / {h_lat*w_lat} ({pct:.1f}%)")
+
+            # Target zone: from placement mask if available, else scale bbox to token space
+            if os.path.isfile(mask_path):
+                target_zone = _placement_mask_to_token_zone(mask_path, height, width, pipe)
+            else:
+                zone_np = np.zeros((h_lat, w_lat), dtype=bool)
+                tx1 = max(0,     int(bx1 * w_lat / width))
+                ty1 = max(0,     int(by1 * h_lat / height))
+                tx2 = min(w_lat, int(bx2 * w_lat / width))
+                ty2 = min(h_lat, int(by2 * h_lat / height))
+                zone_np[ty1:ty2, tx1:tx2] = True
+                target_zone = zone_np.reshape(-1)
+
+            next_scene = run_with_kv_injection(
+                pipe=pipe, canvas=collage_scene, prompt=blend_p,
+                obj_img=obj_img, obj_mask_np=tok_mask, target_zone=target_zone,
+                seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                height=height, width=width,
+                obj_strength=obj_strength, cutoff_frac=cutoff_frac,
+            )
+        else:
+            next_scene = run_standard(
+                pipe      = pipe,
+                canvas    = collage_scene,
+                prompt    = blend_p,
+                seed      = seed,
+                num_steps = num_steps,
+                guidance  = scene_guidance,
+                height    = height,
+                width     = width,
+            )
         result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
@@ -736,6 +1065,12 @@ def parse_args():
                    help="Opacity of pasted object in collage (0-1). Default 0.85.")
     p.add_argument("--feather",       type=int,   default=25,
                    help="Gaussian feather radius for soft mask edge (px). Default 25.")
+    p.add_argument("--kv_injection",  action="store_true",
+                   help="Enable K/V injection from obj_img at target zone on top of collage.")
+    p.add_argument("--obj_strength",  type=float, default=0.7,
+                   help="K/V injection strength at target zone (0-1). Default 0.7.")
+    p.add_argument("--cutoff_frac",   default="0.0,0.6",
+                   help="Injection active window as 'start,end' step fractions. Default '0.0,0.6'.")
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--num_steps",     type=int,   default=28)
     p.add_argument("--height",        type=int,   default=1024)
@@ -762,9 +1097,11 @@ def main():
     print(f"{_SEP}")
     print(f"  Objects      : {[e['name'] for e in edits]}")
     print(f"  Sketch dir   : {args.sketch_dir}")
-    print(f"  Collage mode : {args.collage_mode}  alpha={args.paste_alpha}  "
-          f"feather={args.feather}")
+    print(f"  Collage mode : {args.collage_mode}  alpha={args.paste_alpha}  feather={args.feather}")
     print(f"  Guidance     : {args.guidance}")
+    print(f"  KV injection : {args.kv_injection}"
+          + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
+             if args.kv_injection else ""))
     print(f"  VLM          : {args.vlm_model}  [{args.vlm_device}]")
     print(f"  Output       : {args.out_dir}")
     print(f"{_SEP}\n")
@@ -790,6 +1127,9 @@ def main():
     base.save(os.path.join(args.out_dir, "base_scene.png"))
     print(f"  Saved: base_scene.png")
 
+    _cf = [float(x) for x in args.cutoff_frac.split(",")]
+    cutoff_frac: Tuple[float, float] = (_cf[0], _cf[1])
+
     results = run_collage_chain(
         pipe=pipe, base=base, edits=edits,
         sketch_dir=args.sketch_dir, lora_id=args.lora_id,
@@ -802,6 +1142,9 @@ def main():
         feather=args.feather,
         height=args.height, width=args.width,
         out_dir=args.out_dir, device=args.device,
+        use_kv=args.kv_injection,
+        obj_strength=args.obj_strength,
+        cutoff_frac=cutoff_frac,
     )
 
     all_imgs = results
