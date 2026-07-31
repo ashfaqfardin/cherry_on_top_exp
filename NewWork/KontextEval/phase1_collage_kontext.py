@@ -131,7 +131,32 @@ def _compute_obj_mask(obj_img: Image.Image,
     return (~(is_grey | is_white)).astype(np.uint8)
 
 
-# ── Combined VLM call: prompt + placement bbox in one pass ───────────────────
+# ── Placement mask → bbox ────────────────────────────────────────────────────
+
+def _bbox_from_placement_mask(
+    mask_path: str,
+    width: int,
+    height: int,
+) -> Tuple[int, int, int, int]:
+    """
+    Extract the bounding box of the white region in a user-drawn placement mask.
+    White pixels (>127) mark where the object should be placed.
+    Mask resolution is rescaled to (width × height) pixel space.
+    """
+    mask_img = Image.open(mask_path).convert("L")
+    mask_np  = np.array(mask_img)
+    mh, mw   = mask_np.shape
+    ys, xs   = np.where(mask_np > 127)
+    if len(ys) == 0:
+        return width // 6, height // 2, 5 * width // 6, height
+    x1 = max(0,      int(xs.min() * width  / mw))
+    y1 = max(0,      int(ys.min() * height / mh))
+    x2 = min(width,  int((xs.max() + 1) * width  / mw))
+    y2 = min(height, int((ys.max() + 1) * height / mh))
+    return x1, y1, x2, y2
+
+
+# ── VLM bbox fallback (used when no placement mask is found) ─────────────────
 
 def _vlm_bbox(
     vlm_model,
@@ -463,16 +488,24 @@ def run_collage_chain(
             ref_mask = np.zeros((height, width), dtype=np.uint8)
             ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
 
-        # Stage VLM: bbox placement only — appearance is handled by the collage
-        print(f"  [VLM] Generating placement bbox ...")
-        bx1, by1, bx2, by2 = _vlm_bbox(
-            vlm_model=vlm_model, vlm_processor=vlm_proc,
-            scene_img=scene, obj_img=obj_img, description=desc,
-            width=width, height=height,
-        )
-        print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
-        with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
-            f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
+        # Stage BBOX: placement mask → bbox (VLM fallback if mask absent)
+        mask_path = os.path.join(sketch_dir, f"mask_{name}.png")
+        if os.path.isfile(mask_path):
+            print(f"  [BBOX] Using placement mask: mask_{name}.png")
+            bx1, by1, bx2, by2 = _bbox_from_placement_mask(mask_path, width, height)
+            print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
+            with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
+                f.write(f"bbox (mask): x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
+        else:
+            print(f"  [VLM] No placement mask found — running VLM bbox ...")
+            bx1, by1, bx2, by2 = _vlm_bbox(
+                vlm_model=vlm_model, vlm_processor=vlm_proc,
+                scene_img=scene, obj_img=obj_img, description=desc,
+                width=width, height=height,
+            )
+            print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
+            with open(os.path.join(out_dir, f"vlm_bbox_{name}.txt"), "w") as f:
+                f.write(f"bbox (vlm): x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
         # Stage COL: build collage scene (AnyDoor's core idea in Kontext)
         print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
