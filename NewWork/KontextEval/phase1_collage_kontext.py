@@ -69,39 +69,193 @@ from __future__ import annotations
 
 import argparse
 import gc
-import importlib.util
 import json
 import os
-import sys
-from pathlib import Path
 from typing import List, Tuple
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from diffusers import FluxKontextPipeline
 from PIL import Image
 
-# ── sibling imports ───────────────────────────────────────────────────────────
-_base = Path(__file__).parent
 
-def _load_mod(name: str):
-    p   = _base / f"{name}.py"
-    sp  = importlib.util.spec_from_file_location(name, p)
-    mod = importlib.util.module_from_spec(sp)
-    sp.loader.exec_module(mod)
-    return mod
+# ── Pipeline loading ──────────────────────────────────────────────────────────
 
-_comp = _load_mod("phase1_composite")
-_vlm  = _load_mod("phase1_sketch_vlm")
-_sk   = _load_mod("phase1_sketch")
+def load_kontext_pipeline(
+    model_path: str = "black-forest-labs/FLUX.1-Kontext-dev",
+    hf_token: str | None = None,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    cache_dir: str = "./models",
+    cpu_offload: bool = False,
+) -> FluxKontextPipeline:
+    pipe = FluxKontextPipeline.from_pretrained(
+        model_path, torch_dtype=dtype, token=hf_token, cache_dir=cache_dir,
+    )
+    if cpu_offload:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to(device)
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
 
-run_standard         = _comp.run_standard
-save_grid            = _comp.save_grid
-generate_from_sketch = _vlm.generate_from_sketch
-load_vlm             = _sk.load_vlm
 
-sys.path.insert(0, str(_base.parent.parent))
-from NewWork.KontextEval.utils.model_utils import load_kontext_pipeline  # noqa: E402
+# ── Kontext inference ─────────────────────────────────────────────────────────
+
+def run_standard(
+    pipe, canvas: Image.Image, prompt: str,
+    seed: int, num_steps: int, guidance: float,
+    height: int, width: int,
+) -> Image.Image:
+    generator = torch.Generator(device=pipe.device).manual_seed(seed)
+    return pipe(
+        prompt=prompt, image=canvas,
+        num_inference_steps=num_steps, guidance_scale=guidance,
+        height=height, width=width, generator=generator,
+    ).images[0]
+
+
+# ── Result grid ───────────────────────────────────────────────────────────────
+
+def save_grid(images, titles, path, ncols=None, figsize_per_cell=(4, 4)):
+    n     = len(images)
+    ncols = ncols or n
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(figsize_per_cell[0] * ncols, figsize_per_cell[1] * nrows),
+    )
+    axes_flat = [axes] if n == 1 else list(np.array(axes).flat)
+    for ax, img, t in zip(axes_flat, images, titles):
+        ax.imshow(img); ax.axis("off"); ax.set_title(t, fontsize=7)
+    for ax in axes_flat[n:]:
+        ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ── Stage A: Sketch → Object image ───────────────────────────────────────────
+
+_LORA_TRIGGER = "Convert this sketch into real life version, follow exact structure."
+
+
+def generate_from_sketch(
+    pipe, sketch_path: str, description: str,
+    seed: int, num_steps: int, guidance: float,
+    height: int, width: int, lora_id: str, device: str,
+) -> Image.Image:
+    sketch_pil = Image.open(sketch_path).convert("RGB").resize(
+        (width, height), Image.LANCZOS
+    )
+    print(f"  Loading LoRA: {lora_id}")
+    pipe.load_lora_weights(lora_id)
+    prompt = (
+        f"{_LORA_TRIGGER} {description} on a plain white background, "
+        "photorealistic, no shadows, studio lighting, high quality."
+    )
+    generator = torch.Generator(device=device).manual_seed(seed)
+    obj_img = pipe(
+        image=sketch_pil, prompt=prompt,
+        num_inference_steps=num_steps, guidance_scale=guidance,
+        height=height, width=width,
+        max_sequence_length=512,
+        generator=generator, output_type="pil",
+    ).images[0]
+    pipe.unload_lora_weights()
+    return obj_img
+
+
+# ── VLM loading ───────────────────────────────────────────────────────────────
+
+def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
+    """
+    Load a Qwen2-VL or Qwen2.5-VL model for placement bbox prediction.
+
+    device="cpu"  → bfloat16, safe alongside FLUX on any GPU.
+    device="cuda" → tries 4-bit NF4 (bitsandbytes) first, then bf16 fallback.
+                    pip install -U bitsandbytes>=0.46.1  to enable 4-bit.
+    """
+    from transformers import AutoProcessor
+
+    print(f"  Loading VLM '{model_id}' on {device} ...")
+
+    def _load_model(load_kwargs: dict, to_device: bool):
+        is_qwen25 = "Qwen2.5" in model_id or "Qwen2_5" in model_id
+        classes = []
+        if is_qwen25:
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                classes.append(Qwen2_5_VLForConditionalGeneration)
+            except ImportError:
+                pass
+        try:
+            from transformers import Qwen2VLForConditionalGeneration
+            classes.append(Qwen2VLForConditionalGeneration)
+        except ImportError:
+            pass
+        if not is_qwen25:
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                classes.append(Qwen2_5_VLForConditionalGeneration)
+            except ImportError:
+                pass
+        last_err = None
+        for cls in classes:
+            try:
+                m = cls.from_pretrained(model_id, **load_kwargs)
+                if to_device:
+                    m = m.to(device)
+                return m.eval()
+            except Exception as e:
+                last_err = e
+        try:
+            from transformers import AutoModel
+            m = AutoModel.from_pretrained(model_id, trust_remote_code=True, **load_kwargs)
+            if to_device:
+                m = m.to(device)
+            return m.eval()
+        except Exception as e:
+            last_err = e
+        raise RuntimeError(f"Could not load VLM '{model_id}'. Last error: {last_err}")
+
+    model = None
+    mode  = ""
+    if device == "cuda":
+        try:
+            from transformers import BitsAndBytesConfig
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
+            )
+            model = _load_model(
+                dict(quantization_config=quant_cfg, device_map="auto", cache_dir=cache_dir),
+                to_device=False,
+            )
+            mode = "4-bit NF4 GPU"
+        except Exception as e:
+            print(f"    [VLM] 4-bit load failed ({e!s:.80})")
+            print(f"    [VLM] Falling back to bf16 GPU")
+        if model is None:
+            model = _load_model(
+                dict(torch_dtype=torch.bfloat16, device_map="auto", cache_dir=cache_dir),
+                to_device=False,
+            )
+            mode = "bf16 GPU"
+    else:
+        model = _load_model(
+            dict(torch_dtype=torch.bfloat16, cache_dir=cache_dir),
+            to_device=True,
+        )
+        mode = "bf16 CPU"
+
+    processor = AutoProcessor.from_pretrained(model_id, cache_dir=cache_dir, trust_remote_code=True)
+    print(f"  VLM loaded  ({mode})")
+    return model, processor
 
 # ── constants ─────────────────────────────────────────────────────────────────
 EDITS: List[dict] = [
@@ -109,7 +263,7 @@ EDITS: List[dict] = [
     {"name": "vase",    "description": "white ceramic vase with flowers"},
     {"name": "ball",    "description": "yellow rubber ball"},
 ]
-BASE_PROMPT = "A modern living room with a sofa and a wooden coffee table."
+BASE_PROMPT = "A empty room with a wooden floor, white walls, and a window letting in natural light."
 LORA_ID     = "gokaygokay/Sketch-to-Image-Kontext-Dev-LoRA"
 _SEP        = "═" * 60
 
