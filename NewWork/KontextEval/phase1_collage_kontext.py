@@ -739,10 +739,11 @@ def run_with_kv_injection(
 
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
 
-def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 30) -> np.ndarray:
+def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 50) -> np.ndarray:
     """
-    Returns Sobel-filtered RGB image: high-frequency edges where the object is,
-    black elsewhere.  Matches AnyDoor's detail conditioning approach.
+    AnyDoor's exact high-frequency detail map (datasets/data_utils.py::sobel).
+    Sobel-filtered RGB: texture edges where object is, black elsewhere.
+    thresh=50 matches AnyDoor's default.
     """
     H, W = img.shape[:2]
     small   = cv2.resize(img,  (256, 256))
@@ -778,11 +779,10 @@ def build_collage_scene(
 
     target_bbox   — (x1, y1, x2, y2) from _vlm_prompt_and_bbox.
     collage_mode:
-      'full'  — paste actual obj pixels (colour + texture)
-      'sobel' — paste Sobel edge map only (structure, matches AnyDoor exactly)
-      'blend' — 60% full + 40% sobel
-
-    The pasted region has a Gaussian-feathered soft mask so edges are smooth.
+      'full'  — paste actual obj pixels, feathered alpha blend (colour + texture)
+      'sobel' — AnyDoor exact: Sobel detail map hard-pasted at full bbox, no
+                alpha blend; Kontext handles blending (thresh=50, as in paper)
+      'blend' — 60% full + 40% sobel, feathered alpha blend
     """
     scene_np = np.array(scene.convert("RGB")).astype(np.float32)
     obj_np   = np.array(obj_img.convert("RGB")).astype(np.float32)
@@ -807,6 +807,18 @@ def build_collage_scene(
     print(f"    [COLLAGE] Target zone: y=[{y1},{y2}] x=[{x1},{x2}]  "
           f"{zone_w}×{zone_h} px")
 
+    # AnyDoor-exact sobel: resize obj to fill full target zone, hard paste,
+    # no alpha blending — Kontext (our "ControlNet") handles the blending.
+    if collage_mode == "sobel":
+        obj_z      = cv2.resize(obj_crop.astype(np.uint8),  (zone_w, zone_h))
+        mask_z     = cv2.resize(mask_crop.astype(np.uint8), (zone_w, zone_h))
+        sobel_zone = _sobel_map(obj_z, mask_z)
+        collage_np = scene_np.copy().astype(np.uint8)
+        collage_np[y1:y2, x1:x2] = sobel_zone
+        print(f"    [COLLAGE] AnyDoor hard paste {zone_w}×{zone_h} Sobel at "
+              f"scene[{y1}:{y2},{x1}:{x2}]")
+        return Image.fromarray(collage_np), (y1, y2, x1, x2)
+
     # Scale obj to fill ~80% of the target zone (preserve aspect ratio)
     oh, ow  = obj_crop.shape[:2]
     scale   = min((zone_h * 0.80) / oh, (zone_w * 0.80) / ow)
@@ -818,10 +830,7 @@ def build_collage_scene(
     mask_rs = (mask_rs > 0.5).astype(np.float32)
 
     # Choose what to paste
-    if collage_mode == "sobel":
-        paste_layer = _sobel_map(obj_rs.astype(np.uint8),
-                                  mask_rs).astype(np.float32)
-    elif collage_mode == "blend":
+    if collage_mode == "blend":
         sobel_layer = _sobel_map(obj_rs.astype(np.uint8),
                                   mask_rs).astype(np.float32)
         paste_layer = 0.6 * obj_rs + 0.4 * sobel_layer
