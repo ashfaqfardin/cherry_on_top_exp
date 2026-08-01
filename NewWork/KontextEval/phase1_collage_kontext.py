@@ -997,8 +997,8 @@ def run_collage_chain(
             Image.open(mask_path).convert("L").resize((width, height), Image.Resampling.NEAREST)
         )
         bcg_mask = (placement_np > 127).astype(np.uint8)
-        bcg_mask = cv2.dilate(bcg_mask, np.ones((21, 21), np.uint8), iterations=3)
-        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (51, 51), 15)
+        bcg_mask = cv2.dilate(bcg_mask, np.ones((61, 61), np.uint8), iterations=5)
+        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (101, 101), 30)
         result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
         scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
         mask_3    = bcg_mask[:, :, None]
