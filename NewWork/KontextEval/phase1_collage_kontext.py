@@ -993,6 +993,139 @@ def build_collage_scene(
     return Image.fromarray(collage_np), (y1, y2, x1, x2)
 
 
+# ── Stage HAR: image harmonization ───────────────────────────────────────────
+#
+# Two paths:
+#   PCT-Net  — full harmonization network (CVPR 2023, rakutentech/PCT-Net-Image-Harmonization)
+#              Requires: git clone the repo, pass --pctnet_dir and --pctnet_weights.
+#   Reinhard — luminance-only Lab color transfer, no external deps, instant fallback.
+#
+# Harmonization mask is derived by diffing collage_scene vs original scene so
+# it works correctly for all collage modes (full / sobel / blend).
+
+
+def _collage_obj_mask(collage: Image.Image, scene: Image.Image,
+                       threshold: int = 10) -> np.ndarray:
+    """
+    Binary uint8 mask (H, W): 1 where collage differs from scene (= pasted obj).
+    More reliable than forwarding ref_mask because the paste location shifts
+    (80% scale + centering) relative to the original obj_img space.
+    """
+    diff = np.abs(
+        np.array(collage.convert("RGB"), dtype=np.int32) -
+        np.array(scene.convert("RGB"),   dtype=np.int32)
+    ).max(axis=-1)
+    mask = (diff > threshold).astype(np.uint8)
+    k = np.ones((7, 7), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+    return mask
+
+
+def _harmonize_reinhard(composite: Image.Image, obj_mask: np.ndarray) -> Image.Image:
+    """
+    Luminance-only Reinhard Lab transfer.
+    Matches the pasted object's lightness statistics to the surrounding background
+    while keeping the object's original color (A/B channels untouched).
+    Soft-blends at the mask boundary to avoid hard edges.
+    """
+    comp_np  = np.array(composite.convert("RGB"))
+    comp_lab = cv2.cvtColor(comp_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    bg_L = comp_lab[obj_mask == 0, 0]
+    fg_L = comp_lab[obj_mask >  0, 0]
+
+    if len(bg_L) < 100 or len(fg_L) < 100:
+        print("    [HAR] Reinhard: insufficient pixels — skipping")
+        return composite
+
+    fg_norm = (fg_L - fg_L.mean()) / (fg_L.std() + 1e-6)
+    comp_lab[obj_mask > 0, 0] = np.clip(
+        fg_norm * bg_L.std() + bg_L.mean(), 0, 255
+    )
+
+    result_np = cv2.cvtColor(comp_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+    # Feather boundary
+    mask_f = cv2.GaussianBlur(obj_mask.astype(np.float32), (31, 31), 10)
+    blended = (result_np.astype(np.float32) * mask_f[:, :, None] +
+               comp_np.astype(np.float32)   * (1 - mask_f[:, :, None]))
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
+
+
+def _harmonize_pctnet(
+    composite: Image.Image,
+    obj_mask:  np.ndarray,
+    pctnet_dir: str,
+    weights_path: str,
+    device: str = "cuda",
+) -> Image.Image:
+    """
+    PCT-Net harmonization (CVPR 2023).
+
+    Setup:
+      git clone https://github.com/rakutentech/PCT-Net-Image-Harmonization
+      pip install -r PCT-Net-Image-Harmonization/requirements.txt
+    Then pass:
+      --pctnet_dir  /path/to/PCT-Net-Image-Harmonization
+      --pctnet_weights /path/to/PCT-Net-Image-Harmonization/pretrained_models/PCTNet_ViT.pth
+    """
+    import sys as _sys
+    if pctnet_dir not in _sys.path:
+        _sys.path.insert(0, pctnet_dir)
+
+    from iharm.inference.utils import load_model
+    from iharm.inference.predictor import Predictor
+    from iharm.mconfigs import ALL_MCONFIGS
+
+    model_type = "ViT_pct"
+    net = load_model(model_type, weights_path, verbose=False)
+    cfg = ALL_MCONFIGS[model_type]
+    norm = cfg.get("params", {}).get("input_normalization",
+                                     {"mean": (.485, .456, .406),
+                                      "std":  (.229, .224, .225)})
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    predictor = Predictor(net, dev, mean=norm["mean"], std=norm["std"],
+                           with_flip=False)
+
+    comp_np  = np.array(composite.convert("RGB"))
+    mask_f32 = obj_mask.astype(np.float32)   # [0, 1]
+
+    comp_lr  = cv2.resize(comp_np,  (256, 256))
+    mask_lr  = cv2.resize(mask_f32, (256, 256))
+
+    _, result_np = predictor.predict(comp_lr, comp_np, mask_lr, mask_f32)
+    result_np = np.clip(result_np, 0, 255).astype(np.uint8)
+    return Image.fromarray(result_np)
+
+
+def _harmonize(
+    composite:    Image.Image,
+    obj_mask:     np.ndarray,
+    pctnet_dir:   str = "",
+    pctnet_weights: str = "",
+    device:       str = "cuda",
+) -> Image.Image:
+    """
+    Harmonize the pasted object with the background.
+    Uses PCT-Net when --pctnet_dir and --pctnet_weights are provided,
+    otherwise falls back to Reinhard Lab luminance transfer.
+    """
+    if pctnet_dir and pctnet_weights and \
+            os.path.isdir(pctnet_dir) and os.path.isfile(pctnet_weights):
+        try:
+            print("    [HAR] PCT-Net harmonization ...")
+            result = _harmonize_pctnet(composite, obj_mask, pctnet_dir,
+                                        pctnet_weights, device)
+            print("    [HAR] PCT-Net done")
+            return result
+        except Exception as e:
+            print(f"    [HAR] PCT-Net failed ({e!s:.120}) — falling back to Reinhard")
+
+    print("    [HAR] Reinhard Lab luminance transfer ...")
+    return _harmonize_reinhard(composite, obj_mask)
+
+
 # ── Main incremental pipeline ─────────────────────────────────────────────────
 
 def run_collage_chain(
@@ -1019,6 +1152,8 @@ def run_collage_chain(
     pose_guidance:  float = 2.5,
     pose_expand:    float = 0.2,
     skip_pose:      bool  = False,
+    pctnet_dir:     str   = "",
+    pctnet_weights: str   = "",
 ) -> List[Image.Image]:
     """
     Incremental object insertion via FLUX Kontext with Kontext-based pose adjustment.
@@ -1030,6 +1165,7 @@ def run_collage_chain(
                   diff extraction → obj on white bg with natural pose
       Stage MASK: Threshold obj_posed → ref_mask
       Stage COL : paste obj_posed into scene at bbox → collage_scene
+      Stage HAR : Harmonize pasted object with background (PCT-Net or Reinhard)
       Stage K   : FLUX Kontext(reference=collage_scene, prompt) → result
     """
     results = [base]
@@ -1110,6 +1246,24 @@ def run_collage_chain(
         )
         collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
         print(f"      Saved collage: collage_{name}.png")
+
+        # Stage HAR: harmonize pasted object with background
+        print(f"  [HAR] Harmonizing object with scene ...")
+        obj_mask_har = _collage_obj_mask(collage_scene, scene)
+        n_har = int(obj_mask_har.sum())
+        print(f"      HAR mask: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
+        if n_har >= 50:
+            collage_scene = _harmonize(
+                composite=collage_scene,
+                obj_mask=obj_mask_har,
+                pctnet_dir=pctnet_dir,
+                pctnet_weights=pctnet_weights,
+                device=device,
+            )
+            collage_scene.save(os.path.join(out_dir, f"collage_har_{name}.png"))
+            print(f"      Saved: collage_har_{name}.png")
+        else:
+            print("      HAR mask too sparse — skipping harmonization")
 
         # Stage K: FLUX Kontext integration pass
         blend_p = (
@@ -1198,6 +1352,12 @@ def parse_args():
                    help="Guidance scale for the pose pass. Default 2.5.")
     p.add_argument("--pose_expand",   type=float, default=0.2,
                    help="Fraction to expand bbox when cropping scene for pose context. Default 0.2.")
+    p.add_argument("--pctnet_dir",    default="",
+                   help="Path to cloned rakutentech/PCT-Net-Image-Harmonization repo. "
+                        "If empty, Reinhard Lab transfer is used instead.")
+    p.add_argument("--pctnet_weights", default="",
+                   help="Path to PCTNet_ViT.pth weights file. "
+                        "If empty, Reinhard Lab transfer is used instead.")
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--num_steps",     type=int,   default=28)
     p.add_argument("--height",        type=int,   default=1024)
@@ -1225,6 +1385,8 @@ def main():
     print(f"  Collage mode : {args.collage_mode}  alpha={args.paste_alpha}  feather={args.feather}")
     print(f"  Guidance     : {args.guidance}")
     print(f"  Pose pass    : {'skip' if args.skip_pose else f'steps={args.pose_steps}  guidance={args.pose_guidance}  expand={args.pose_expand}'}")
+    har_backend = "PCT-Net" if (args.pctnet_dir and args.pctnet_weights) else "Reinhard (fallback)"
+    print(f"  Harmonization: {har_backend}")
     print(f"  KV injection : {args.kv_injection}"
           + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
              if args.kv_injection else ""))
@@ -1270,6 +1432,8 @@ def main():
         pose_guidance=args.pose_guidance,
         pose_expand=args.pose_expand,
         skip_pose=args.skip_pose,
+        pctnet_dir=args.pctnet_dir,
+        pctnet_weights=args.pctnet_weights,
     )
 
     all_imgs = results
