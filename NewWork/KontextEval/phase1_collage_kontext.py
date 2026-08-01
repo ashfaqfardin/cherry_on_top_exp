@@ -1281,24 +1281,27 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Stage ENH: second Kontext pass to remove blending artifacts
+        # Chain carries pre-ENH result so errors don't compound across objects.
+        scene = next_scene
+
+        # Stage ENH: cosmetic refinement pass — output only, NOT fed back into chain.
         if not skip_enh:
             print(f"  [ENH] Refinement pass ({enh_steps} steps, guidance={enh_guidance}) ...")
             enh_prompt = (
                 "Photorealistic interior room. Restore sharp floor texture, "
                 "remove blending artifacts, preserve all objects and colors exactly."
             )
-            next_scene = run_standard(
+            enh_result = run_standard(
                 pipe=pipe, canvas=next_scene, prompt=enh_prompt,
                 seed=seed, num_steps=enh_steps, guidance=enh_guidance,
                 height=height, width=width,
             )
             enh_path = os.path.join(out_dir, f"result_enh_{name}.png")
-            next_scene.save(enh_path)
+            enh_result.save(enh_path)
             print(f"      Saved: {enh_path}")
-
-        scene = next_scene
-        results.append(scene)
+            results.append(enh_result)
+        else:
+            results.append(scene)
 
         gc.collect()
         if torch.cuda.is_available():
