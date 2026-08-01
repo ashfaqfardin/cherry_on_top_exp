@@ -989,12 +989,16 @@ def run_collage_chain(
         print(f"      Saved: {result_path}")
 
         # Stage BCG: Background Consistency Guidance
-        # Replace non-object pixels with original scene to prevent background drift.
-        # Dilate mask to include Kontext-generated contact shadows and edge blending.
-        # Soft feather at boundary for a seamless transition.
+        # Use the placement mask (user-drawn) as the BCG zone — guaranteed to cover
+        # the object regardless of its size or any repositioning Kontext does.
+        # Dilate generously to include generated contact shadows and edge blending.
         print(f"  [BCG] Restoring background ...")
-        bcg_mask = cv2.dilate(obj_mask_har, np.ones((11, 11), np.uint8), iterations=2)
-        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (31, 31), 10)
+        placement_np = np.array(
+            Image.open(mask_path).convert("L").resize((width, height), Image.Resampling.NEAREST)
+        )
+        bcg_mask = (placement_np > 127).astype(np.uint8)
+        bcg_mask = cv2.dilate(bcg_mask, np.ones((21, 21), np.uint8), iterations=3)
+        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (51, 51), 15)
         result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
         scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
         mask_3    = bcg_mask[:, :, None]
