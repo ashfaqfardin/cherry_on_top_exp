@@ -744,10 +744,47 @@ def run_with_kv_injection(
 # ── Stage POSE: Kontext-based pose adjustment ────────────────────────────────
 
 @torch.no_grad()
+def _derive_pose_string(
+    bbox:        Tuple[int, int, int, int],
+    scene_w:     int,
+    scene_h:     int,
+    description: str,
+) -> str:
+    """
+    Convert placement mask bbox geometry into a natural-language pose instruction.
+
+    Horizontal position → which direction the object faces (objects face inward).
+    Vertical position   → camera elevation (high in frame = more top-down).
+    """
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2 / scene_w   # 0=left, 1=right
+    cy = (y1 + y2) / 2 / scene_h   # 0=top,  1=bottom
+
+    if cx < 0.33:
+        facing = "facing toward the right at a 3/4 angle"
+    elif cx > 0.67:
+        facing = "facing toward the left at a 3/4 angle"
+    else:
+        facing = "facing directly toward the viewer at a slight 3/4 angle"
+
+    if cy < 0.40:
+        elevation = "seen from above with a top-down perspective"
+    elif cy > 0.70:
+        elevation = "at eye level with a straight-on perspective"
+    else:
+        elevation = "seen from a slight overhead angle"
+
+    return (
+        f"Rotate the {description} so it is {facing}, {elevation}. "
+        f"Keep the {description} perfectly identical — same color, same design, "
+        f"same details. Only change the viewing angle. "
+        f"White background, studio lighting, no shadows."
+    )
+
+
 def _pose_object_in_context(
     pipe,
     obj_img:     Image.Image,
-    scene:       Image.Image,
     bbox:        Tuple[int, int, int, int],
     description: str,
     seed:        int,
@@ -755,102 +792,42 @@ def _pose_object_in_context(
     guidance:    float,
     height:      int,
     width:       int,
-    expand_frac: float = 0.2,
 ) -> Image.Image:
     """
-    Ask Kontext to naturally pose obj_img at the target bbox zone in scene.
+    Repose obj_img using Kontext with object-only input.
 
-    1. Expand bbox by expand_frac → crop scene for local context.
-    2. Upscale crop to (height×width); paste obj_img at zone within crop.
-    3. Kontext(mini_collage, pose_prompt) → posed result.
-    4. Diff posed vs upscaled scene_crop, restricted to zone ROI
-       → extract obj pixels → white background → obj_posed.
+    Passes obj_img directly as the Kontext canvas (no scene crop, no collage).
+    Kontext edits the viewing angle while preserving object identity.
+    Pose string is derived from bbox geometry — no VLM needed.
 
-    Falls back to original obj_img if diff extraction yields < 100 px.
+    Falls back to original obj_img if the output is indistinguishable from input.
     """
-    x1, y1, x2, y2 = bbox
-    scene_np = np.array(scene.convert("RGB"))
-    H_sc, W_sc = scene_np.shape[:2]
+    pose_prompt = _derive_pose_string(bbox, width, height, description)
+    print(f"    [POSE] Pose prompt: {pose_prompt[:120]}")
 
-    # 1. Expand bbox for context
-    pad_x = int((x2 - x1) * expand_frac)
-    pad_y = int((y2 - y1) * expand_frac)
-    cx1 = max(0,    x1 - pad_x);  cx2 = min(W_sc, x2 + pad_x)
-    cy1 = max(0,    y1 - pad_y);  cy2 = min(H_sc, y2 + pad_y)
-    scene_crop  = scene_np[cy1:cy2, cx1:cx2]
-    crop_h, crop_w = scene_crop.shape[:2]
-
-    # Map bbox zone into upscaled-crop space
-    sx = width  / crop_w
-    sy = height / crop_h
-    zx1 = int((x1 - cx1) * sx);  zx2 = int((x2 - cx1) * sx)
-    zy1 = int((y1 - cy1) * sy);  zy2 = int((y2 - cy1) * sy)
-    zone_w = max(4, zx2 - zx1);  zone_h = max(4, zy2 - zy1)
-
-    # 2. Tight-crop obj_img (strip white bg)
-    obj_arr = np.array(obj_img.convert("RGB"), dtype=np.int32)
-    is_bg   = (obj_arr[:,:,0] >= 230) & (obj_arr[:,:,1] >= 230) & (obj_arr[:,:,2] >= 230)
-    ys_o, xs_o = np.where(~is_bg)
-    if len(ys_o) > 0:
-        obj_crop = obj_arr.astype(np.uint8)[
-            ys_o.min():ys_o.max()+1, xs_o.min():xs_o.max()+1]
-    else:
-        oh, ow = obj_arr.shape[:2]
-        obj_crop = obj_arr.astype(np.uint8)[oh//4:3*oh//4, ow//4:3*ow//4]
-
-    # Build mini_collage: upscale crop, paste obj at 80% zone fill, centered
-    mini_np = cv2.resize(scene_crop, (width, height))
-    oh_c, ow_c = obj_crop.shape[:2]
-    scale = min((zone_h * 0.8) / oh_c, (zone_w * 0.8) / ow_c)
-    pw = max(4, int(ow_c * scale));  ph = max(4, int(oh_c * scale))
-    obj_rs = cv2.resize(obj_crop, (pw, ph))
-    py1_m = max(0,      zy1 + (zone_h - ph) // 2)
-    px1_m = max(0,      zx1 + (zone_w - pw) // 2)
-    py2_m = min(height, py1_m + ph)
-    px2_m = min(width,  px1_m + pw)
-    mini_np[py1_m:py2_m, px1_m:px2_m] = obj_rs[:py2_m-py1_m, :px2_m-px1_m]
-
-    # 3. Kontext pose pass on mini_collage
-    pose_prompt = (
-        f"Naturally integrate the {description} shown in this scene. "
-        f"Adjust its pose and perspective so it sits properly on the floor "
-        f"with correct contact shadow. Preserve all {description} details."
-    )
     gen = torch.Generator(device=pipe.device).manual_seed(seed)
     posed_pil = pipe(
-        image=Image.fromarray(mini_np), prompt=pose_prompt,
-        num_inference_steps=num_steps, guidance_scale=guidance,
-        height=height, width=width, max_sequence_length=512,
-        generator=gen, output_type="pil",
+        image=obj_img,
+        prompt=pose_prompt,
+        num_inference_steps=num_steps,
+        guidance_scale=guidance,
+        height=height, width=width,
+        max_sequence_length=512,
+        generator=gen,
+        output_type="pil",
     ).images[0]
 
-    # 4. Diff to extract object — restrict to zone ROI + margin
-    posed_np = np.array(posed_pil.convert("RGB"))
-    scene_up = cv2.resize(scene_crop, (width, height))
-    diff_mag = np.abs(posed_np.astype(int) - scene_up.astype(int)).max(axis=-1)
-    obj_mask = (diff_mag > 20).astype(np.uint8)
-
-    margin   = max(30, int(min(zone_w, zone_h) * 0.3))
-    zone_roi = np.zeros((height, width), dtype=np.uint8)
-    zone_roi[max(0, zy1-margin):min(height, zy2+margin),
-             max(0, zx1-margin):min(width,  zx2+margin)] = 1
-    obj_mask = obj_mask * zone_roi
-
-    k5 = np.ones((5, 5), np.uint8)
-    obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_CLOSE, k5)
-    obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
-
-    n_obj = int(obj_mask.sum())
-    print(f"    [POSE] diff mask: {n_obj} px ({100*n_obj/(height*width):.1f}%)")
-
-    if n_obj < 100:
-        print(f"    [POSE] diff too sparse — returning original obj_img")
+    # Sanity check: if output is too similar to input, return original
+    diff = np.abs(
+        np.array(posed_pil.convert("RGB"), dtype=np.int32) -
+        np.array(obj_img.convert("RGB"),   dtype=np.int32)
+    ).mean()
+    print(f"    [POSE] Input/output mean diff: {diff:.1f}")
+    if diff < 2.0:
+        print("    [POSE] Output nearly identical to input — returning original obj_img")
         return obj_img
 
-    # Compose object pixels onto white background
-    obj_posed_np = np.full((height, width, 3), 255, dtype=np.uint8)
-    obj_posed_np[obj_mask > 0] = posed_np[obj_mask > 0]
-    return Image.fromarray(obj_posed_np)
+    return posed_pil
 
 
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
@@ -1150,8 +1127,10 @@ def run_collage_chain(
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
     pose_steps:     int   = 15,
     pose_guidance:  float = 2.5,
-    pose_expand:    float = 0.2,
     skip_pose:      bool  = False,
+    enh_steps:      int   = 6,
+    enh_guidance:   float = 1.5,
+    skip_enh:       bool  = False,
     pctnet_dir:     str   = "",
     pctnet_weights: str   = "",
 ) -> List[Image.Image]:
@@ -1210,14 +1189,14 @@ def run_collage_chain(
         with open(os.path.join(out_dir, f"bbox_{name}.txt"), "w") as f:
             f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
-        # Stage POSE: Kontext poses the object in context of the target zone
+        # Stage POSE: Kontext repose object-only, angle derived from mask geometry
         if not skip_pose:
-            print(f"  [POSE] Adjusting pose via Kontext mini-collage ...")
+            print(f"  [POSE] Adjusting pose via Kontext (object-only) ...")
             obj_posed = _pose_object_in_context(
-                pipe=pipe, obj_img=obj_img, scene=scene,
+                pipe=pipe, obj_img=obj_img,
                 bbox=(bx1, by1, bx2, by2), description=desc,
                 seed=seed, num_steps=pose_steps, guidance=pose_guidance,
-                height=height, width=width, expand_frac=pose_expand,
+                height=height, width=width,
             )
             obj_posed.save(os.path.join(out_dir, f"obj_posed_{name}.png"))
             print(f"      Saved: obj_posed_{name}.png")
@@ -1302,6 +1281,22 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
+        # Stage ENH: second Kontext pass to remove blending artifacts
+        if not skip_enh:
+            print(f"  [ENH] Refinement pass ({enh_steps} steps, guidance={enh_guidance}) ...")
+            enh_prompt = (
+                "Photorealistic interior room. Restore sharp floor texture, "
+                "remove blending artifacts, preserve all objects and colors exactly."
+            )
+            next_scene = run_standard(
+                pipe=pipe, canvas=next_scene, prompt=enh_prompt,
+                seed=seed, num_steps=enh_steps, guidance=enh_guidance,
+                height=height, width=width,
+            )
+            enh_path = os.path.join(out_dir, f"result_enh_{name}.png")
+            next_scene.save(enh_path)
+            print(f"      Saved: {enh_path}")
+
         scene = next_scene
         results.append(scene)
 
@@ -1336,8 +1331,8 @@ def parse_args():
                         "'blend'=60%%full+40%%sobel.")
     p.add_argument("--paste_alpha",   type=float, default=0.85,
                    help="Opacity of pasted object in collage (0-1). Default 0.85.")
-    p.add_argument("--feather",       type=int,   default=25,
-                   help="Gaussian feather radius for soft mask edge (px). Default 25.")
+    p.add_argument("--feather",       type=int,   default=10,
+                   help="Gaussian feather radius for soft mask edge (px). Default 10.")
     p.add_argument("--kv_injection",  action="store_true",
                    help="Enable K/V injection from obj_img at target zone on top of collage.")
     p.add_argument("--obj_strength",  type=float, default=0.7,
@@ -1350,8 +1345,12 @@ def parse_args():
                    help="Kontext steps for the pose-adjustment pass. Default 15.")
     p.add_argument("--pose_guidance", type=float, default=2.5,
                    help="Guidance scale for the pose pass. Default 2.5.")
-    p.add_argument("--pose_expand",   type=float, default=0.2,
-                   help="Fraction to expand bbox when cropping scene for pose context. Default 0.2.")
+    p.add_argument("--skip_enh",       action="store_true",
+                   help="Skip Stage ENH refinement pass.")
+    p.add_argument("--enh_steps",     type=int,   default=6,
+                   help="Kontext steps for the refinement pass. Default 6.")
+    p.add_argument("--enh_guidance",  type=float, default=1.5,
+                   help="Guidance scale for the refinement pass. Default 1.5.")
     p.add_argument("--pctnet_dir",    default="",
                    help="Path to cloned rakutentech/PCT-Net-Image-Harmonization repo. "
                         "If empty, Reinhard Lab transfer is used instead.")
@@ -1384,9 +1383,10 @@ def main():
     print(f"  Sketch dir   : {args.sketch_dir}")
     print(f"  Collage mode : {args.collage_mode}  alpha={args.paste_alpha}  feather={args.feather}")
     print(f"  Guidance     : {args.guidance}")
-    print(f"  Pose pass    : {'skip' if args.skip_pose else f'steps={args.pose_steps}  guidance={args.pose_guidance}  expand={args.pose_expand}'}")
+    print(f"  Pose pass    : {'skip' if args.skip_pose else f'steps={args.pose_steps}  guidance={args.pose_guidance}'}")
     har_backend = "PCT-Net" if (args.pctnet_dir and args.pctnet_weights) else "Reinhard (fallback)"
     print(f"  Harmonization: {har_backend}")
+    print(f"  Refinement   : {'skip' if args.skip_enh else f'steps={args.enh_steps}  guidance={args.enh_guidance}'}")
     print(f"  KV injection : {args.kv_injection}"
           + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
              if args.kv_injection else ""))
@@ -1430,8 +1430,10 @@ def main():
         cutoff_frac=cutoff_frac,
         pose_steps=args.pose_steps,
         pose_guidance=args.pose_guidance,
-        pose_expand=args.pose_expand,
         skip_pose=args.skip_pose,
+        enh_steps=args.enh_steps,
+        enh_guidance=args.enh_guidance,
+        skip_enh=args.skip_enh,
         pctnet_dir=args.pctnet_dir,
         pctnet_weights=args.pctnet_weights,
     )
