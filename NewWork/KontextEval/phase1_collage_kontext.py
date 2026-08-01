@@ -860,6 +860,7 @@ def run_collage_chain(
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
     pctnet_dir:     str   = "",
     pctnet_weights: str   = "",
+    skip_har:       bool  = False,
 ) -> List[Image.Image]:
     """
     Incremental object insertion via FLUX Kontext with Kontext-based pose adjustment.
@@ -942,7 +943,10 @@ def run_collage_chain(
         obj_mask_har = _collage_obj_mask(collage_scene, scene)
         n_har = int(obj_mask_har.sum())
         print(f"      HAR mask: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
-        if n_har >= 50:
+        _MIN_HAR_PX = 30_000
+        if skip_har:
+            print("      Harmonization skipped (--skip_har)")
+        elif n_har >= _MIN_HAR_PX:
             collage_scene = _harmonize(
                 composite=collage_scene,
                 obj_mask=obj_mask_har,
@@ -953,7 +957,7 @@ def run_collage_chain(
             collage_scene.save(os.path.join(out_dir, f"collage_har_{name}.png"))
             print(f"      Saved: collage_har_{name}.png")
         else:
-            print("      HAR mask too sparse — skipping harmonization")
+            print(f"      Object too small for PCT-Net ({n_har} px < {_MIN_HAR_PX}) — skipping harmonization")
 
         # Stage K: FLUX Kontext integration pass
         blend_p = f"A photorealistic room with a {desc} placed naturally."
@@ -1046,6 +1050,8 @@ def parse_args():
                    help="K/V injection strength at target zone (0-1). Default 0.7.")
     p.add_argument("--cutoff_frac",   default="0.0,0.6",
                    help="Injection active window as 'start,end' step fractions. Default '0.0,0.6'.")
+    p.add_argument("--skip_har",       action="store_true",
+                   help="Skip PCT-Net harmonization for the entire run.")
     p.add_argument("--pctnet_dir",    default="",
                    help="Path to cloned rakutentech/PCT-Net-Image-Harmonization repo. "
                         "If empty, Reinhard Lab transfer is used instead.")
@@ -1078,7 +1084,12 @@ def main():
     print(f"  Sketch dir   : {args.sketch_dir}")
     print(f"  Collage mode : {args.collage_mode}")
     print(f"  Guidance     : {args.guidance}")
-    har_backend = "PCT-Net" if (args.pctnet_dir and args.pctnet_weights) else "skip"
+    if args.skip_har:
+        har_backend = "skip (--skip_har)"
+    elif args.pctnet_dir and args.pctnet_weights:
+        har_backend = "PCT-Net"
+    else:
+        har_backend = "skip (no paths provided)"
     print(f"  Harmonization: {har_backend}")
     print(f"  KV injection : {args.kv_injection}"
           + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
@@ -1121,6 +1132,7 @@ def main():
         cutoff_frac=cutoff_frac,
         pctnet_dir=args.pctnet_dir,
         pctnet_weights=args.pctnet_weights,
+        skip_har=args.skip_har,
     )
 
     all_imgs = results
