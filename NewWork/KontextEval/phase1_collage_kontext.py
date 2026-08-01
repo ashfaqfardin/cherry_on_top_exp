@@ -46,9 +46,9 @@ Pipeline
   Stage POSE: scene_crop = scene[y1:y2, x1:x2] expanded by 20%
               mini_collage = obj pasted into upscaled crop
               Kontext(mini_collage, pose_prompt) → posed result
-              diff(posed, scene_crop) → obj_posed on white bg
-  Stage MASK: Threshold obj_posed → ref_mask
-  Stage COL : Build collage_scene by pasting obj_posed at placement bbox
+              diff(posed, scene_crop) → obj_img on white bg
+  Stage MASK: Threshold obj_img → ref_mask
+  Stage COL : Build collage_scene by pasting obj_img at placement bbox
   Stage K   : FLUX Kontext(reference=collage_scene, prompt=blend_prompt) → result
   Loop      : result → next scene
 
@@ -64,8 +64,6 @@ Usage
 Key flags
 ----------
   --collage_mode   full | sobel | blend   Default: full
-  --paste_alpha    float  Opacity of pasted obj (0-1). Default 0.85.
-  --feather        int    Gaussian feather radius for soft mask edge. Default 25.
   --guidance       float  Kontext CFG scale. Default 2.5.
 """
 
@@ -315,136 +313,6 @@ def _bbox_from_placement_mask(
     x2 = min(width,  int((xs.max() + 1) * width  / mw))
     y2 = min(height, int((ys.max() + 1) * height / mh))
     return x1, y1, x2, y2
-
-
-# ── VLM bbox fallback (used when no placement mask is found) ─────────────────
-
-def _vlm_bbox(
-    vlm_model,
-    vlm_processor,
-    scene_img:   Image.Image,
-    obj_img:     Image.Image,
-    description: str,
-    width:       int,
-    height:      int,
-    max_new_tokens: int = 64,
-) -> Tuple[int, int, int, int]:
-    """
-    Ask the VLM only WHERE to place `description` — returns a pixel bbox.
-    No text prompt generation; the collage already encodes appearance + position
-    visually, so Kontext gets a fixed integration template instead.
-
-    Parses two output formats the model may produce:
-      - Native grounding tokens: <|box_start|>(x,y),(x,y)<|box_end|>  [0,1000)
-      - Plain bracket format:    BBOX: [x1, y1, x2, y2]  (resized image pixels)
-    Both are rescaled to full (width × height) pixel space.
-    Falls back to center-floor zone if neither format is found.
-    """
-    import re
-
-    device = next(vlm_model.parameters()).device
-
-    def _resize(img, max_side):
-        w, h = img.size
-        if max(w, h) > max_side:
-            s = max_side / max(w, h)
-            img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
-        return img.convert("RGB")
-
-    scene_small = _resize(scene_img, 768)
-    obj_small   = _resize(obj_img,   512)
-    sw, sh      = scene_small.size
-
-    instruction = (
-        f"Image 1 is a room scene. Image 2 is a {description} on a white background.\n\n"
-        f"Find the best empty location in Image 1 to place the {description} "
-        f"so it sits naturally on a surface (floor, table, or shelf) without "
-        f"overlapping existing furniture.\n\n"
-        f"Output ONLY the bounding box of that location in Image 1. Nothing else."
-    )
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": scene_small},
-                {"type": "image", "image": obj_small},
-                {"type": "text",  "text": instruction},
-            ],
-        }
-    ]
-
-    text = vlm_processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = vlm_processor(
-        text=[text],
-        images=[scene_small, obj_small],
-        padding=True,
-        return_tensors="pt",
-    ).to(device)
-
-    with torch.no_grad():
-        gen_ids = vlm_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-
-    out_ids = gen_ids[:, inputs["input_ids"].shape[1]:]
-    raw = vlm_processor.batch_decode(
-        out_ids,
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )[0].strip()
-
-    print(f"    [VLM-bbox] raw: {raw!r}")
-
-    def _rescale(rx1, ry1, rx2, ry2):
-        x1 = max(0,      int(rx1 * width  / sw))
-        y1 = max(0,      int(ry1 * height / sh))
-        x2 = min(width,  int(rx2 * width  / sw))
-        y2 = min(height, int(ry2 * height / sh))
-        return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
-
-    # Parser 1: native grounding tokens — coords normalised [0, 1000)
-    bm = re.search(
-        r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>', raw
-    )
-    if bm:
-        x1n, y1n, x2n, y2n = (int(bm.group(i)) for i in range(1, 5))
-        bbox = _rescale(
-            int(x1n * sw / 1000), int(y1n * sh / 1000),
-            int(x2n * sw / 1000), int(y2n * sh / 1000),
-        )
-        if bbox:
-            print(f"    [VLM-bbox] grounding: x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
-            return bbox
-
-    # Parser 2: bracket format — floats or ints
-    # Model may output normalized [0,1] coords or pixel coords in resized space.
-    NUM = r'(\d+\.?\d*)'
-    SEP = r'[,\s]+'
-    bm2 = re.search(rf'\[{NUM}{SEP}{NUM}{SEP}{NUM}{SEP}{NUM}\]', raw)
-    if bm2:
-        v = [float(bm2.group(i)) for i in range(1, 5)]
-        rx1, ry1, rx2, ry2 = v
-        if max(v) <= 1.0:
-            # normalized [0,1] → multiply directly by full image dimensions
-            x1 = max(0,      int(rx1 * width))
-            y1 = max(0,      int(ry1 * height))
-            x2 = min(width,  int(rx2 * width))
-            y2 = min(height, int(ry2 * height))
-            bbox = (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
-        else:
-            # pixel coords in resized image space → rescale
-            bbox = _rescale(rx1, ry1, rx2, ry2)
-        if bbox:
-            print(f"    [VLM-bbox] bracket:   x=[{bbox[0]},{bbox[2]}] y=[{bbox[1]},{bbox[3]}]")
-            return bbox
-
-    print(f"    [VLM-bbox] parse failed — center-floor fallback")
-    return width // 6, height // 2, 5 * width // 6, height
 
 
 # ── K/V injection: capture + inject obj appearance at target zone ─────────────
@@ -741,95 +609,6 @@ def run_with_kv_injection(
     return result
 
 
-# ── Stage POSE: Kontext-based pose adjustment ────────────────────────────────
-
-@torch.no_grad()
-def _derive_pose_string(
-    bbox:        Tuple[int, int, int, int],
-    scene_w:     int,
-    scene_h:     int,
-    description: str,
-) -> str:
-    """
-    Convert placement mask bbox geometry into a natural-language pose instruction.
-
-    Horizontal position → which direction the object faces (objects face inward).
-    Vertical position   → camera elevation (high in frame = more top-down).
-    """
-    x1, y1, x2, y2 = bbox
-    cx = (x1 + x2) / 2 / scene_w   # 0=left, 1=right
-    cy = (y1 + y2) / 2 / scene_h   # 0=top,  1=bottom
-
-    if cx < 0.33:
-        facing = "facing toward the right at a 3/4 angle"
-    elif cx > 0.67:
-        facing = "facing toward the left at a 3/4 angle"
-    else:
-        facing = "facing directly toward the viewer at a slight 3/4 angle"
-
-    if cy < 0.40:
-        elevation = "seen from above with a top-down perspective"
-    elif cy > 0.70:
-        elevation = "at eye level with a straight-on perspective"
-    else:
-        elevation = "seen from a slight overhead angle"
-
-    return (
-        f"Rotate the {description} so it is {facing}, {elevation}. "
-        f"Keep the {description} perfectly identical — same color, same design, "
-        f"same details. Only change the viewing angle. "
-        f"White background, studio lighting, no shadows."
-    )
-
-
-def _pose_object_in_context(
-    pipe,
-    obj_img:     Image.Image,
-    bbox:        Tuple[int, int, int, int],
-    description: str,
-    seed:        int,
-    num_steps:   int,
-    guidance:    float,
-    height:      int,
-    width:       int,
-) -> Image.Image:
-    """
-    Repose obj_img using Kontext with object-only input.
-
-    Passes obj_img directly as the Kontext canvas (no scene crop, no collage).
-    Kontext edits the viewing angle while preserving object identity.
-    Pose string is derived from bbox geometry — no VLM needed.
-
-    Falls back to original obj_img if the output is indistinguishable from input.
-    """
-    pose_prompt = _derive_pose_string(bbox, width, height, description)
-    print(f"    [POSE] Pose prompt: {pose_prompt[:120]}")
-
-    gen = torch.Generator(device=pipe.device).manual_seed(seed)
-    posed_pil = pipe(
-        image=obj_img,
-        prompt=pose_prompt,
-        num_inference_steps=num_steps,
-        guidance_scale=guidance,
-        height=height, width=width,
-        max_sequence_length=512,
-        generator=gen,
-        output_type="pil",
-    ).images[0]
-
-    # Sanity check: if output is too similar to input, return original
-    diff = np.abs(
-        np.array(posed_pil.convert("RGB"), dtype=np.int32) -
-        np.array(obj_img.convert("RGB"),   dtype=np.int32)
-    ).mean()
-    print(f"    [POSE] Input/output mean diff: {diff:.1f}")
-    if diff < 2.0:
-        print("    [POSE] Output nearly identical to input — returning original obj_img")
-        return obj_img
-
-    return posed_pil
-
-
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
 
 def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 30) -> np.ndarray:
@@ -866,19 +645,15 @@ def build_collage_scene(
     ref_mask:     np.ndarray,
     target_bbox:  Tuple[int, int, int, int],
     collage_mode: str  = "full",
-    paste_alpha:  float = 0.85,
-    feather:      int   = 25,
 ) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
-    AnyDoor-style: build a collage scene with the object pasted at the
-    target location.  Returns (collage_pil, (x1, y1, x2, y2) paste bbox).
+    Build a collage scene with the object hard-pasted at the target location.
+    Returns (collage_pil, (x1, y1, x2, y2) paste bbox).
 
-    target_bbox   — (x1, y1, x2, y2) from _vlm_prompt_and_bbox.
     collage_mode:
-      'full'  — paste actual obj pixels, feathered alpha blend (colour + texture)
-      'sobel' — AnyDoor exact: Sobel detail map hard-pasted at full bbox, no
-                alpha blend; Kontext handles blending (thresh=50, as in paper)
-      'blend' — 60% full + 40% sobel, feathered alpha blend
+      'full'  — paste actual obj pixels, binary mask (hard paste)
+      'sobel' — AnyDoor exact: Sobel edge map hard-pasted at full bbox
+      'blend' — 60% full + 40% sobel, hard paste
     """
     scene_np = np.array(scene.convert("RGB")).astype(np.float32)
     obj_np   = np.array(obj_img.convert("RGB")).astype(np.float32)
@@ -933,11 +708,9 @@ def build_collage_scene(
     else:  # 'full'
         paste_layer = obj_rs
 
-    # Gaussian-feathered soft mask: smooth edges like a natural composite
-    mask_f  = (mask_rs * 255).astype(np.uint8)
-    mask_f  = cv2.GaussianBlur(mask_f, (feather * 2 + 1, feather * 2 + 1), feather / 3)
-    mask_f  = mask_f.astype(np.float32) / 255.0 * paste_alpha
-    mask_3  = np.stack([mask_f, mask_f, mask_f], axis=-1)
+    # Hard binary mask: paste at full opacity, no feathering, no alpha blend.
+    # Kontext handles all blending in Stage K.
+    mask_3  = np.stack([mask_rs, mask_rs, mask_rs], axis=-1)
 
     # Center the resized obj in the target zone
     dy = (zone_h - new_h) // 2
@@ -965,7 +738,7 @@ def build_collage_scene(
     collage_np = np.clip(collage_np, 0, 255).astype(np.uint8)
 
     print(f"    [COLLAGE] Pasted {new_w}×{new_h} obj at scene[{py1}:{py2}, {px1}:{px2}]  "
-          f"mode={collage_mode}  alpha={paste_alpha}")
+          f"mode={collage_mode}")
 
     return Image.fromarray(collage_np), (y1, y2, x1, x2)
 
@@ -997,37 +770,6 @@ def _collage_obj_mask(collage: Image.Image, scene: Image.Image,
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
     return mask
-
-
-def _harmonize_reinhard(composite: Image.Image, obj_mask: np.ndarray) -> Image.Image:
-    """
-    Luminance-only Reinhard Lab transfer.
-    Matches the pasted object's lightness statistics to the surrounding background
-    while keeping the object's original color (A/B channels untouched).
-    Soft-blends at the mask boundary to avoid hard edges.
-    """
-    comp_np  = np.array(composite.convert("RGB"))
-    comp_lab = cv2.cvtColor(comp_np, cv2.COLOR_RGB2LAB).astype(np.float32)
-
-    bg_L = comp_lab[obj_mask == 0, 0]
-    fg_L = comp_lab[obj_mask >  0, 0]
-
-    if len(bg_L) < 100 or len(fg_L) < 100:
-        print("    [HAR] Reinhard: insufficient pixels — skipping")
-        return composite
-
-    fg_norm = (fg_L - fg_L.mean()) / (fg_L.std() + 1e-6)
-    comp_lab[obj_mask > 0, 0] = np.clip(
-        fg_norm * bg_L.std() + bg_L.mean(), 0, 255
-    )
-
-    result_np = cv2.cvtColor(comp_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-
-    # Feather boundary
-    mask_f = cv2.GaussianBlur(obj_mask.astype(np.float32), (31, 31), 10)
-    blended = (result_np.astype(np.float32) * mask_f[:, :, None] +
-               comp_np.astype(np.float32)   * (1 - mask_f[:, :, None]))
-    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
 
 
 def _harmonize_pctnet(
@@ -1084,23 +826,16 @@ def _harmonize(
     device:       str = "cuda",
 ) -> Image.Image:
     """
-    Harmonize the pasted object with the background.
-    Uses PCT-Net when --pctnet_dir and --pctnet_weights are provided,
-    otherwise falls back to Reinhard Lab luminance transfer.
+    PCT-Net harmonization only. Skips if paths not provided or invalid.
     """
-    if pctnet_dir and pctnet_weights and \
-            os.path.isdir(pctnet_dir) and os.path.isfile(pctnet_weights):
-        try:
-            print("    [HAR] PCT-Net harmonization ...")
-            result = _harmonize_pctnet(composite, obj_mask, pctnet_dir,
-                                        pctnet_weights, device)
-            print("    [HAR] PCT-Net done")
-            return result
-        except Exception as e:
-            print(f"    [HAR] PCT-Net failed ({e!s:.120}) — falling back to Reinhard")
-
-    print("    [HAR] Reinhard Lab luminance transfer ...")
-    return _harmonize_reinhard(composite, obj_mask)
+    if not (pctnet_dir and pctnet_weights and
+            os.path.isdir(pctnet_dir) and os.path.isfile(pctnet_weights)):
+        print("    [HAR] PCT-Net not configured — skipping harmonization")
+        return composite
+    print("    [HAR] PCT-Net harmonization ...")
+    result = _harmonize_pctnet(composite, obj_mask, pctnet_dir, pctnet_weights, device)
+    print("    [HAR] PCT-Net done")
+    return result
 
 
 # ── Main incremental pipeline ─────────────────────────────────────────────────
@@ -1116,8 +851,6 @@ def run_collage_chain(
     lora_guidance:  float,
     scene_guidance: float,
     collage_mode:   str,
-    paste_alpha:    float,
-    feather:        int,
     height:         int,
     width:          int,
     out_dir:        str,
@@ -1125,12 +858,6 @@ def run_collage_chain(
     use_kv:         bool  = False,
     obj_strength:   float = 0.7,
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
-    pose_steps:     int   = 15,
-    pose_guidance:  float = 2.5,
-    skip_pose:      bool  = False,
-    enh_steps:      int   = 6,
-    enh_guidance:   float = 1.5,
-    skip_enh:       bool  = False,
     pctnet_dir:     str   = "",
     pctnet_weights: str   = "",
 ) -> List[Image.Image]:
@@ -1140,10 +867,10 @@ def run_collage_chain(
     Per object:
       Stage A   : Sketch → LoRA FLUX → obj_img
       Stage BBOX: Placement mask → bbox  (mask_{name}.png required)
-      Stage POSE: Kontext(scene_crop+obj, pose_prompt) → obj_posed
+      Stage POSE: Kontext(scene_crop+obj, pose_prompt) → obj_img
                   diff extraction → obj on white bg with natural pose
-      Stage MASK: Threshold obj_posed → ref_mask
-      Stage COL : paste obj_posed into scene at bbox → collage_scene
+      Stage MASK: Threshold obj_img → ref_mask
+      Stage COL : paste obj_img into scene at bbox → collage_scene
       Stage HAR : Harmonize pasted object with background (PCT-Net or Reinhard)
       Stage K   : FLUX Kontext(reference=collage_scene, prompt) → result
     """
@@ -1189,22 +916,8 @@ def run_collage_chain(
         with open(os.path.join(out_dir, f"bbox_{name}.txt"), "w") as f:
             f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
-        # Stage POSE: Kontext repose object-only, angle derived from mask geometry
-        if not skip_pose:
-            print(f"  [POSE] Adjusting pose via Kontext (object-only) ...")
-            obj_posed = _pose_object_in_context(
-                pipe=pipe, obj_img=obj_img,
-                bbox=(bx1, by1, bx2, by2), description=desc,
-                seed=seed, num_steps=pose_steps, guidance=pose_guidance,
-                height=height, width=width,
-            )
-            obj_posed.save(os.path.join(out_dir, f"obj_posed_{name}.png"))
-            print(f"      Saved: obj_posed_{name}.png")
-        else:
-            obj_posed = obj_img
-
-        # Stage MASK: extract mask from posed object
-        ref_mask = _compute_obj_mask(obj_posed)
+        # Stage MASK: extract object mask
+        ref_mask = _compute_obj_mask(obj_img)
         n_px = ref_mask.sum()
         print(f"  [MASK] Object pixels: {n_px} ({100*n_px/(height*width):.1f}%)")
         if n_px < 50:
@@ -1216,12 +929,10 @@ def run_collage_chain(
         print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
         collage_scene, paste_box = build_collage_scene(
             scene        = scene,
-            obj_img      = obj_posed,
+            obj_img      = obj_img,
             ref_mask     = ref_mask,
             target_bbox  = (bx1, by1, bx2, by2),
             collage_mode = collage_mode,
-            paste_alpha  = paste_alpha,
-            feather      = feather,
         )
         collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
         print(f"      Saved collage: collage_{name}.png")
@@ -1245,11 +956,7 @@ def run_collage_chain(
             print("      HAR mask too sparse — skipping harmonization")
 
         # Stage K: FLUX Kontext integration pass
-        blend_p = (
-            f"Naturally integrate the {desc} shown in the scene "
-            f"with correct lighting, contact shadow, and perspective. "
-            f"Do not change any other part of the room."
-        )
+        blend_p = f"A photorealistic room with a {desc} placed naturally on the floor."
         print(f"  [K] Kontext integration pass (kv={use_kv}) ...")
         print(f"      Prompt: {blend_p[:100]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
@@ -1259,13 +966,13 @@ def run_collage_chain(
             vae_sf   = getattr(pipe, "vae_scale_factor", 8)
             h_lat    = height // (vae_sf * 2)
             w_lat    = width  // (vae_sf * 2)
-            tok_mask = _obj_token_mask(obj_posed, h_lat, w_lat)
+            tok_mask = _obj_token_mask(obj_img, h_lat, w_lat)
             pct      = 100.0 * tok_mask.mean()
             print(f"      obj token mask: {tok_mask.sum()} / {h_lat*w_lat} ({pct:.1f}%)")
             target_zone = _placement_mask_to_token_zone(mask_path, height, width, pipe)
             next_scene = run_with_kv_injection(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
-                obj_img=obj_posed, obj_mask_np=tok_mask, target_zone=target_zone,
+                obj_img=obj_img, obj_mask_np=tok_mask, target_zone=target_zone,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
                 height=height, width=width,
                 obj_strength=obj_strength, cutoff_frac=cutoff_frac,
@@ -1281,27 +988,8 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Chain carries pre-ENH result so errors don't compound across objects.
         scene = next_scene
-
-        # Stage ENH: cosmetic refinement pass — output only, NOT fed back into chain.
-        if not skip_enh:
-            print(f"  [ENH] Refinement pass ({enh_steps} steps, guidance={enh_guidance}) ...")
-            enh_prompt = (
-                "Photorealistic interior room. Restore sharp floor texture, "
-                "remove blending artifacts, preserve all objects and colors exactly."
-            )
-            enh_result = run_standard(
-                pipe=pipe, canvas=next_scene, prompt=enh_prompt,
-                seed=seed, num_steps=enh_steps, guidance=enh_guidance,
-                height=height, width=width,
-            )
-            enh_path = os.path.join(out_dir, f"result_enh_{name}.png")
-            enh_result.save(enh_path)
-            print(f"      Saved: {enh_path}")
-            results.append(enh_result)
-        else:
-            results.append(scene)
+        results.append(scene)
 
         gc.collect()
         if torch.cuda.is_available():
@@ -1332,28 +1020,12 @@ def parse_args():
                         "'full'=actual pixels (default), "
                         "'sobel'=edge map only (AnyDoor-exact), "
                         "'blend'=60%%full+40%%sobel.")
-    p.add_argument("--paste_alpha",   type=float, default=0.85,
-                   help="Opacity of pasted object in collage (0-1). Default 0.85.")
-    p.add_argument("--feather",       type=int,   default=10,
-                   help="Gaussian feather radius for soft mask edge (px). Default 10.")
     p.add_argument("--kv_injection",  action="store_true",
                    help="Enable K/V injection from obj_img at target zone on top of collage.")
     p.add_argument("--obj_strength",  type=float, default=0.7,
                    help="K/V injection strength at target zone (0-1). Default 0.7.")
     p.add_argument("--cutoff_frac",   default="0.0,0.6",
                    help="Injection active window as 'start,end' step fractions. Default '0.0,0.6'.")
-    p.add_argument("--skip_pose",      action="store_true",
-                   help="Skip Stage POSE; use raw obj_img directly in collage.")
-    p.add_argument("--pose_steps",    type=int,   default=15,
-                   help="Kontext steps for the pose-adjustment pass. Default 15.")
-    p.add_argument("--pose_guidance", type=float, default=2.5,
-                   help="Guidance scale for the pose pass. Default 2.5.")
-    p.add_argument("--skip_enh",       action="store_true",
-                   help="Skip Stage ENH refinement pass.")
-    p.add_argument("--enh_steps",     type=int,   default=6,
-                   help="Kontext steps for the refinement pass. Default 6.")
-    p.add_argument("--enh_guidance",  type=float, default=1.5,
-                   help="Guidance scale for the refinement pass. Default 1.5.")
     p.add_argument("--pctnet_dir",    default="",
                    help="Path to cloned rakutentech/PCT-Net-Image-Harmonization repo. "
                         "If empty, Reinhard Lab transfer is used instead.")
@@ -1384,12 +1056,10 @@ def main():
     print(f"{_SEP}")
     print(f"  Objects      : {[e['name'] for e in edits]}")
     print(f"  Sketch dir   : {args.sketch_dir}")
-    print(f"  Collage mode : {args.collage_mode}  alpha={args.paste_alpha}  feather={args.feather}")
+    print(f"  Collage mode : {args.collage_mode}")
     print(f"  Guidance     : {args.guidance}")
-    print(f"  Pose pass    : {'skip' if args.skip_pose else f'steps={args.pose_steps}  guidance={args.pose_guidance}'}")
-    har_backend = "PCT-Net" if (args.pctnet_dir and args.pctnet_weights) else "Reinhard (fallback)"
+    har_backend = "PCT-Net" if (args.pctnet_dir and args.pctnet_weights) else "skip"
     print(f"  Harmonization: {har_backend}")
-    print(f"  Refinement   : {'skip' if args.skip_enh else f'steps={args.enh_steps}  guidance={args.enh_guidance}'}")
     print(f"  KV injection : {args.kv_injection}"
           + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
              if args.kv_injection else ""))
@@ -1424,19 +1094,11 @@ def main():
         lora_guidance=args.lora_guidance,
         scene_guidance=args.guidance,
         collage_mode=args.collage_mode,
-        paste_alpha=args.paste_alpha,
-        feather=args.feather,
         height=args.height, width=args.width,
         out_dir=args.out_dir, device=args.device,
         use_kv=args.kv_injection,
         obj_strength=args.obj_strength,
         cutoff_frac=cutoff_frac,
-        pose_steps=args.pose_steps,
-        pose_guidance=args.pose_guidance,
-        skip_pose=args.skip_pose,
-        enh_steps=args.enh_steps,
-        enh_guidance=args.enh_guidance,
-        skip_enh=args.skip_enh,
         pctnet_dir=args.pctnet_dir,
         pctnet_weights=args.pctnet_weights,
     )
