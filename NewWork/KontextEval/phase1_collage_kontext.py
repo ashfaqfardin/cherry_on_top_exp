@@ -956,7 +956,7 @@ def run_collage_chain(
             print("      HAR mask too sparse — skipping harmonization")
 
         # Stage K: FLUX Kontext integration pass
-        blend_p = f"A photorealistic room with a {desc} placed naturally. If the object is present preserve the object in the {desc} style. The object should be placed in the scene naturally and blend seamlessly with the environment."
+        blend_p = f"A photorealistic room with a {desc} placed naturally."
         print(f"  [K] Kontext integration pass (kv={use_kv}) ...")
         print(f"      Prompt: {blend_p[:100]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
@@ -987,6 +987,22 @@ def run_collage_chain(
         result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
+
+        # Stage BCG: Background Consistency Guidance
+        # Replace non-object pixels with original scene to prevent background drift.
+        # Dilate mask to include Kontext-generated contact shadows and edge blending.
+        # Soft feather at boundary for a seamless transition.
+        print(f"  [BCG] Restoring background ...")
+        bcg_mask = cv2.dilate(obj_mask_har, np.ones((11, 11), np.uint8), iterations=2)
+        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (31, 31), 10)
+        result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
+        scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
+        mask_3    = bcg_mask[:, :, None]
+        bcg_np    = np.clip(result_np * mask_3 + scene_np * (1 - mask_3), 0, 255).astype(np.uint8)
+        next_scene = Image.fromarray(bcg_np)
+        bcg_path = os.path.join(out_dir, f"result_bcg_{name}.png")
+        next_scene.save(bcg_path)
+        print(f"      Saved: {bcg_path}")
 
         scene = next_scene
         results.append(scene)
