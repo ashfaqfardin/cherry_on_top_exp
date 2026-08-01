@@ -1081,18 +1081,11 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Stage BCG: safety layer — restore object core from collage pixels.
-        # Background is already preserved by the latent BCG above.
-        # This layer guarantees the object is visible even if Kontext moved/removed it.
-        print(f"  [BCG] Object core safety restore ...")
-        obj_core   = cv2.GaussianBlur(obj_mask_har.astype(np.float32), (15, 15), 4)
-        result_arr  = np.array(next_scene.convert("RGB"),    dtype=np.float32)
-        collage_arr = np.array(collage_scene.convert("RGB"), dtype=np.float32)
-        final_arr   = collage_arr * obj_core[:, :, None] + result_arr * (1.0 - obj_core[:, :, None])
-        next_scene  = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
+        # Stage BCG: latent BCG is applied inside Stage K via callback.
+        # result_step{n} already has background preserved — save as BCG result.
         bcg_path = os.path.join(out_dir, f"result_bcg_{name}.png")
         next_scene.save(bcg_path)
-        print(f"      Saved: {bcg_path}")
+        print(f"  [BCG] Latent BCG applied in-loop. Saved: {bcg_path}")
 
         scene = next_scene
         results.append(scene)
