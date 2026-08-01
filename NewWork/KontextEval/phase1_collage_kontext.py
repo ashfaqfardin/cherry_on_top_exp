@@ -1075,11 +1075,25 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Stage BCG: latent BCG is applied inside Stage K via callback.
-        # result_step{n} already has background preserved — save as BCG result.
+        # Stage BCG: pixel-space composite on top of the latent BCG output.
+        # Latent BCG handled in-loop integration; this gives a hard guarantee
+        # that background outside the placement zone is pixel-perfect original scene.
+        print(f"  [BCG] Pixel-space background restore ...")
+        placement_np = np.array(
+            Image.open(mask_path).convert("L").resize((width, height), Image.Resampling.NEAREST)
+        )
+        bcg_mask = (placement_np > 127).astype(np.uint8)
+        bcg_mask = cv2.dilate(bcg_mask, np.ones((61, 61), np.uint8), iterations=5)
+        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (101, 101), 30)
+
+        result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
+        scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
+        m3        = bcg_mask[:, :, None]
+        bcg_np    = np.clip(result_np * m3 + scene_np * (1.0 - m3), 0, 255).astype(np.uint8)
+        next_scene = Image.fromarray(bcg_np)
         bcg_path = os.path.join(out_dir, f"result_bcg_{name}.png")
         next_scene.save(bcg_path)
-        print(f"  [BCG] Latent BCG applied in-loop. Saved: {bcg_path}")
+        print(f"      Saved: {bcg_path}")
 
         scene = next_scene
         results.append(scene)
