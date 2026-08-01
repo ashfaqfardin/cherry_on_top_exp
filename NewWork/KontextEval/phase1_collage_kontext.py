@@ -992,22 +992,39 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Stage BCG: Background Consistency Guidance
-        # Use the placement mask (user-drawn) as the BCG zone — guaranteed to cover
-        # the object regardless of its size or any repositioning Kontext does.
-        # Dilate generously to include generated contact shadows and edge blending.
+        # Stage BCG: three-layer composite
+        #   Layer 1 (outermost) — original scene   : background, no drift ever
+        #   Layer 2 (middle)    — Kontext output   : shadows + edge integration
+        #   Layer 3 (innermost) — collage pixels   : object core guaranteed visible
         print(f"  [BCG] Restoring background ...")
+
+        # --- Layer 1 mask: dilated placement zone (Kontext integration region) ---
         placement_np = np.array(
             Image.open(mask_path).convert("L").resize((width, height), Image.Resampling.NEAREST)
         )
         bcg_mask = (placement_np > 127).astype(np.uint8)
         bcg_mask = cv2.dilate(bcg_mask, np.ones((61, 61), np.uint8), iterations=5)
         bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (101, 101), 30)
-        result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
-        scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
-        mask_3    = bcg_mask[:, :, None]
-        bcg_np    = np.clip(result_np * mask_3 + scene_np * (1 - mask_3), 0, 255).astype(np.uint8)
-        next_scene = Image.fromarray(bcg_np)
+
+        # Save mask for debugging
+        Image.fromarray((bcg_mask * 255).astype(np.uint8)).save(
+            os.path.join(out_dir, f"debug_bcg_mask_{name}.png")
+        )
+
+        result_np  = np.array(next_scene.convert("RGB"),   dtype=np.float32)
+        scene_np   = np.array(scene.convert("RGB"),         dtype=np.float32)
+        collage_np = np.array(collage_scene.convert("RGB"), dtype=np.float32)
+
+        # Layer 1+2: blend Kontext output into original scene at placement zone
+        layer12 = result_np * bcg_mask[:, :, None] + scene_np * (1 - bcg_mask[:, :, None])
+
+        # --- Layer 3 mask: exact object footprint from collage diff (soft edge) ---
+        obj_core = cv2.GaussianBlur(obj_mask_har.astype(np.float32), (15, 15), 4)
+
+        # Layer 3: paste collage object pixels on top to guarantee object is visible
+        final_np = collage_np * obj_core[:, :, None] + layer12 * (1 - obj_core[:, :, None])
+
+        next_scene = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
         bcg_path = os.path.join(out_dir, f"result_bcg_{name}.png")
         next_scene.save(bcg_path)
         print(f"      Saved: {bcg_path}")
