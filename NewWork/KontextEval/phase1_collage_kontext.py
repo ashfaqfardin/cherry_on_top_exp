@@ -271,7 +271,7 @@ def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
 # ── constants ─────────────────────────────────────────────────────────────────
 EDITS: List[dict] = [
     {"name": "bicycle", "description": "yellow mountain bicycle"},
-    {"name": "vase",    "description": "white ceramic vase with flowers"},
+    {"name": "vase",    "description": "black ceramic vase with flowers"},
     {"name": "ball",    "description": "yellow rubber ball"},
 ]
 BASE_PROMPT = "A empty room with a wooden floor, white walls, and a window letting in natural light."
