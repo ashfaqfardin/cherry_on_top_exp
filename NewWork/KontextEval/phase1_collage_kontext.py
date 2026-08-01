@@ -753,15 +753,7 @@ def build_collage_scene(
     return Image.fromarray(collage_np), (y1, y2, x1, x2)
 
 
-# ── Stage HAR: image harmonization ───────────────────────────────────────────
-#
-# Two paths:
-#   PCT-Net  — full harmonization network (CVPR 2023, rakutentech/PCT-Net-Image-Harmonization)
-#              Requires: git clone the repo, pass --pctnet_dir and --pctnet_weights.
-#   Reinhard — luminance-only Lab color transfer, no external deps, instant fallback.
-#
-# Harmonization mask is derived by diffing collage_scene vs original scene so
-# it works correctly for all collage modes (full / sobel / blend).
+# ── Object footprint mask (used for BCG tight boundary) ──────────────────────
 
 
 def _collage_obj_mask(collage: Image.Image, scene: Image.Image,
@@ -782,73 +774,9 @@ def _collage_obj_mask(collage: Image.Image, scene: Image.Image,
     return mask
 
 
-def _harmonize_pctnet(
-    composite: Image.Image,
-    obj_mask:  np.ndarray,
-    pctnet_dir: str,
-    weights_path: str,
-    device: str = "cuda",
-) -> Image.Image:
-    """
-    PCT-Net harmonization (CVPR 2023).
-
-    Setup:
-      git clone https://github.com/rakutentech/PCT-Net-Image-Harmonization
-      pip install -r PCT-Net-Image-Harmonization/requirements.txt
-    Then pass:
-      --pctnet_dir  /path/to/PCT-Net-Image-Harmonization
-      --pctnet_weights /path/to/PCT-Net-Image-Harmonization/pretrained_models/PCTNet_ViT.pth
-    """
-    import sys as _sys
-    if pctnet_dir not in _sys.path:
-        _sys.path.insert(0, pctnet_dir)
-
-    from iharm.inference.utils import load_model
-    from iharm.inference.predictor import Predictor
-    from iharm.mconfigs import ALL_MCONFIGS
-
-    model_type = "ViT_pct"
-    net = load_model(model_type, weights_path, verbose=False)
-    cfg = ALL_MCONFIGS[model_type]
-    norm = cfg.get("params", {}).get("input_normalization",
-                                     {"mean": (.485, .456, .406),
-                                      "std":  (.229, .224, .225)})
-    dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    predictor = Predictor(net, dev, mean=norm["mean"], std=norm["std"],
-                           with_flip=False)
-
-    comp_np  = np.array(composite.convert("RGB"))
-    mask_f32 = obj_mask.astype(np.float32)   # [0, 1]
-
-    comp_lr  = cv2.resize(comp_np,  (256, 256))
-    mask_lr  = cv2.resize(mask_f32, (256, 256))
-
-    _, result_np = predictor.predict(comp_lr, comp_np, mask_lr, mask_f32)
-    result_np = np.clip(result_np, 0, 255).astype(np.uint8)
-    return Image.fromarray(result_np)
 
 
-def _harmonize(
-    composite:    Image.Image,
-    obj_mask:     np.ndarray,
-    pctnet_dir:   str = "",
-    pctnet_weights: str = "",
-    device:       str = "cuda",
-) -> Image.Image:
-    """
-    PCT-Net harmonization only. Skips if paths not provided or invalid.
-    """
-    if not (pctnet_dir and pctnet_weights and
-            os.path.isdir(pctnet_dir) and os.path.isfile(pctnet_weights)):
-        print("    [HAR] PCT-Net not configured — skipping harmonization")
-        return composite
-    print("    [HAR] PCT-Net harmonization ...")
-    result = _harmonize_pctnet(composite, obj_mask, pctnet_dir, pctnet_weights, device)
-    print("    [HAR] PCT-Net done")
-    return result
-
-
-# ── Latent-space BCG (Blended Latent Diffusion, 2206.02779) ──────────────────
+# ── BLD latent-space BCG (Blended Latent Diffusion, arxiv:2206.02779) ─────────
 
 def _make_bcg_latent_callback(
     scene:        Image.Image,
@@ -858,21 +786,23 @@ def _make_bcg_latent_callback(
     width:        int,
     device:       str,
     dtype:        torch.dtype = torch.bfloat16,
-    dilation_lat: int = 4,
+    dilation_lat: int = 3,
 ):
     """
-    Returns a callback_on_step_end that enforces background consistency in latent space.
+    At every denoising step with noise level sigma_t:
+        z_bg_t = (1 - sigma_t) * z0_scene + sigma_t * noise
+        latents = latents * mask + z_bg_t * (1 - mask)
 
-    At every denoising step t, background latents (outside the dilated placement mask)
-    are replaced with the original scene latent noise-blended to sigma_t:
-        z_bg_t = (1 - sigma) * z0_bg + sigma * noise
-    so the model always sees the unchanged background and generates shadows / contact
-    integration naturally inside the mask region.
+    Early steps (sigma≈1): background ≈ noise  → matches noisy interior → no discontinuity
+    Late steps  (sigma≈0): background → z0_scene → pixel-identical to original scene
+
+    Mask is the user-drawn placement mask at VAE latent resolution.
+    Everything outside the mask converges to the exact original scene.
     """
     vae_h = height // 8
     vae_w = width  // 8
 
-    # VAE-encode the background scene once
+    # Encode the background scene once (z0)
     scene_np = np.array(scene.convert("RGB"), dtype=np.float32) / 255.0
     scene_t  = torch.from_numpy(scene_np).permute(2, 0, 1).unsqueeze(0)
     scene_t  = (scene_t * 2.0 - 1.0).to(dtype)
@@ -882,7 +812,11 @@ def _make_bcg_latent_callback(
         z0 = (z0 - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
     z0 = z0.to(device, dtype)
 
-    # Latent-resolution placement mask
+    # Fixed noise — consistent across all steps so background converges coherently
+    noise = torch.randn(z0.shape, device=device, dtype=dtype,
+                        generator=torch.Generator(device=device).manual_seed(42))
+
+    # Placement mask at VAE latent resolution
     placement_np = np.array(
         Image.open(mask_path).convert("L").resize((vae_w, vae_h), Image.Resampling.NEAREST)
     )
@@ -893,17 +827,17 @@ def _make_bcg_latent_callback(
     mask_soft   = cv2.GaussianBlur(mask_lat.astype(np.float32), (7, 7), 2.0)
     mask_tensor = torch.from_numpy(mask_soft).to(device, dtype)[None, None]  # (1,1,H,W)
 
-    coverage = float(mask_soft.mean()) * 100
-    print(f"    [BCG-lat] Latent mask {vae_h}×{vae_w}, coverage={coverage:.1f}%")
+    print(f"    [BLD] Latent mask {vae_h}×{vae_w}, edit zone={mask_soft.mean()*100:.1f}%")
 
-    def _callback(_pipeline, _step_index, _timestep, callback_kwargs):
+    def _callback(_pipeline, _step_index, timestep, callback_kwargs):
         latents = callback_kwargs["latents"]
         if latents.shape[-2:] != (vae_h, vae_w):
             return callback_kwargs  # unexpected shape — skip safely
 
-        # Paper BCG formula: Z_i = Z_{i-1} ⊙ (1-m) + Z_i ⊙ m
-        # Replace background with the clean prior latent unconditionally every step.
-        z_bg = z0.to(latents.dtype).to(latents.device)
+        # FLUX flow-matching: timestep = sigma × 1000, sigma in [0, 1]
+        sigma = max(0.0, min(1.0, float(timestep) / 1000.0))
+
+        z_bg = ((1.0 - sigma) * z0 + sigma * noise).to(latents.dtype).to(latents.device)
         m    = mask_tensor.expand_as(latents).to(latents.dtype).to(latents.device)
 
         callback_kwargs["latents"] = latents * m + z_bg * (1.0 - m)
@@ -932,9 +866,6 @@ def run_collage_chain(
     use_kv:         bool  = False,
     obj_strength:   float = 0.7,
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
-    pctnet_dir:     str   = "",
-    pctnet_weights: str   = "",
-    skip_har:       bool  = False,
 ) -> List[Image.Image]:
     """
     Incremental object insertion via FLUX Kontext with Kontext-based pose adjustment.
@@ -1012,26 +943,10 @@ def run_collage_chain(
         collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
         print(f"      Saved collage: collage_{name}.png")
 
-        # Stage HAR: harmonize pasted object with background
-        print(f"  [HAR] Harmonizing object with scene ...")
+        # Object footprint mask — used by BCG to define the tight boundary
         obj_mask_har = _collage_obj_mask(collage_scene, scene)
         n_har = int(obj_mask_har.sum())
-        print(f"      HAR mask: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
-        _MIN_HAR_PX = 30_000
-        if skip_har:
-            print("      Harmonization skipped (--skip_har)")
-        elif n_har >= _MIN_HAR_PX:
-            collage_scene = _harmonize(
-                composite=collage_scene,
-                obj_mask=obj_mask_har,
-                pctnet_dir=pctnet_dir,
-                pctnet_weights=pctnet_weights,
-                device=device,
-            )
-            collage_scene.save(os.path.join(out_dir, f"collage_har_{name}.png"))
-            print(f"      Saved: collage_har_{name}.png")
-        else:
-            print(f"      Object too small for PCT-Net ({n_har} px < {_MIN_HAR_PX}) — skipping harmonization")
+        print(f"  [MASK] Object footprint: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
 
         # Stage K: FLUX Kontext integration pass with latent-space BCG
         blend_p = f"A photorealistic room with a {desc} placed naturally."
@@ -1040,7 +955,8 @@ def run_collage_chain(
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
             f.write(blend_p)
 
-        # Build BCG latent callback (Blended Latent Diffusion) for this object
+        # BLD latent callback: inside placement mask Kontext generates freely,
+        # outside it converges to the original scene (pixel-identical at sigma=0).
         pipe_dtype = next(pipe.transformer.parameters()).dtype
         bcg_cb = _make_bcg_latent_callback(
             scene=scene, mask_path=mask_path, pipe=pipe,
@@ -1075,16 +991,12 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Stage BCG: pixel-space composite on top of the latent BCG output.
-        # Latent BCG handled in-loop integration; this gives a hard guarantee
-        # that background outside the placement zone is pixel-perfect original scene.
-        print(f"  [BCG] Pixel-space background restore ...")
-        placement_np = np.array(
-            Image.open(mask_path).convert("L").resize((width, height), Image.Resampling.NEAREST)
-        )
-        bcg_mask = (placement_np > 127).astype(np.uint8)
-        bcg_mask = cv2.dilate(bcg_mask, np.ones((61, 61), np.uint8), iterations=5)
-        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (101, 101), 30)
+        # Stage BCG: tight mask from actual object footprint.
+        # Boundary stays at the object edge so it never cuts through flat wall/floor.
+        # Dilation adds ~60 px buffer around the object to capture contact shadows.
+        print(f"  [BCG] Object-tight background restore ...")
+        bcg_mask = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=3)
+        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (41, 41), 15)
 
         result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
         scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
@@ -1133,14 +1045,6 @@ def parse_args():
                    help="K/V injection strength at target zone (0-1). Default 0.7.")
     p.add_argument("--cutoff_frac",   default="0.0,0.6",
                    help="Injection active window as 'start,end' step fractions. Default '0.0,0.6'.")
-    p.add_argument("--skip_har",       action="store_true",
-                   help="Skip PCT-Net harmonization for the entire run.")
-    p.add_argument("--pctnet_dir",    default="",
-                   help="Path to cloned rakutentech/PCT-Net-Image-Harmonization repo. "
-                        "If empty, Reinhard Lab transfer is used instead.")
-    p.add_argument("--pctnet_weights", default="",
-                   help="Path to PCTNet_ViT.pth weights file. "
-                        "If empty, Reinhard Lab transfer is used instead.")
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--num_steps",     type=int,   default=28)
     p.add_argument("--height",        type=int,   default=1024)
@@ -1167,13 +1071,6 @@ def main():
     print(f"  Sketch dir   : {args.sketch_dir}")
     print(f"  Collage mode : {args.collage_mode}")
     print(f"  Guidance     : {args.guidance}")
-    if args.skip_har:
-        har_backend = "skip (--skip_har)"
-    elif args.pctnet_dir and args.pctnet_weights:
-        har_backend = "PCT-Net"
-    else:
-        har_backend = "skip (no paths provided)"
-    print(f"  Harmonization: {har_backend}")
     print(f"  KV injection : {args.kv_injection}"
           + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
              if args.kv_injection else ""))
@@ -1213,9 +1110,6 @@ def main():
         use_kv=args.kv_injection,
         obj_strength=args.obj_strength,
         cutoff_frac=cutoff_frac,
-        pctnet_dir=args.pctnet_dir,
-        pctnet_weights=args.pctnet_weights,
-        skip_har=args.skip_har,
     )
 
     all_imgs = results
