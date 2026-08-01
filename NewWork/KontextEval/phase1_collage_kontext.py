@@ -115,12 +115,18 @@ def run_standard(
     pipe, canvas: Image.Image, prompt: str,
     seed: int, num_steps: int, guidance: float,
     height: int, width: int,
+    bcg_callback=None,
 ) -> Image.Image:
     generator = torch.Generator(device=pipe.device).manual_seed(seed)
+    cb_kwargs: dict = {}
+    if bcg_callback is not None:
+        cb_kwargs["callback_on_step_end"] = bcg_callback
+        cb_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
     return pipe(
         prompt=prompt, image=canvas,
         num_inference_steps=num_steps, guidance_scale=guidance,
         height=height, width=width, generator=generator,
+        **cb_kwargs,
     ).images[0]
 
 
@@ -543,6 +549,7 @@ def run_with_kv_injection(
     width:        int,
     obj_strength: float = 0.7,
     cutoff_frac:  Tuple[float, float] = (0.0, 0.6),
+    bcg_callback=None,
 ) -> Image.Image:
     """
     FLUX Kontext with K/V injection from obj_img at target_zone tokens.
@@ -593,8 +600,11 @@ def run_with_kv_injection(
     def _step_callback(pipe_ref, step_index, timestep, callback_kwargs):
         inject_proc._step  = step_index + 1
         inject_proc._layer = 0
+        if bcg_callback is not None:
+            callback_kwargs = bcg_callback(pipe_ref, step_index, timestep, callback_kwargs)
         return callback_kwargs
 
+    tensor_inputs = ["latents"] if bcg_callback is not None else []
     gen1 = torch.Generator(device=pipe.device).manual_seed(seed)
     result = pipe(
         image=canvas, prompt=prompt,
@@ -602,7 +612,7 @@ def run_with_kv_injection(
         height=height, width=width, max_sequence_length=512,
         generator=gen1, output_type="pil",
         callback_on_step_end=_step_callback,
-        callback_on_step_end_tensor_inputs=[],
+        callback_on_step_end_tensor_inputs=tensor_inputs,
     ).images[0]
 
     pipe.transformer.set_attn_processor(orig_procs)   # restore
@@ -838,6 +848,76 @@ def _harmonize(
     return result
 
 
+# ── Latent-space BCG (Blended Latent Diffusion, 2206.02779) ──────────────────
+
+def _make_bcg_latent_callback(
+    scene:        Image.Image,
+    mask_path:    str,
+    pipe,
+    height:       int,
+    width:        int,
+    device:       str,
+    dtype:        torch.dtype = torch.bfloat16,
+    dilation_lat: int = 4,
+):
+    """
+    Returns a callback_on_step_end that enforces background consistency in latent space.
+
+    At every denoising step t, background latents (outside the dilated placement mask)
+    are replaced with the original scene latent noise-blended to sigma_t:
+        z_bg_t = (1 - sigma) * z0_bg + sigma * noise
+    so the model always sees the unchanged background and generates shadows / contact
+    integration naturally inside the mask region.
+    """
+    vae_h = height // 8
+    vae_w = width  // 8
+
+    # VAE-encode the background scene once
+    scene_np = np.array(scene.convert("RGB"), dtype=np.float32) / 255.0
+    scene_t  = torch.from_numpy(scene_np).permute(2, 0, 1).unsqueeze(0)
+    scene_t  = (scene_t * 2.0 - 1.0).to(dtype)
+    with torch.no_grad():
+        enc_dev = next(pipe.vae.parameters()).device
+        z0 = pipe.vae.encode(scene_t.to(enc_dev)).latent_dist.sample()
+        z0 = (z0 - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+    z0 = z0.to(device, dtype)
+
+    # Fixed BLD noise — same across all steps so background stays coherent
+    noise = torch.randn(z0.shape, device=device, dtype=dtype,
+                        generator=torch.Generator(device=device).manual_seed(42))
+
+    # Latent-resolution placement mask
+    placement_np = np.array(
+        Image.open(mask_path).convert("L").resize((vae_w, vae_h), Image.Resampling.NEAREST)
+    )
+    mask_lat = (placement_np > 127).astype(np.uint8)
+    if dilation_lat > 0:
+        k = dilation_lat * 2 + 1
+        mask_lat = cv2.dilate(mask_lat, np.ones((k, k), np.uint8), iterations=2)
+    mask_soft   = cv2.GaussianBlur(mask_lat.astype(np.float32), (7, 7), 2.0)
+    mask_tensor = torch.from_numpy(mask_soft).to(device, dtype)[None, None]  # (1,1,H,W)
+
+    coverage = float(mask_soft.mean()) * 100
+    print(f"    [BCG-lat] Latent mask {vae_h}×{vae_w}, coverage={coverage:.1f}%")
+
+    def _callback(_pipeline, _step_index, timestep, callback_kwargs):
+        latents = callback_kwargs["latents"]
+        if latents.shape[-2:] != (vae_h, vae_w):
+            return callback_kwargs  # unexpected shape — skip safely
+
+        # FLUX flow-matching: timestep is sigma × 1000, sigma in [0, 1]
+        sigma = float(timestep) / 1000.0
+        sigma = max(0.0, min(1.0, sigma))
+
+        z_bg = ((1.0 - sigma) * z0 + sigma * noise).to(latents.dtype).to(latents.device)
+        m    = mask_tensor.expand_as(latents).to(latents.dtype).to(latents.device)
+
+        callback_kwargs["latents"] = latents * m + z_bg * (1.0 - m)
+        return callback_kwargs
+
+    return _callback
+
+
 # ── Main incremental pipeline ─────────────────────────────────────────────────
 
 def run_collage_chain(
@@ -959,12 +1039,19 @@ def run_collage_chain(
         else:
             print(f"      Object too small for PCT-Net ({n_har} px < {_MIN_HAR_PX}) — skipping harmonization")
 
-        # Stage K: FLUX Kontext integration pass
+        # Stage K: FLUX Kontext integration pass with latent-space BCG
         blend_p = f"A photorealistic room with a {desc} placed naturally."
         print(f"  [K] Kontext integration pass (kv={use_kv}) ...")
         print(f"      Prompt: {blend_p[:100]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
             f.write(blend_p)
+
+        # Build BCG latent callback (Blended Latent Diffusion) for this object
+        pipe_dtype = next(pipe.transformer.parameters()).dtype
+        bcg_cb = _make_bcg_latent_callback(
+            scene=scene, mask_path=mask_path, pipe=pipe,
+            height=height, width=width, device=device, dtype=pipe_dtype,
+        )
 
         if use_kv:
             vae_sf   = getattr(pipe, "vae_scale_factor", 8)
@@ -980,51 +1067,29 @@ def run_collage_chain(
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
                 height=height, width=width,
                 obj_strength=obj_strength, cutoff_frac=cutoff_frac,
+                bcg_callback=bcg_cb,
             )
         else:
             next_scene = run_standard(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
                 height=height, width=width,
+                bcg_callback=bcg_cb,
             )
 
         result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Stage BCG: three-layer composite
-        #   Layer 1 (outermost) — original scene   : background, no drift ever
-        #   Layer 2 (middle)    — Kontext output   : shadows + edge integration
-        #   Layer 3 (innermost) — collage pixels   : object core guaranteed visible
-        print(f"  [BCG] Restoring background ...")
-
-        # --- Layer 1 mask: dilated placement zone (Kontext integration region) ---
-        placement_np = np.array(
-            Image.open(mask_path).convert("L").resize((width, height), Image.Resampling.NEAREST)
-        )
-        bcg_mask = (placement_np > 127).astype(np.uint8)
-        bcg_mask = cv2.dilate(bcg_mask, np.ones((61, 61), np.uint8), iterations=5)
-        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (101, 101), 30)
-
-        # Save mask for debugging
-        Image.fromarray((bcg_mask * 255).astype(np.uint8)).save(
-            os.path.join(out_dir, f"debug_bcg_mask_{name}.png")
-        )
-
-        result_np  = np.array(next_scene.convert("RGB"),   dtype=np.float32)
-        scene_np   = np.array(scene.convert("RGB"),         dtype=np.float32)
-        collage_np = np.array(collage_scene.convert("RGB"), dtype=np.float32)
-
-        # Layer 1+2: blend Kontext output into original scene at placement zone
-        layer12 = result_np * bcg_mask[:, :, None] + scene_np * (1 - bcg_mask[:, :, None])
-
-        # --- Layer 3 mask: exact object footprint from collage diff (soft edge) ---
-        obj_core = cv2.GaussianBlur(obj_mask_har.astype(np.float32), (15, 15), 4)
-
-        # Layer 3: paste collage object pixels on top to guarantee object is visible
-        final_np = collage_np * obj_core[:, :, None] + layer12 * (1 - obj_core[:, :, None])
-
-        next_scene = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
+        # Stage BCG: safety layer — restore object core from collage pixels.
+        # Background is already preserved by the latent BCG above.
+        # This layer guarantees the object is visible even if Kontext moved/removed it.
+        print(f"  [BCG] Object core safety restore ...")
+        obj_core   = cv2.GaussianBlur(obj_mask_har.astype(np.float32), (15, 15), 4)
+        result_arr  = np.array(next_scene.convert("RGB"),    dtype=np.float32)
+        collage_arr = np.array(collage_scene.convert("RGB"), dtype=np.float32)
+        final_arr   = collage_arr * obj_core[:, :, None] + result_arr * (1.0 - obj_core[:, :, None])
+        next_scene  = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
         bcg_path = os.path.join(out_dir, f"result_bcg_{name}.png")
         next_scene.save(bcg_path)
         print(f"      Saved: {bcg_path}")
