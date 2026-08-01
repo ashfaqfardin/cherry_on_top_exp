@@ -882,10 +882,6 @@ def _make_bcg_latent_callback(
         z0 = (z0 - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
     z0 = z0.to(device, dtype)
 
-    # Fixed BLD noise — same across all steps so background stays coherent
-    noise = torch.randn(z0.shape, device=device, dtype=dtype,
-                        generator=torch.Generator(device=device).manual_seed(42))
-
     # Latent-resolution placement mask
     placement_np = np.array(
         Image.open(mask_path).convert("L").resize((vae_w, vae_h), Image.Resampling.NEAREST)
@@ -900,16 +896,14 @@ def _make_bcg_latent_callback(
     coverage = float(mask_soft.mean()) * 100
     print(f"    [BCG-lat] Latent mask {vae_h}×{vae_w}, coverage={coverage:.1f}%")
 
-    def _callback(_pipeline, _step_index, timestep, callback_kwargs):
+    def _callback(_pipeline, _step_index, _timestep, callback_kwargs):
         latents = callback_kwargs["latents"]
         if latents.shape[-2:] != (vae_h, vae_w):
             return callback_kwargs  # unexpected shape — skip safely
 
-        # FLUX flow-matching: timestep is sigma × 1000, sigma in [0, 1]
-        sigma = float(timestep) / 1000.0
-        sigma = max(0.0, min(1.0, sigma))
-
-        z_bg = ((1.0 - sigma) * z0 + sigma * noise).to(latents.dtype).to(latents.device)
+        # Paper BCG formula: Z_i = Z_{i-1} ⊙ (1-m) + Z_i ⊙ m
+        # Replace background with the clean prior latent unconditionally every step.
+        z_bg = z0.to(latents.dtype).to(latents.device)
         m    = mask_tensor.expand_as(latents).to(latents.dtype).to(latents.device)
 
         callback_kwargs["latents"] = latents * m + z_bg * (1.0 - m)
