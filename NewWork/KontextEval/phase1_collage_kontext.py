@@ -956,7 +956,7 @@ def run_collage_chain(
             print("      HAR mask too sparse — skipping harmonization")
 
         # Stage K: FLUX Kontext integration pass
-        blend_p = f"A photorealistic room with a {desc} placed naturally on the floor."
+        blend_p = f"A photorealistic room with a {desc} placed naturally. If the object is present preserve the object in the {desc} style. The object should be placed in the scene naturally and blend seamlessly with the environment."
         print(f"  [K] Kontext integration pass (kv={use_kv}) ...")
         print(f"      Prompt: {blend_p[:100]}...")
         with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
