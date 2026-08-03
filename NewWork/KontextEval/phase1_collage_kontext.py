@@ -619,6 +619,151 @@ def run_with_kv_injection(
     return result
 
 
+# ── Collage K/V injection ─────────────────────────────────────────────────────
+#
+# The collage (canvas passed to Kontext) has the object already pasted at the
+# target position. During denoising, ref-slice K/V at target_zone positions
+# encode the pasted object in scene context — no white bg, no mean-pooling.
+# Redirecting gen K/V at those positions from the ref prevents hallucinated
+# text/logos while allowing lighting and shadow integration at edges.
+
+class _CollageKVInject:
+    """
+    At TIER_A layers within cutoff_frac:
+        K_gen[zone] = (1-s)*K_gen[zone] + s*K_ref[zone]
+        V_gen[zone] = (1-s)*V_gen[zone] + s*V_ref[zone]
+    Ref is the collage passed as the Kontext reference image.
+    """
+    def __init__(self, n_gen: int, target_zone: np.ndarray,
+                 obj_strength: float, n_steps: int,
+                 cutoff_frac: Tuple[float, float]):
+        self.n_gen        = n_gen
+        self.target_zone  = target_zone
+        self.obj_strength = obj_strength
+        self.n_steps      = n_steps
+        self.cutoff_frac  = cutoff_frac
+        self._layer = 0
+        self._step  = 0
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None):
+        is_double = encoder_hidden_states is not None
+        B = hidden_states.shape[0]
+
+        q = attn.to_q(hidden_states)
+        k = attn.to_k(hidden_states)
+        v = attn.to_v(hidden_states)
+        hd = k.shape[-1] // attn.heads
+        q = q.view(B, -1, attn.heads, hd).transpose(1, 2)
+        k = k.view(B, -1, attn.heads, hd).transpose(1, 2)
+        v = v.view(B, -1, attn.heads, hd).transpose(1, 2)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+
+        txt_len = 0
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            ek = attn.add_k_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            ev = attn.add_v_proj(encoder_hidden_states).view(B, -1, attn.heads, hd).transpose(1, 2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            txt_len = eq.shape[2]
+            q = torch.cat([eq, q], dim=2)
+            k = torch.cat([ek, k], dim=2)
+            v = torch.cat([ev, v], dim=2)
+
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q, image_rotary_emb)
+            k = apply_rotary_emb(k, image_rotary_emb)
+
+        lo = int(self.cutoff_frac[0] * self.n_steps)
+        hi = int(self.cutoff_frac[1] * self.n_steps)
+        if lo <= self._step < hi and self._layer in _TIER_A:
+            img_off = txt_len if is_double else _SINGLE_TXT_LEN
+            g_lo, g_hi = img_off,              img_off + self.n_gen
+            r_lo, r_hi = img_off + self.n_gen, img_off + 2 * self.n_gen
+
+            if k.shape[2] >= r_hi:
+                k_gen = k[:, :, g_lo:g_hi, :].clone()
+                v_gen = v[:, :, g_lo:g_hi, :].clone()
+                k_ref = k[:, :, r_lo:r_hi, :]
+                v_ref = v[:, :, r_lo:r_hi, :]
+
+                tgt = torch.from_numpy(self.target_zone).to(k.device).view(1, 1, -1, 1)
+                s   = self.obj_strength
+                k_gen = torch.where(tgt, (1.0 - s) * k_gen + s * k_ref, k_gen)
+                v_gen = torch.where(tgt, (1.0 - s) * v_gen + s * v_ref, v_gen)
+
+                k = k.clone(); v = v.clone()
+                k[:, :, g_lo:g_hi, :] = k_gen
+                v[:, :, g_lo:g_hi, :] = v_gen
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, -1, attn.heads * hd).to(q.dtype)
+
+        if is_double:
+            enc_out = out[:, :encoder_hidden_states.shape[1]]
+            out     = out[:, encoder_hidden_states.shape[1]:]
+            out     = attn.to_out[1](attn.to_out[0](out))
+            enc_out = attn.to_add_out(enc_out)
+            self._layer += 1
+            return out, enc_out
+        self._layer += 1
+        return out
+
+
+@torch.no_grad()
+def run_with_collage_kv_injection(
+    pipe,
+    canvas:       Image.Image,
+    prompt:       str,
+    target_zone:  np.ndarray,
+    seed:         int,
+    num_steps:    int,
+    guidance:     float,
+    height:       int,
+    width:        int,
+    obj_strength: float = 0.5,
+    cutoff_frac:  Tuple[float, float] = (0.0, 0.6),
+    bcg_callback  = None,
+) -> Image.Image:
+    """
+    Kontext with live collage K/V injection — no pre-capture step needed.
+    The reference IS the collage; ref K/V at target positions are used directly.
+    """
+    vae_sf = getattr(pipe, "vae_scale_factor", 8)
+    n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+
+    orig_procs  = pipe.transformer.attn_processors
+    inject_proc = _CollageKVInject(
+        n_gen=n_gen, target_zone=target_zone,
+        obj_strength=obj_strength, n_steps=num_steps,
+        cutoff_frac=cutoff_frac,
+    )
+    pipe.transformer.set_attn_processor(inject_proc)
+
+    def _step_callback(pipe_ref, step_index, timestep, callback_kwargs):
+        inject_proc._step  = step_index + 1
+        inject_proc._layer = 0
+        if bcg_callback is not None:
+            callback_kwargs = bcg_callback(pipe_ref, step_index, timestep, callback_kwargs)
+        return callback_kwargs
+
+    tensor_inputs = ["latents"] if bcg_callback is not None else []
+    gen = torch.Generator(device=pipe.device).manual_seed(seed)
+    result = pipe(
+        image=canvas, prompt=prompt,
+        num_inference_steps=num_steps, guidance_scale=guidance,
+        height=height, width=width, max_sequence_length=512,
+        generator=gen, output_type="pil",
+        callback_on_step_end=_step_callback,
+        callback_on_step_end_tensor_inputs=tensor_inputs,
+    ).images[0]
+
+    pipe.transformer.set_attn_processor(orig_procs)
+    return result
+
+
 # ── Sobel edge extraction (mirrors AnyDoor's sobel()) ────────────────────────
 
 def _sobel_map(img: np.ndarray, mask: np.ndarray, thresh: int = 30) -> np.ndarray:
@@ -964,16 +1109,11 @@ def run_collage_chain(
         )
 
         if use_kv:
-            vae_sf   = getattr(pipe, "vae_scale_factor", 8)
-            h_lat    = height // (vae_sf * 2)
-            w_lat    = width  // (vae_sf * 2)
-            tok_mask = _obj_token_mask(obj_img, h_lat, w_lat)
-            pct      = 100.0 * tok_mask.mean()
-            print(f"      obj token mask: {tok_mask.sum()} / {h_lat*w_lat} ({pct:.1f}%)")
             target_zone = _placement_mask_to_token_zone(mask_path, height, width, pipe)
-            next_scene = run_with_kv_injection(
+            print(f"      Collage K/V zone: {target_zone.sum()} tokens ({100*target_zone.mean():.1f}%)")
+            next_scene = run_with_collage_kv_injection(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
-                obj_img=obj_img, obj_mask_np=tok_mask, target_zone=target_zone,
+                target_zone=target_zone,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
                 height=height, width=width,
                 obj_strength=obj_strength, cutoff_frac=cutoff_frac,
