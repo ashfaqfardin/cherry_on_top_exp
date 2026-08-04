@@ -91,14 +91,17 @@ def run_qwen(
     height: int, width: int,
     bcg_callback=None,
 ) -> Image.Image:
+    # Qwen uses true_cfg_scale (classifier-free guidance), not guidance_scale.
+    # A negative_prompt must be provided to activate CFG; without it the
+    # guidance_scale param is silently ignored.
     generator = torch.Generator(device=pipe.device).manual_seed(seed)
     cb_kwargs: dict = {}
     if bcg_callback is not None:
         cb_kwargs["callback_on_step_end"] = bcg_callback
         cb_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
     return pipe(
-        prompt=prompt, image=canvas,
-        num_inference_steps=num_steps, guidance_scale=guidance,
+        prompt=prompt, negative_prompt="", image=canvas,
+        num_inference_steps=num_steps, true_cfg_scale=guidance,
         height=height, width=width, generator=generator,
         **cb_kwargs,
     ).images[0]
@@ -335,15 +338,18 @@ def _make_bcg_latent_callback(
     scene_np = np.array(scene.convert("RGB"), dtype=np.float32) / 255.0
     scene_t  = torch.from_numpy(scene_np).permute(2, 0, 1).unsqueeze(0)
     scene_t  = (scene_t * 2.0 - 1.0).to(dtype)
+    # Wan2.1-based VAE expects (B, C, T, H, W); add temporal dim T=1 for images
+    scene_t  = scene_t.unsqueeze(2)
 
     with torch.no_grad():
         enc_dev = next(pipe.vae.parameters()).device
-        z0 = pipe.vae.encode(scene_t.to(enc_dev)).latent_dist.sample()
+        z0_raw = pipe.vae.encode(scene_t.to(enc_dev)).latent_dist.sample()
         # Read shift/scale from config — Qwen's Wan2.1 VAE differs from FLUX
         sf    = getattr(pipe.vae.config, "shift_factor",   0.0)
         scale = getattr(pipe.vae.config, "scaling_factor", 1.0)
-        z0 = (z0 - sf) * scale
-    z0 = z0.to(device, dtype)
+        z0_raw = (z0_raw - sf) * scale
+    # z0_raw is (1, C, 1, H_lat, W_lat); squeeze T — denoising latents are 4D
+    z0 = z0_raw.squeeze(2).to(device, dtype)
 
     # Infer latent spatial dims from the actual encoded z0 (robust to any VAE stride)
     lat_h, lat_w = z0.shape[-2], z0.shape[-1]
