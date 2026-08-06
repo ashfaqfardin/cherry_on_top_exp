@@ -550,9 +550,10 @@ class _QwenKVCapture:
         if len(zone_np) > 0 and int(zone_np.max()) < S_tot:
             zone_t = torch.from_numpy(zone_np).to(k.device)
             # k/v are (B, S, H, D) — index along dim 1
+            # nan_to_num guards against NaN from early high-sigma scheduler steps
             self.kv[self._layer] = (
-                k[0:1, zone_t, :, :].detach().cpu(),  # (1, n_zone, H, D)
-                v[0:1, zone_t, :, :].detach().cpu(),
+                torch.nan_to_num(k[0:1, zone_t, :, :].detach().cpu()),
+                torch.nan_to_num(v[0:1, zone_t, :, :].detach().cpu()),
             )
 
         self._layer += 1
@@ -641,13 +642,25 @@ def run_with_qwen_kv_injection(
     capture_proc = _QwenKVCapture(n_img=n_img, target_zone=target_zone)
     pipe.transformer.set_attn_processor(capture_proc)
 
-    # No negative_prompt → CFG disabled → batch stays at 1 (clean capture)
+    # num_inference_steps=1 causes sigma=1.0 → divide-by-zero in the scheduler
+    # (stretched_t = 1 - one_minus_z/scale_factor when one_minus_z=0) → NaN K/V.
+    # Use 20 steps so sigmas spread across (0,1) and avoid the boundary.
+    # A per-step callback resets _layer so keys 0-59 are overwritten each step;
+    # the final stored K/V come from the last (most denoised) step.
+    _CAP_STEPS = 20
+
+    def _capture_step_cb(pipe_ref, step_idx, timestep, cb_kwargs):
+        capture_proc._layer = 0
+        return cb_kwargs
+
     gen0 = torch.Generator(device=pipe.device).manual_seed(seed)
     pipe(
         image=collage, prompt=prompt,
-        num_inference_steps=1, true_cfg_scale=1.0,
+        num_inference_steps=_CAP_STEPS, true_cfg_scale=1.0,
         height=height, width=width,
         generator=gen0, output_type="latent",
+        callback_on_step_end=_capture_step_cb,
+        callback_on_step_end_tensor_inputs=[],
     )
     kv_ref = dict(capture_proc.kv)
     print(f"    [KV] Captured at {len(kv_ref)} / 60 layers  "
