@@ -537,8 +537,13 @@ class _QwenKVCapture:
         q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
             attn, hidden_states, encoder_hidden_states, kw
         )
-        # Image tokens are the last n_img positions in the joint sequence
-        img_off  = (txt_len if txt_len is not None else seq - self.n_img)
+        # Qwen editing: image sequence = [input_img_tokens (n_img) | target_tokens (n_img)]
+        # Capture K/V from input_img (the clean collage reference), not the target.
+        img_off  = (txt_len if txt_len is not None else seq - 2 * self.n_img)
+        if self._layer == 0:
+            S_img = hidden_states.shape[1]
+            print(f"[KV-cap] layer0 S_img={S_img} txt_len={txt_len} n_img={self.n_img} "
+                  f"seq={seq}  img_off={img_off}  expected_target_off={img_off + self.n_img}")
         zone_idx = torch.from_numpy(
             img_off + np.where(self.target_zone)[0]
         ).to(k.device)
@@ -553,7 +558,7 @@ class _QwenKVCapture:
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         self._layer += 1
         return _qwen_attn_output(
-            attn, out, txt_len if txt_len is not None else seq - self.n_img,
+            attn, out, txt_len if txt_len is not None else seq - 2 * self.n_img,
             encoder_hidden_states, B, seq, attn.heads, hd,
         )
 
@@ -582,7 +587,9 @@ class _QwenKVInject:
         q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
             attn, hidden_states, encoder_hidden_states, kw
         )
-        img_off = (txt_len if txt_len is not None else seq - self.n_img)
+        # Inject into NOISY TARGET tokens (positions after input_img tokens in the image sequence).
+        # Fallback (no text stream): seq - n_img = txt_len + 2*n_img - n_img = target start. ✓
+        img_off = (txt_len + self.n_img if txt_len is not None else seq - self.n_img)
 
         lo = int(self.cutoff_frac[0] * self.n_steps)
         hi = int(self.cutoff_frac[1] * self.n_steps)
@@ -607,7 +614,8 @@ class _QwenKVInject:
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         self._layer += 1
         return _qwen_attn_output(
-            attn, out, img_off, encoder_hidden_states, B, seq, attn.heads, hd,
+            attn, out, txt_len if txt_len is not None else seq - 2 * self.n_img,
+            encoder_hidden_states, B, seq, attn.heads, hd,
         )
 
 
