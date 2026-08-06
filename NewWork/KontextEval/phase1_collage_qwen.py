@@ -62,6 +62,13 @@ import torch.nn.functional as F
 from diffusers import QwenImageEditPlusPipeline
 from PIL import Image
 
+# dispatch_attention_fn is available in diffusers >= 0.33 (same version that ships Qwen support)
+try:
+    from diffusers.models.attention_dispatch import dispatch_attention_fn as _dispatch_attn
+    _HAS_DISPATCH = True
+except ImportError:
+    _HAS_DISPATCH = False
+
 
 # ── Pipeline loading ──────────────────────────────────────────────────────────
 
@@ -420,103 +427,99 @@ def _make_bcg_latent_callback(
 #   artifacts when clean reference K/V are injected at high-noise early steps.
 
 
-def _apply_complex_rope(
-    x: torch.Tensor,      # (B, S, H, D)  — S-major layout, NOT yet transposed
-    freqs: torch.Tensor,  # (S, D//2) complex64
-) -> torch.Tensor:
-    """
-    Qwen/Wan2.1 complex-valued RoPE.
-    freqs = (img_freqs, txt_freqs) is split by the caller; each is complex64
-    with shape (S, D//2).  x must be in (B, S, H, D) layout.
-    """
+def _apply_complex_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Complex-valued RoPE matching apply_rotary_emb_qwen(use_real=False).
+    x: (B, S, H, D),  freqs: (S, D//2) complex64."""
     x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    # (B, S, H, D//2) complex  *  (S, 1, D//2) complex  →  (B, S, H, D//2)
-    x_out = torch.view_as_real(x_c * freqs.unsqueeze(1).to(x_c.device)).flatten(-2)
-    return x_out.to(x.dtype)
+    x_out = torch.view_as_real(x_c * freqs.unsqueeze(1).to(x_c.device)).flatten(3)
+    return x_out.type_as(x)
 
 
-def _qwen_attn_forward(
+def _qwen_joint_qkv(
     attn,
-    hidden_states: torch.Tensor,                    # image tokens (B, S_img, D)
-    encoder_hidden_states: Optional[torch.Tensor],  # text tokens  (B, S_txt, D)
-    kwargs: dict,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[int], int, int, int]:
+    hidden_states: torch.Tensor,          # image tokens (B, S_img, D)
+    encoder_hidden_states: torch.Tensor,  # text tokens  (B, S_txt, D)
+    image_rotary_emb,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
-    Correct Qwen QKV projection + complex RoPE.
-    - Separate projection matrices per stream (to_q/k/v for image;
-      add_q/k/v_proj for text).
-    - Complex RoPE applied in (B, S, H, D) layout before transpose.
-    - Joint sequence is [txt, img] (text-first, Qwen convention).
-    Returns (q, k, v, txt_len, seq, B, hd) where q/k/v are (B, H, S_total, D).
+    Project + norm + RoPE for both streams, concat into joint (B, S_tot, H, D).
+    Layout stays (B, S, H, D) — matches QwenDoubleStreamAttnProcessor2_0 exactly.
+    Returns (q, k, v, S_txt).
     """
-    B     = hidden_states.shape[0]
-    S_img = hidden_states.shape[1]
-    hd    = hidden_states.shape[-1] // attn.heads
-    H     = attn.heads
+    H = attn.heads
 
-    # ── Image stream ─────────────────────────────────────────────────────────
-    img_q = attn.to_q(hidden_states).view(B, S_img, H, hd)  # (B, S_img, H, D)
-    img_k = attn.to_k(hidden_states).view(B, S_img, H, hd)
-    img_v = attn.to_v(hidden_states).view(B, S_img, H, hd)
+    # Image stream
+    img_q = attn.to_q(hidden_states).unflatten(-1, (H, -1))
+    img_k = attn.to_k(hidden_states).unflatten(-1, (H, -1))
+    img_v = attn.to_v(hidden_states).unflatten(-1, (H, -1))
     if attn.norm_q is not None: img_q = attn.norm_q(img_q)
     if attn.norm_k is not None: img_k = attn.norm_k(img_k)
 
-    if encoder_hidden_states is not None:
-        # ── Text stream ───────────────────────────────────────────────────────
-        S_txt = encoder_hidden_states.shape[1]
-        txt_q = attn.add_q_proj(encoder_hidden_states).view(B, S_txt, H, hd)
-        txt_k = attn.add_k_proj(encoder_hidden_states).view(B, S_txt, H, hd)
-        txt_v = attn.add_v_proj(encoder_hidden_states).view(B, S_txt, H, hd)
-        if hasattr(attn, "norm_added_q") and attn.norm_added_q is not None:
-            txt_q = attn.norm_added_q(txt_q)
-        if hasattr(attn, "norm_added_k") and attn.norm_added_k is not None:
-            txt_k = attn.norm_added_k(txt_k)
+    # Text stream
+    S_txt = encoder_hidden_states.shape[1]
+    txt_q = attn.add_q_proj(encoder_hidden_states).unflatten(-1, (H, -1))
+    txt_k = attn.add_k_proj(encoder_hidden_states).unflatten(-1, (H, -1))
+    txt_v = attn.add_v_proj(encoder_hidden_states).unflatten(-1, (H, -1))
+    if attn.norm_added_q is not None: txt_q = attn.norm_added_q(txt_q)
+    if attn.norm_added_k is not None: txt_k = attn.norm_added_k(txt_k)
 
-        # ── Complex RoPE (separate freqs per stream) ──────────────────────────
-        rot = kwargs.get("image_rotary_emb")
-        if rot is not None:
-            img_freqs, txt_freqs = rot
-            img_q = _apply_complex_rope(img_q, img_freqs)
-            img_k = _apply_complex_rope(img_k, img_freqs)
-            txt_q = _apply_complex_rope(txt_q, txt_freqs)
-            txt_k = _apply_complex_rope(txt_k, txt_freqs)
+    # Complex RoPE (separate freqs per stream)
+    if image_rotary_emb is not None:
+        img_freqs, txt_freqs = image_rotary_emb
+        img_q = _apply_complex_rope(img_q, img_freqs)
+        img_k = _apply_complex_rope(img_k, img_freqs)
+        txt_q = _apply_complex_rope(txt_q, txt_freqs)
+        txt_k = _apply_complex_rope(txt_k, txt_freqs)
 
-        # ── [txt, img] concat then transpose for SDPA ─────────────────────────
-        q = torch.cat([txt_q, img_q], dim=1).transpose(1, 2)  # (B, H, S_tot, D)
-        k = torch.cat([txt_k, img_k], dim=1).transpose(1, 2)
-        v = torch.cat([txt_v, img_v], dim=1).transpose(1, 2)
-        txt_len = S_txt
+    # Joint [txt, img] — (B, S_tot, H, D), NO transpose
+    q = torch.cat([txt_q, img_q], dim=1)
+    k = torch.cat([txt_k, img_k], dim=1)
+    v = torch.cat([txt_v, img_v], dim=1)
+    return q, k, v, S_txt
+
+
+def _qwen_joint_out(
+    attn,
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    S_txt: int,
+    encoder_hidden_states_mask,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Attention + output projections matching QwenDoubleStreamAttnProcessor2_0.
+    Builds attention mask from encoder padding mask to exclude padding tokens.
+    Returns (img_out, txt_out).
+    """
+    B = q.shape[0]
+    S_tot = q.shape[1]
+
+    # Build additive attention mask from text padding mask
+    attn_mask = None
+    if encoder_hidden_states_mask is not None:
+        S_img = S_tot - S_txt
+        img_ok = torch.ones((B, S_img), dtype=torch.bool, device=q.device)
+        joint_mask = torch.cat([encoder_hidden_states_mask.bool(), img_ok], dim=1)
+        attn_mask = joint_mask[:, None, None, :]  # (B, 1, 1, S_tot)
+
+    if _HAS_DISPATCH:
+        out = _dispatch_attn(q, k, v, attn_mask=attn_mask)
+        out = out.flatten(2, 3).to(q.dtype)  # (B, S_tot, H*D)
     else:
-        rot = kwargs.get("image_rotary_emb")
-        if rot is not None:
-            img_freqs = rot[0] if isinstance(rot, (tuple, list)) else rot
-            img_q = _apply_complex_rope(img_q, img_freqs)
-            img_k = _apply_complex_rope(img_k, img_freqs)
-        q = img_q.transpose(1, 2)
-        k = img_k.transpose(1, 2)
-        v = img_v.transpose(1, 2)
-        txt_len = None
+        # Fallback: SDPA with (B, H, S, D) layout
+        q2 = q.transpose(1, 2)
+        k2 = k.transpose(1, 2)
+        v2 = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+        )
+        out = out.transpose(1, 2).flatten(2, 3).to(q.dtype)  # (B, S_tot, H*D)
 
-    seq = q.shape[2]
-    return q, k, v, txt_len, seq, B, hd
-
-
-def _qwen_attn_output(attn, out, txt_len, encoder_hidden_states, B, seq, heads, hd):
-    """Shared output projection. Mirrors how FLUX double/single blocks work."""
-    out = out.transpose(1, 2).reshape(B, seq, heads * hd).to(out.dtype)
-    if encoder_hidden_states is not None:
-        enc_out = out[:, :txt_len]
-        img_out = out[:, txt_len:]
-        img_out = attn.to_out[0](img_out)
-        if len(attn.to_out) > 1:
-            img_out = attn.to_out[1](img_out)
-        enc_out = attn.to_add_out(enc_out) if hasattr(attn, "to_add_out") else enc_out
-        return img_out, enc_out
-    else:
-        out = attn.to_out[0](out)
-        if len(attn.to_out) > 1:
-            out = attn.to_out[1](out)
-        return out
+    txt_out = out[:, :S_txt].contiguous()
+    img_out = out[:, S_txt:].contiguous()
+    img_out = attn.to_out[0](img_out)
+    if len(attn.to_out) > 1:
+        img_out = attn.to_out[1](img_out)
+    txt_out = attn.to_add_out(txt_out)
+    return img_out, txt_out
 
 
 class _QwenKVCapture:
@@ -533,34 +536,27 @@ class _QwenKVCapture:
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, encoder_hidden_states_mask=None,
                  image_rotary_emb=None, **kwargs):
-        kw = {**kwargs, "image_rotary_emb": image_rotary_emb}
-        q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
-            attn, hidden_states, encoder_hidden_states, kw
-        )
-        # Qwen editing: image sequence = [input_img_tokens (n_img) | target_tokens (n_img)]
-        # Capture K/V from input_img (the clean collage reference), not the target.
-        img_off  = (txt_len if txt_len is not None else seq - 2 * self.n_img)
-        if self._layer == 0:
-            S_img = hidden_states.shape[1]
-            print(f"[KV-cap] layer0 S_img={S_img} txt_len={txt_len} n_img={self.n_img} "
-                  f"seq={seq}  img_off={img_off}  expected_target_off={img_off + self.n_img}")
-        zone_idx = torch.from_numpy(
-            img_off + np.where(self.target_zone)[0]
-        ).to(k.device)
+        q, k, v, S_txt = _qwen_joint_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
+        S_tot = q.shape[1]
 
-        if zone_idx.numel() > 0 and int(zone_idx.max()) < seq:
-            # Store from first batch element — avoids CFG-doubled-batch confusion
+        # Input image tokens: positions [S_txt .. S_txt+n_img)
+        img_off = S_txt
+        if self._layer == 0:
+            print(f"[KV-cap] layer0 S_img={hidden_states.shape[1]} S_txt={S_txt} "
+                  f"n_img={self.n_img} S_tot={S_tot}  img_off={img_off}  "
+                  f"target_off={img_off + self.n_img}")
+
+        zone_np = img_off + np.where(self.target_zone)[0]
+        if len(zone_np) > 0 and int(zone_np.max()) < S_tot:
+            zone_t = torch.from_numpy(zone_np).to(k.device)
+            # k/v are (B, S, H, D) — index along dim 1
             self.kv[self._layer] = (
-                k[0:1, :, zone_idx, :].detach().cpu(),
-                v[0:1, :, zone_idx, :].detach().cpu(),
+                k[0:1, zone_t, :, :].detach().cpu(),  # (1, n_zone, H, D)
+                v[0:1, zone_t, :, :].detach().cpu(),
             )
 
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         self._layer += 1
-        return _qwen_attn_output(
-            attn, out, txt_len if txt_len is not None else seq - 2 * self.n_img,
-            encoder_hidden_states, B, seq, attn.heads, hd,
-        )
+        return _qwen_joint_out(attn, q, k, v, S_txt, encoder_hidden_states_mask)
 
 
 class _QwenKVInject:
@@ -583,40 +579,32 @@ class _QwenKVInject:
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, encoder_hidden_states_mask=None,
                  image_rotary_emb=None, **kwargs):
-        kw = {**kwargs, "image_rotary_emb": image_rotary_emb}
-        q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
-            attn, hidden_states, encoder_hidden_states, kw
-        )
-        # Inject into NOISY TARGET tokens (positions after input_img tokens in the image sequence).
-        # Fallback (no text stream): seq - n_img = txt_len + 2*n_img - n_img = target start. ✓
-        img_off = (txt_len + self.n_img if txt_len is not None else seq - self.n_img)
+        q, k, v, S_txt = _qwen_joint_qkv(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
+        S_tot = q.shape[1]
+        B = q.shape[0]
 
+        # Target tokens: positions [S_txt+n_img .. S_txt+2*n_img)
+        target_off = S_txt + self.n_img
         lo = int(self.cutoff_frac[0] * self.n_steps)
         hi = int(self.cutoff_frac[1] * self.n_steps)
 
         if lo <= self._step < hi and self._layer in self.kv_ref:
-            zone_idx = torch.from_numpy(
-                img_off + np.where(self.target_zone)[0]
-            ).to(k.device)
-
-            if zone_idx.numel() > 0 and int(zone_idx.max()) < seq:
+            zone_np = target_off + np.where(self.target_zone)[0]
+            if len(zone_np) > 0 and int(zone_np.max()) < S_tot:
+                zone_t = torch.from_numpy(zone_np).to(k.device)
                 k_ref, v_ref = self.kv_ref[self._layer]
-                # Expand to full batch (handles CFG-doubled batch during denoising)
+                # k_ref/v_ref are (1, n_zone, H, D); expand to full batch
                 k_ref = k_ref.expand(B, -1, -1, -1).to(k.device, k.dtype)
                 v_ref = v_ref.expand(B, -1, -1, -1).to(v.device, v.dtype)
-
                 s = self.obj_strength
                 k = k.clone()
                 v = v.clone()
-                k[:, :, zone_idx, :] = (1 - s) * k[:, :, zone_idx, :] + s * k_ref
-                v[:, :, zone_idx, :] = (1 - s) * v[:, :, zone_idx, :] + s * v_ref
+                # k/v are (B, S, H, D) — index along dim 1
+                k[:, zone_t, :, :] = (1 - s) * k[:, zone_t, :, :] + s * k_ref
+                v[:, zone_t, :, :] = (1 - s) * v[:, zone_t, :, :] + s * v_ref
 
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         self._layer += 1
-        return _qwen_attn_output(
-            attn, out, txt_len if txt_len is not None else seq - 2 * self.n_img,
-            encoder_hidden_states, B, seq, attn.heads, hd,
-        )
+        return _qwen_joint_out(attn, q, k, v, S_txt, encoder_hidden_states_mask)
 
 
 @torch.no_grad()
