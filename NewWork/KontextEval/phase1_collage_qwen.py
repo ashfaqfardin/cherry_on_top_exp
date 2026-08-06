@@ -50,7 +50,7 @@ import argparse
 import gc
 import json
 import os
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib
@@ -58,6 +58,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers import QwenImageEditPlusPipeline
 from PIL import Image
 
@@ -201,6 +202,19 @@ def _bbox_from_placement_mask(
     x2 = min(width,  int((xs.max() + 1) * width  / mw))
     y2 = min(height, int((ys.max() + 1) * height / mh))
     return x1, y1, x2, y2
+
+
+# ── Placement mask → flat token zone ─────────────────────────────────────────
+
+def _placement_mask_to_token_zone(mask_path: str, height: int, width: int,
+                                   pipe) -> np.ndarray:
+    """Convert placement mask to flat bool array (n_img,) at token resolution."""
+    vae_sf       = getattr(pipe, "vae_scale_factor", 8)
+    h_tok, w_tok = height // (vae_sf * 2), width // (vae_sf * 2)
+    mask_down    = Image.open(mask_path).convert("L").resize((w_tok, h_tok), Image.Resampling.NEAREST)
+    zone = (np.array(mask_down) > 127).reshape(-1)
+    print(f"    [KV-zone] {zone.sum()} / {h_tok * w_tok} tokens ({100*zone.mean():.1f}%)")
+    return zone
 
 
 # ── Sobel edge extraction ─────────────────────────────────────────────────────
@@ -390,6 +404,245 @@ def _make_bcg_latent_callback(
     return _callback
 
 
+# ── Qwen collage K/V injection ───────────────────────────────────────────────
+#
+# Architecture:  hidden = [text_tokens | image_tokens]   (joint attention)
+#
+# Phase 1 — capture (1 forward pass, no CFG, near-clean collage):
+#   K, V at target_zone image-token positions are stored per layer.
+#   These encode the pasted object's appearance at the correct spatial position
+#   with matching RoPE coordinates → no positional collision.
+#
+# Phase 2 — denoising with injection (cutoff_frac window, default late steps):
+#   K[zone] = (1-s)*K + s*K_ref
+#   V[zone] = (1-s)*V + s*V_ref
+#   Late-step injection (sigma↓) avoids the clean/noisy mismatch that causes
+#   artifacts when clean reference K/V are injected at high-noise early steps.
+
+def _qwen_attn_forward(
+    attn,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: Optional[torch.Tensor],
+    kwargs: dict,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[int], int, int, int]:
+    """
+    Shared QKV projection + RoPE for both capture and inject processors.
+    Returns (q, k, v, txt_len, seq, B, hd).
+
+    Handles two layouts:
+      • Joint  (encoder_hidden_states is None):
+            hidden_states = [text | image],  txt_len returned as None
+      • Split (encoder_hidden_states is not None):
+            hidden_states = image tokens,  encoder = text tokens
+    """
+    B  = hidden_states.shape[0]
+    hd = hidden_states.shape[-1] // attn.heads
+
+    if encoder_hidden_states is not None:
+        full    = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        txt_len = encoder_hidden_states.shape[1]
+    else:
+        full    = hidden_states
+        # txt_len inferred by caller using n_img
+        txt_len = None
+
+    seq = full.shape[1]
+    q = attn.to_q(full).view(B, seq, attn.heads, hd).transpose(1, 2)
+    k = attn.to_k(full).view(B, seq, attn.heads, hd).transpose(1, 2)
+    v = attn.to_v(full).view(B, seq, attn.heads, hd).transpose(1, 2)
+    if attn.norm_q is not None: q = attn.norm_q(q)
+    if attn.norm_k is not None: k = attn.norm_k(k)
+
+    rot = kwargs.get("image_rotary_emb")
+    if rot is not None:
+        from diffusers.models.embeddings import apply_rotary_emb
+        q = apply_rotary_emb(q, rot)
+        k = apply_rotary_emb(k, rot)
+
+    return q, k, v, txt_len, seq, B, hd
+
+
+def _qwen_attn_output(attn, out, txt_len, encoder_hidden_states, B, seq, heads, hd):
+    """Shared output projection. Mirrors how FLUX double/single blocks work."""
+    out = out.transpose(1, 2).reshape(B, seq, heads * hd).to(out.dtype)
+    if encoder_hidden_states is not None:
+        enc_out = out[:, :txt_len]
+        img_out = out[:, txt_len:]
+        img_out = attn.to_out[0](img_out)
+        if len(attn.to_out) > 1:
+            img_out = attn.to_out[1](img_out)
+        enc_out = attn.to_add_out(enc_out) if hasattr(attn, "to_add_out") else enc_out
+        return img_out, enc_out
+    else:
+        out = attn.to_out[0](out)
+        if len(attn.to_out) > 1:
+            out = attn.to_out[1](out)
+        return out
+
+
+class _QwenKVCapture:
+    """
+    Attention processor: 1-pass capture of K/V at target zone image tokens.
+    Run once on the clean collage before denoising begins.
+    """
+    def __init__(self, n_img: int, target_zone: np.ndarray):
+        self.n_img       = n_img
+        self.target_zone = target_zone  # bool (n_img,)
+        self.kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._layer      = 0
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, **kwargs):
+        q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
+            attn, hidden_states, encoder_hidden_states, kwargs
+        )
+        # Image tokens are the last n_img positions in the joint sequence
+        img_off  = (txt_len if txt_len is not None else seq - self.n_img)
+        zone_idx = torch.from_numpy(
+            img_off + np.where(self.target_zone)[0]
+        ).to(k.device)
+
+        if zone_idx.numel() > 0 and int(zone_idx.max()) < seq:
+            # Store from first batch element — avoids CFG-doubled-batch confusion
+            self.kv[self._layer] = (
+                k[0:1, :, zone_idx, :].detach().cpu(),
+                v[0:1, :, zone_idx, :].detach().cpu(),
+            )
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        self._layer += 1
+        return _qwen_attn_output(
+            attn, out, txt_len if txt_len is not None else seq - self.n_img,
+            encoder_hidden_states, B, seq, attn.heads, hd,
+        )
+
+
+class _QwenKVInject:
+    """
+    Attention processor: injects captured collage K/V at target zone image
+    tokens during the active denoising window (cutoff_frac).
+    """
+    def __init__(self, n_img: int, target_zone: np.ndarray,
+                 kv_ref: dict, obj_strength: float,
+                 n_steps: int, cutoff_frac: Tuple[float, float]):
+        self.n_img        = n_img
+        self.target_zone  = target_zone
+        self.kv_ref       = kv_ref
+        self.obj_strength = obj_strength
+        self.n_steps      = n_steps
+        self.cutoff_frac  = cutoff_frac
+        self._layer = 0
+        self._step  = 0
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, **kwargs):
+        q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
+            attn, hidden_states, encoder_hidden_states, kwargs
+        )
+        img_off = (txt_len if txt_len is not None else seq - self.n_img)
+
+        lo = int(self.cutoff_frac[0] * self.n_steps)
+        hi = int(self.cutoff_frac[1] * self.n_steps)
+
+        if lo <= self._step < hi and self._layer in self.kv_ref:
+            zone_idx = torch.from_numpy(
+                img_off + np.where(self.target_zone)[0]
+            ).to(k.device)
+
+            if zone_idx.numel() > 0 and int(zone_idx.max()) < seq:
+                k_ref, v_ref = self.kv_ref[self._layer]
+                # Expand to full batch (handles CFG-doubled batch during denoising)
+                k_ref = k_ref.expand(B, -1, -1, -1).to(k.device, k.dtype)
+                v_ref = v_ref.expand(B, -1, -1, -1).to(v.device, v.dtype)
+
+                s = self.obj_strength
+                k = k.clone()
+                v = v.clone()
+                k[:, :, zone_idx, :] = (1 - s) * k[:, :, zone_idx, :] + s * k_ref
+                v[:, :, zone_idx, :] = (1 - s) * v[:, :, zone_idx, :] + s * v_ref
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        self._layer += 1
+        return _qwen_attn_output(
+            attn, out, img_off, encoder_hidden_states, B, seq, attn.heads, hd,
+        )
+
+
+@torch.no_grad()
+def run_with_qwen_kv_injection(
+    pipe,
+    collage:      Image.Image,
+    prompt:       str,
+    target_zone:  np.ndarray,
+    seed:         int,
+    num_steps:    int,
+    guidance:     float,
+    height:       int,
+    width:        int,
+    obj_strength: float = 0.7,
+    cutoff_frac:  Tuple[float, float] = (0.5, 1.0),
+    bcg_callback  = None,
+) -> Image.Image:
+    """
+    Phase 1 — 1-step capture pass (no CFG, batch=1):
+        collage → Qwen transformer → K,V at target zone image tokens per layer
+
+    Phase 2 — full denoising with injection:
+        Within cutoff_frac steps, blend captured K,V into live image tokens
+        at target zone positions.  Default window is the late 50% of steps
+        (sigma↓) where the latent is close to clean — matching the noise level
+        of the captured K,V and avoiding early-step artifacts.
+    """
+    vae_sf = getattr(pipe, "vae_scale_factor", 8)
+    n_img  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+
+    orig_procs = pipe.transformer.attn_processors
+
+    # ── Phase 1: capture ─────────────────────────────────────────────────────
+    capture_proc = _QwenKVCapture(n_img=n_img, target_zone=target_zone)
+    pipe.transformer.set_attn_processor(capture_proc)
+
+    # No negative_prompt → CFG disabled → batch stays at 1 (clean capture)
+    gen0 = torch.Generator(device=pipe.device).manual_seed(seed)
+    pipe(
+        image=collage, prompt=prompt,
+        num_inference_steps=1, true_cfg_scale=1.0,
+        height=height, width=width,
+        generator=gen0, output_type="latent",
+    )
+    kv_ref = dict(capture_proc.kv)
+    print(f"    [KV] Captured at {len(kv_ref)} / 60 layers  "
+          f"zone={target_zone.sum()} tokens ({100*target_zone.mean():.1f}%)")
+
+    # ── Phase 2: denoising with injection ─────────────────────────────────────
+    inject_proc = _QwenKVInject(
+        n_img=n_img, target_zone=target_zone, kv_ref=kv_ref,
+        obj_strength=obj_strength, n_steps=num_steps, cutoff_frac=cutoff_frac,
+    )
+    pipe.transformer.set_attn_processor(inject_proc)
+
+    def _step_cb(pipe_ref, step_idx, timestep, cb_kwargs):
+        inject_proc._step  = step_idx + 1
+        inject_proc._layer = 0
+        if bcg_callback is not None:
+            cb_kwargs = bcg_callback(pipe_ref, step_idx, timestep, cb_kwargs)
+        return cb_kwargs
+
+    tensor_inputs = ["latents"] if bcg_callback is not None else []
+    gen1 = torch.Generator(device=pipe.device).manual_seed(seed)
+    result = pipe(
+        image=collage, prompt=prompt,
+        negative_prompt="blurry, distorted, low quality, watermark, text, artifacts",
+        num_inference_steps=num_steps, true_cfg_scale=guidance,
+        height=height, width=width, generator=gen1,
+        callback_on_step_end=_step_cb,
+        callback_on_step_end_tensor_inputs=tensor_inputs,
+    ).images[0]
+
+    pipe.transformer.set_attn_processor(orig_procs)
+    return result
+
+
 # ── Main incremental pipeline ─────────────────────────────────────────────────
 
 def run_collage_chain(
@@ -406,6 +659,9 @@ def run_collage_chain(
     width:          int,
     out_dir:        str,
     device:         str,
+    use_kv:         bool = False,
+    obj_strength:   float = 0.7,
+    cutoff_frac:    Tuple[float, float] = (0.5, 1.0),
 ) -> List[Image.Image]:
     results = [base]
     scene   = base
@@ -491,11 +747,24 @@ def run_collage_chain(
             height=height, width=width, device=device, dtype=pipe_dtype,
         )
 
-        next_scene = run_qwen(
-            pipe=pipe, canvas=collage_scene, prompt=blend_p,
-            seed=seed, num_steps=num_steps, guidance=scene_guidance,
-            height=height, width=width, bcg_callback=bcg_cb,
-        )
+        if use_kv:
+            target_zone = _placement_mask_to_token_zone(mask_path, height, width, pipe)
+            print(f"      K/V zone: {target_zone.sum()} tokens  "
+                  f"strength={obj_strength}  cutoff={cutoff_frac}")
+            next_scene = run_with_qwen_kv_injection(
+                pipe=pipe, collage=collage_scene, prompt=blend_p,
+                target_zone=target_zone,
+                seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                height=height, width=width,
+                obj_strength=obj_strength, cutoff_frac=cutoff_frac,
+                bcg_callback=bcg_cb,
+            )
+        else:
+            next_scene = run_qwen(
+                pipe=pipe, canvas=collage_scene, prompt=blend_p,
+                seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                height=height, width=width, bcg_callback=bcg_cb,
+            )
 
         result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
         next_scene.save(result_path)
@@ -553,6 +822,12 @@ def parse_args():
     p.add_argument("--height",       type=int, default=1024)
     p.add_argument("--width",        type=int, default=1024)
     p.add_argument("--device",       default="cuda")
+    p.add_argument("--use_kv",       action="store_true",
+                   help="Enable collage K/V injection for object appearance preservation.")
+    p.add_argument("--obj_strength", type=float, default=0.7,
+                   help="K/V injection strength (0-1). Default 0.7.")
+    p.add_argument("--cutoff_frac",  default="0.5,1.0",
+                   help="Injection active window as 'start,end' fractions. Default '0.5,1.0'.")
     p.add_argument("--cpu_offload",  action="store_true",
                    help="Enable model CPU offload. Use if VRAM < 45 GB.")
     return p.parse_args()
@@ -577,6 +852,9 @@ def main():
     print(f"  Sketch dir   : {args.sketch_dir}")
     print(f"  Collage mode : {args.collage_mode}")
     print(f"  Guidance     : obj={args.lora_guidance}  scene={args.guidance}")
+    print(f"  KV injection : {args.use_kv}"
+          + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
+             if args.use_kv else ""))
     print(f"  Steps        : {args.num_steps}")
     print(f"  CPU offload  : {args.cpu_offload}")
     print(f"  Output       : {args.out_dir}")
@@ -602,6 +880,9 @@ def main():
     base.save(os.path.join(args.out_dir, "base_scene.png"))
     print(f"  Saved: base_scene.png")
 
+    _cf = [float(x) for x in args.cutoff_frac.split(",")]
+    cutoff_frac: Tuple[float, float] = (_cf[0], _cf[1])
+
     results = run_collage_chain(
         pipe=pipe, base=base, edits=edits,
         sketch_dir=args.sketch_dir,
@@ -611,6 +892,9 @@ def main():
         collage_mode=args.collage_mode,
         height=args.height, width=args.width,
         out_dir=args.out_dir, device=args.device,
+        use_kv=args.use_kv,
+        obj_strength=args.obj_strength,
+        cutoff_frac=cutoff_frac,
     )
 
     all_imgs = results
