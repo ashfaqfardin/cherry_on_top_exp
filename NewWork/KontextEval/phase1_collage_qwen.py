@@ -100,7 +100,9 @@ def run_qwen(
         cb_kwargs["callback_on_step_end"] = bcg_callback
         cb_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
     return pipe(
-        prompt=prompt, negative_prompt="", image=canvas,
+        prompt=prompt,
+        negative_prompt="blurry, distorted, low quality, watermark, text, artifacts",
+        image=canvas,
         num_inference_steps=num_steps, true_cfg_scale=guidance,
         height=height, width=width, generator=generator,
         **cb_kwargs,
@@ -150,7 +152,8 @@ def generate_from_sketch(
     generator = torch.Generator(device=device).manual_seed(seed)
     return pipe(
         image=sketch_pil, prompt=prompt,
-        num_inference_steps=num_steps, guidance_scale=guidance,
+        negative_prompt="blurry, distorted, low quality, watermark, text, artifacts",
+        num_inference_steps=num_steps, true_cfg_scale=guidance,
         height=height, width=width, generator=generator,
     ).images[0]
 
