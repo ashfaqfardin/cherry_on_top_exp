@@ -419,46 +419,85 @@ def _make_bcg_latent_callback(
 #   Late-step injection (sigma↓) avoids the clean/noisy mismatch that causes
 #   artifacts when clean reference K/V are injected at high-noise early steps.
 
+
+def _apply_complex_rope(
+    x: torch.Tensor,      # (B, S, H, D)  — S-major layout, NOT yet transposed
+    freqs: torch.Tensor,  # (S, D//2) complex64
+) -> torch.Tensor:
+    """
+    Qwen/Wan2.1 complex-valued RoPE.
+    freqs = (img_freqs, txt_freqs) is split by the caller; each is complex64
+    with shape (S, D//2).  x must be in (B, S, H, D) layout.
+    """
+    x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    # (B, S, H, D//2) complex  *  (S, 1, D//2) complex  →  (B, S, H, D//2)
+    x_out = torch.view_as_real(x_c * freqs.unsqueeze(1).to(x_c.device)).flatten(-2)
+    return x_out.to(x.dtype)
+
+
 def _qwen_attn_forward(
     attn,
-    hidden_states: torch.Tensor,
-    encoder_hidden_states: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,                    # image tokens (B, S_img, D)
+    encoder_hidden_states: Optional[torch.Tensor],  # text tokens  (B, S_txt, D)
     kwargs: dict,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[int], int, int, int]:
     """
-    Shared QKV projection + RoPE for both capture and inject processors.
-    Returns (q, k, v, txt_len, seq, B, hd).
-
-    Handles two layouts:
-      • Joint  (encoder_hidden_states is None):
-            hidden_states = [text | image],  txt_len returned as None
-      • Split (encoder_hidden_states is not None):
-            hidden_states = image tokens,  encoder = text tokens
+    Correct Qwen QKV projection + complex RoPE.
+    - Separate projection matrices per stream (to_q/k/v for image;
+      add_q/k/v_proj for text).
+    - Complex RoPE applied in (B, S, H, D) layout before transpose.
+    - Joint sequence is [txt, img] (text-first, Qwen convention).
+    Returns (q, k, v, txt_len, seq, B, hd) where q/k/v are (B, H, S_total, D).
     """
-    B  = hidden_states.shape[0]
-    hd = hidden_states.shape[-1] // attn.heads
+    B     = hidden_states.shape[0]
+    S_img = hidden_states.shape[1]
+    hd    = hidden_states.shape[-1] // attn.heads
+    H     = attn.heads
+
+    # ── Image stream ─────────────────────────────────────────────────────────
+    img_q = attn.to_q(hidden_states).view(B, S_img, H, hd)  # (B, S_img, H, D)
+    img_k = attn.to_k(hidden_states).view(B, S_img, H, hd)
+    img_v = attn.to_v(hidden_states).view(B, S_img, H, hd)
+    if attn.norm_q is not None: img_q = attn.norm_q(img_q)
+    if attn.norm_k is not None: img_k = attn.norm_k(img_k)
 
     if encoder_hidden_states is not None:
-        full    = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-        txt_len = encoder_hidden_states.shape[1]
+        # ── Text stream ───────────────────────────────────────────────────────
+        S_txt = encoder_hidden_states.shape[1]
+        txt_q = attn.add_q_proj(encoder_hidden_states).view(B, S_txt, H, hd)
+        txt_k = attn.add_k_proj(encoder_hidden_states).view(B, S_txt, H, hd)
+        txt_v = attn.add_v_proj(encoder_hidden_states).view(B, S_txt, H, hd)
+        if hasattr(attn, "norm_added_q") and attn.norm_added_q is not None:
+            txt_q = attn.norm_added_q(txt_q)
+        if hasattr(attn, "norm_added_k") and attn.norm_added_k is not None:
+            txt_k = attn.norm_added_k(txt_k)
+
+        # ── Complex RoPE (separate freqs per stream) ──────────────────────────
+        rot = kwargs.get("image_rotary_emb")
+        if rot is not None:
+            img_freqs, txt_freqs = rot
+            img_q = _apply_complex_rope(img_q, img_freqs)
+            img_k = _apply_complex_rope(img_k, img_freqs)
+            txt_q = _apply_complex_rope(txt_q, txt_freqs)
+            txt_k = _apply_complex_rope(txt_k, txt_freqs)
+
+        # ── [txt, img] concat then transpose for SDPA ─────────────────────────
+        q = torch.cat([txt_q, img_q], dim=1).transpose(1, 2)  # (B, H, S_tot, D)
+        k = torch.cat([txt_k, img_k], dim=1).transpose(1, 2)
+        v = torch.cat([txt_v, img_v], dim=1).transpose(1, 2)
+        txt_len = S_txt
     else:
-        full    = hidden_states
-        # txt_len inferred by caller using n_img
+        rot = kwargs.get("image_rotary_emb")
+        if rot is not None:
+            img_freqs = rot[0] if isinstance(rot, (tuple, list)) else rot
+            img_q = _apply_complex_rope(img_q, img_freqs)
+            img_k = _apply_complex_rope(img_k, img_freqs)
+        q = img_q.transpose(1, 2)
+        k = img_k.transpose(1, 2)
+        v = img_v.transpose(1, 2)
         txt_len = None
 
-    seq = full.shape[1]
-    q = attn.to_q(full).view(B, seq, attn.heads, hd).transpose(1, 2)
-    k = attn.to_k(full).view(B, seq, attn.heads, hd).transpose(1, 2)
-    v = attn.to_v(full).view(B, seq, attn.heads, hd).transpose(1, 2)
-    if attn.norm_q is not None: q = attn.norm_q(q)
-    if attn.norm_k is not None: k = attn.norm_k(k)
-
-    rot = kwargs.get("image_rotary_emb")
-    if rot is not None:
-        from diffusers.models.embeddings import apply_rotary_emb
-        q = apply_rotary_emb(q, rot)
-        k = apply_rotary_emb(k, rot)
-
+    seq = q.shape[2]
     return q, k, v, txt_len, seq, B, hd
 
 
