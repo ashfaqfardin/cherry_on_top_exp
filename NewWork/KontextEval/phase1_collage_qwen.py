@@ -492,9 +492,11 @@ class _QwenKVCapture:
         self._layer      = 0
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
-                 attention_mask=None, **kwargs):
+                 attention_mask=None, encoder_hidden_states_mask=None,
+                 image_rotary_emb=None, **kwargs):
+        kw = {**kwargs, "image_rotary_emb": image_rotary_emb}
         q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
-            attn, hidden_states, encoder_hidden_states, kwargs
+            attn, hidden_states, encoder_hidden_states, kw
         )
         # Image tokens are the last n_img positions in the joint sequence
         img_off  = (txt_len if txt_len is not None else seq - self.n_img)
@@ -535,9 +537,11 @@ class _QwenKVInject:
         self._step  = 0
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
-                 attention_mask=None, **kwargs):
+                 attention_mask=None, encoder_hidden_states_mask=None,
+                 image_rotary_emb=None, **kwargs):
+        kw = {**kwargs, "image_rotary_emb": image_rotary_emb}
         q, k, v, txt_len, seq, B, hd = _qwen_attn_forward(
-            attn, hidden_states, encoder_hidden_states, kwargs
+            attn, hidden_states, encoder_hidden_states, kw
         )
         img_off = (txt_len if txt_len is not None else seq - self.n_img)
 
