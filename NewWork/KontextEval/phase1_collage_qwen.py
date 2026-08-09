@@ -98,10 +98,10 @@ def run_qwen(
     seed: int, num_steps: int, guidance: float,
     height: int, width: int,
     bcg_callback=None,
+    negative_prompt: str = "blurry, distorted, low quality, watermark, text, artifacts",
 ) -> Image.Image:
-    # Qwen uses true_cfg_scale (classifier-free guidance), not guidance_scale.
-    # A negative_prompt must be provided to activate CFG; without it the
-    # guidance_scale param is silently ignored.
+    # true_cfg_scale activates CFG only when negative_prompt is also provided.
+    # guidance_scale is present in the signature but silently ignored by this checkpoint.
     generator = torch.Generator(device=pipe.device).manual_seed(seed)
     cb_kwargs: dict = {}
     if bcg_callback is not None:
@@ -109,7 +109,7 @@ def run_qwen(
         cb_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
     return pipe(
         prompt=prompt,
-        negative_prompt="blurry, distorted, low quality, watermark, text, artifacts",
+        negative_prompt=negative_prompt,
         image=canvas,
         num_inference_steps=num_steps, true_cfg_scale=guidance,
         height=height, width=width, generator=generator,
@@ -169,9 +169,13 @@ def generate_from_sketch(
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 EDITS: List[dict] = [
-    {"name": "bicycle", "description": "yellow mountain bicycle"},
-    {"name": "vase",    "description": "black ceramic vase with flowers"},
-    {"name": "ball",    "description": "yellow rubber ball"},
+    # ── Insertion ─────────────────────────────────────────────────────────────
+    {"name": "bicycle", "description": "yellow mountain bicycle",          "action": "insert"},
+    {"name": "vase",    "description": "black ceramic vase with flowers",  "action": "insert"},
+    {"name": "ball",    "description": "yellow rubber ball",               "action": "insert"},
+    # ── Removal ───────────────────────────────────────────────────────────────
+    {"name": "ball",    "description": "yellow rubber ball",               "action": "remove"},
+    {"name": "bicycle", "description": "yellow mountain bicycle",          "action": "remove"},
 ]
 BASE_PROMPT = (
     "A empty room with a wooden floor, white walls, "
@@ -323,6 +327,31 @@ def build_collage_scene(
     return Image.fromarray(collage_np), (y1, y2, x1, x2)
 
 
+# ── Removal collage builder ───────────────────────────────────────────────────
+
+def build_removal_collage(
+    scene:     Image.Image,
+    mask_path: str,
+    height:    int,
+    width:     int,
+    dilate_px: int = 8,
+) -> Image.Image:
+    """
+    Erase the object region with OpenCV Telea inpaint so Qwen sees a plausible
+    background where the object was.  BCG keeps everything outside the mask
+    pixel-identical to the original scene.
+    """
+    scene_np = np.array(scene.convert("RGB"))
+    mask_img = Image.open(mask_path).convert("L").resize((width, height), Image.NEAREST)
+    inpaint_mask = (np.array(mask_img) > 127).astype(np.uint8)
+    if dilate_px > 0:
+        k = dilate_px * 2 + 1
+        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((k, k), np.uint8), iterations=1)
+    inpainted = cv2.inpaint(scene_np, inpaint_mask, inpaintRadius=12, flags=cv2.INPAINT_TELEA)
+    print(f"    [REMOVAL] Telea inpaint: {int(inpaint_mask.sum())} px erased")
+    return Image.fromarray(inpainted)
+
+
 # ── Object footprint mask (used for BCG tight boundary) ──────────────────────
 
 def _collage_obj_mask(collage: Image.Image, scene: Image.Image,
@@ -367,13 +396,21 @@ def _make_bcg_latent_callback(
 
     with torch.no_grad():
         enc_dev = next(pipe.vae.parameters()).device
-        z0_raw = pipe.vae.encode(scene_t.to(enc_dev)).latent_dist.sample()
-        # Read shift/scale from config — Qwen's Wan2.1 VAE differs from FLUX
-        sf    = getattr(pipe.vae.config, "shift_factor",   0.0)
-        scale = getattr(pipe.vae.config, "scaling_factor", 1.0)
-        z0_raw = (z0_raw - sf) * scale
-    # z0_raw is (1, C, 1, H_lat, W_lat); squeeze T — denoising latents are 4D
-    z0 = z0_raw.squeeze(2).to(device, dtype)
+        # Use .mean (deterministic) — matches pipeline's sample_mode="argmax"
+        z0_raw = pipe.vae.encode(scene_t.to(enc_dev)).latent_dist.mean
+        z0_raw = z0_raw.squeeze(2)  # (1, 16, H_lat, W_lat) — remove T=1 dim
+
+    # Qwen VAE normalises per-channel with latents_mean / latents_std vectors.
+    # There is NO shift_factor / scaling_factor — falling back to (sf=0, scale=1)
+    # stores unnormalized latents while the denoising loop works with normalised
+    # ones, corrupting every BLD blend step.
+    latents_mean = torch.tensor(
+        pipe.vae.config.latents_mean, dtype=dtype, device=enc_dev
+    ).reshape(1, -1, 1, 1)
+    latents_std = torch.tensor(
+        pipe.vae.config.latents_std, dtype=dtype, device=enc_dev
+    ).reshape(1, -1, 1, 1)
+    z0 = ((z0_raw - latents_mean) / latents_std).to(device, dtype)
 
     # Infer latent spatial dims from the actual encoded z0 (robust to any VAE stride)
     lat_h, lat_w = z0.shape[-2], z0.shape[-1]
@@ -392,7 +429,7 @@ def _make_bcg_latent_callback(
     mask_tensor = torch.from_numpy(mask_soft).to(device, dtype)[None, None]
 
     print(f"    [BLD] VAE latent {lat_h}×{lat_w}  "
-          f"shift={sf:.4f}  scale={scale:.4f}  "
+          f"latents_mean[0]={pipe.vae.config.latents_mean[0]:.4f}  "
           f"edit zone={mask_soft.mean()*100:.1f}%")
 
     def _callback(_pipeline, _step_index, timestep, callback_kwargs):
@@ -451,11 +488,16 @@ def _make_obj_latent_composite_callback(
 
     with torch.no_grad():
         enc_dev = next(pipe.vae.parameters()).device
-        z_raw   = pipe.vae.encode(collage_t.to(enc_dev)).latent_dist.sample()
-        sf      = getattr(pipe.vae.config, "shift_factor",   0.0)
-        scale   = getattr(pipe.vae.config, "scaling_factor", 1.0)
-        z_raw   = (z_raw - sf) * scale
-    z_clean = z_raw.squeeze(2).to(device, dtype)   # (1, C, lat_h, lat_w)
+        z_raw   = pipe.vae.encode(collage_t.to(enc_dev)).latent_dist.mean
+        z_raw   = z_raw.squeeze(2)  # (1, 16, lat_h, lat_w)
+
+    latents_mean = torch.tensor(
+        pipe.vae.config.latents_mean, dtype=dtype, device=enc_dev
+    ).reshape(1, -1, 1, 1)
+    latents_std = torch.tensor(
+        pipe.vae.config.latents_std, dtype=dtype, device=enc_dev
+    ).reshape(1, -1, 1, 1)
+    z_clean = ((z_raw - latents_mean) / latents_std).to(device, dtype)
 
     lat_h, lat_w = z_clean.shape[-2], z_clean.shape[-1]
 
@@ -810,38 +852,15 @@ def run_collage_chain(
     scene   = base
 
     for i, edit in enumerate(edits):
-        name = edit["name"]
-        desc = edit["description"]
-
-        sketch_path = os.path.join(sketch_dir, f"{name}.png")
-        if not os.path.isfile(sketch_path):
-            sketch_path = os.path.join(sketch_dir, f"sketch_{name}.png")
-        if not os.path.isfile(sketch_path):
-            raise FileNotFoundError(
-                f"Sketch not found in {sketch_dir!r}. "
-                f"Expected '{name}.png' or 'sketch_{name}.png'."
-            )
+        name   = edit["name"]
+        desc   = edit["description"]
+        action = edit.get("action", "insert")
 
         print(f"\n{'─'*60}")
-        print(f"  Step {i+1}/{len(edits)}  —  {name}")
+        print(f"  Step {i+1}/{len(edits)}  —  {name}  [{action}]")
         print(f"{'─'*60}")
 
-        # Stage A: sketch → object image
-        obj_cache = os.path.join(out_dir, f"obj_gen_{name}.png")
-        if os.path.isfile(obj_cache):
-            print(f"  [A] Reusing cached obj_gen_{name}.png")
-            obj_img = Image.open(obj_cache).convert("RGB")
-        else:
-            print(f"  [A] Generating '{desc}' from sketch ...")
-            obj_img = generate_from_sketch(
-                pipe=pipe, sketch_path=sketch_path, description=desc,
-                seed=seed, num_steps=num_steps, guidance=obj_guidance,
-                height=height, width=width, device=device,
-            )
-            obj_img.save(obj_cache)
-            print(f"      Saved: obj_gen_{name}.png")
-
-        # Stage BBOX: placement mask required
+        # Stage BBOX: placement mask required for both insert and remove
         mask_path = os.path.join(sketch_dir, f"mask_{name}.png")
         if not os.path.isfile(mask_path):
             raise FileNotFoundError(
@@ -851,37 +870,94 @@ def run_collage_chain(
         print(f"  [BBOX] Placement mask: mask_{name}.png")
         bx1, by1, bx2, by2 = _bbox_from_placement_mask(mask_path, width, height)
         print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
-        with open(os.path.join(out_dir, f"bbox_{name}.txt"), "w") as f:
+        step_tag = f"{'remove' if action == 'remove' else 'step'}{i+1}_{name}"
+        with open(os.path.join(out_dir, f"bbox_{step_tag}.txt"), "w") as f:
             f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
-        # Stage MASK: extract object mask
-        ref_mask = _compute_obj_mask(obj_img)
-        n_px = ref_mask.sum()
-        print(f"  [MASK] Object pixels: {n_px} ({100*n_px/(height*width):.1f}%)")
-        if n_px < 50:
-            print("         Fallback: using center 50% crop as object region")
-            ref_mask = np.zeros((height, width), dtype=np.uint8)
-            ref_mask[height // 4:3 * height // 4, width // 4:3 * width // 4] = 1
+        if action == "insert":
+            # Stage A: sketch → object image
+            sketch_path = os.path.join(sketch_dir, f"{name}.png")
+            if not os.path.isfile(sketch_path):
+                sketch_path = os.path.join(sketch_dir, f"sketch_{name}.png")
+            if not os.path.isfile(sketch_path):
+                raise FileNotFoundError(
+                    f"Sketch not found in {sketch_dir!r}. "
+                    f"Expected '{name}.png' or 'sketch_{name}.png'."
+                )
+            obj_cache = os.path.join(out_dir, f"obj_gen_{name}.png")
+            if os.path.isfile(obj_cache):
+                print(f"  [A] Reusing cached obj_gen_{name}.png")
+                obj_img = Image.open(obj_cache).convert("RGB")
+            else:
+                print(f"  [A] Generating '{desc}' from sketch ...")
+                obj_img = generate_from_sketch(
+                    pipe=pipe, sketch_path=sketch_path, description=desc,
+                    seed=seed, num_steps=num_steps, guidance=obj_guidance,
+                    height=height, width=width, device=device,
+                )
+                obj_img.save(obj_cache)
+                print(f"      Saved: obj_gen_{name}.png")
 
-        # Stage COL: build collage
-        print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
-        collage_scene, _ = build_collage_scene(
-            scene=scene, obj_img=obj_img, ref_mask=ref_mask,
-            target_bbox=(bx1, by1, bx2, by2), collage_mode=collage_mode,
-        )
-        collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
-        print(f"      Saved collage: collage_{name}.png")
+            # Stage MASK: extract object silhouette
+            ref_mask = _compute_obj_mask(obj_img)
+            n_px = ref_mask.sum()
+            print(f"  [MASK] Object pixels: {n_px} ({100*n_px/(height*width):.1f}%)")
+            if n_px < 50:
+                print("         Fallback: using center 50% crop as object region")
+                ref_mask = np.zeros((height, width), dtype=np.uint8)
+                ref_mask[height // 4:3 * height // 4, width // 4:3 * width // 4] = 1
 
-        # Object footprint mask — tight BCG boundary
-        obj_mask_har = _collage_obj_mask(collage_scene, scene)
-        n_har = int(obj_mask_har.sum())
-        print(f"  [MASK] Object footprint: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
+            # Stage COL: paste object into scene
+            print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
+            collage_scene, _ = build_collage_scene(
+                scene=scene, obj_img=obj_img, ref_mask=ref_mask,
+                target_bbox=(bx1, by1, bx2, by2), collage_mode=collage_mode,
+            )
+            collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
+            print(f"      Saved: collage_{name}.png")
+
+            obj_mask_har = _collage_obj_mask(collage_scene, scene)
+            n_har = int(obj_mask_har.sum())
+            print(f"  [MASK] Object footprint: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
+
+            # Qwen instruction-following: declarative sentence works well for insertion
+            blend_p = f"A photorealistic room with a {desc} placed naturally on the floor."
+            neg_p   = "blurry, distorted, low quality, watermark, text, artifacts"
+
+        else:  # remove
+            print(f"  [A] Removal — skipping object generation")
+
+            # Stage COL: inpaint the object away as the Qwen reference image
+            print(f"  [COL] Building removal collage (Telea inpaint) ...")
+            collage_scene = build_removal_collage(
+                scene=scene, mask_path=mask_path, height=height, width=width
+            )
+            collage_scene.save(os.path.join(out_dir, f"collage_remove_{name}.png"))
+            print(f"      Saved: collage_remove_{name}.png")
+
+            # For BCG: use the placement mask as the edit boundary
+            _pmask_arr = np.array(
+                Image.open(mask_path).convert("L").resize((width, height), Image.NEAREST)
+            )
+            obj_mask_har = (_pmask_arr > 127).astype(np.uint8)
+            n_har = int(obj_mask_har.sum())
+            print(f"  [MASK] Removal zone: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
+
+            # Qwen is instruction-following — imperative style outperforms declarative for removal
+            blend_p = (
+                f"Remove the {desc} from the room completely. "
+                f"Fill the area with seamless wooden floor and white wall that match the surroundings. "
+                f"Keep all other parts of the room exactly the same."
+            )
+            # Adding the object to the negative prompt reinforces what to erase
+            neg_p = (
+                f"blurry, distorted, low quality, watermark, text, artifacts, {desc}"
+            )
 
         # Stage K: Qwen integration pass with BLD latent BCG
-        blend_p = f"A photorealistic room with a {desc} placed naturally."
-        print(f"  [K] Qwen integration pass ...")
-        print(f"      Prompt: {blend_p}")
-        with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
+        print(f"  [K] Qwen integration pass  action={action}  kv={use_kv} ...")
+        print(f"      Prompt: {blend_p[:120]}...")
+        with open(os.path.join(out_dir, f"prompt_{step_tag}.txt"), "w") as f:
             f.write(blend_p)
 
         pipe_dtype = next(pipe.transformer.parameters()).dtype
@@ -902,28 +978,35 @@ def run_collage_chain(
                 obj_strength=obj_strength, cutoff_frac=cutoff_frac,
                 bcg_callback=bcg_cb,
             )
-        else:
+        elif action == "insert":
+            # Object identity anchor only for insertion (not removal)
             anchor_cb = _make_obj_latent_composite_callback(
                 collage=collage_scene, obj_mask_har=obj_mask_har,
                 pipe=pipe, height=height, width=width,
                 device=device, dtype=pipe_dtype,
                 anchor_strength=obj_strength * 0.5,
             )
-            # BCG restores background (outside zone); anchor preserves object
-            # identity (inside zone). BCG first, anchor second.
             combined_cb = _compose_callbacks(bcg_cb, anchor_cb)
             next_scene = run_qwen(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
                 height=height, width=width, bcg_callback=combined_cb,
+                negative_prompt=neg_p,
+            )
+        else:  # remove, no kv
+            next_scene = run_qwen(
+                pipe=pipe, canvas=collage_scene, prompt=blend_p,
+                seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                height=height, width=width, bcg_callback=bcg_cb,
+                negative_prompt=neg_p,
             )
 
-        result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
+        result_path = os.path.join(out_dir, f"result_{step_tag}.png")
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
         # Stage BCG: pixel-space tight-mask composite
-        print(f"  [BCG] Object-tight background restore ...")
+        print(f"  [BCG] Background restore ...")
         bcg_mask = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=3)
         bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (41, 41), 15)
 
@@ -932,7 +1015,7 @@ def run_collage_chain(
         m3        = bcg_mask[:, :, None]
         bcg_np    = np.clip(result_np * m3 + scene_np * (1.0 - m3), 0, 255).astype(np.uint8)
         next_scene = Image.fromarray(bcg_np)
-        bcg_path = os.path.join(out_dir, f"result_bcg_{name}.png")
+        bcg_path   = os.path.join(out_dir, f"result_bcg_{step_tag}.png")
         next_scene.save(bcg_path)
         print(f"      Saved: {bcg_path}")
 
