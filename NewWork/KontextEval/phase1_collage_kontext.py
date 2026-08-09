@@ -270,9 +270,13 @@ def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
 
 # ── constants ─────────────────────────────────────────────────────────────────
 EDITS: List[dict] = [
-    {"name": "bicycle", "description": "yellow mountain bicycle"},
-    {"name": "vase",    "description": "black ceramic vase with flowers"},
-    {"name": "ball",    "description": "yellow rubber ball"},
+    # ── Insertion ─────────────────────────────────────────────────────────────
+    {"name": "bicycle", "description": "yellow mountain bicycle",          "action": "insert"},
+    {"name": "vase",    "description": "black ceramic vase with flowers",  "action": "insert"},
+    {"name": "ball",    "description": "yellow rubber ball",               "action": "insert"},
+    # ── Removal ───────────────────────────────────────────────────────────────
+    {"name": "ball",    "description": "yellow rubber ball",               "action": "remove"},
+    {"name": "bicycle", "description": "yellow mountain bicycle",          "action": "remove"},
 ]
 BASE_PROMPT = "A empty room with a wooden floor, white walls, and a window letting in natural light."
 LORA_ID     = "gokaygokay/Sketch-to-Image-Kontext-Dev-LoRA"
@@ -898,6 +902,33 @@ def build_collage_scene(
     return Image.fromarray(collage_np), (y1, y2, x1, x2)
 
 
+# ── Removal collage builder ───────────────────────────────────────────────────
+
+def build_removal_collage(
+    scene:     Image.Image,
+    mask_path: str,
+    height:    int,
+    width:     int,
+    dilate_px: int = 8,
+) -> Image.Image:
+    """
+    Erase the object region with OpenCV Telea inpaint so Kontext sees a plausible
+    background where the object was.  BCG keeps everything outside the mask
+    pixel-identical to the original scene.
+
+    dilate_px: expand the inpaint mask so object edges are also erased.
+    """
+    scene_np = np.array(scene.convert("RGB"))
+    mask_img = Image.open(mask_path).convert("L").resize((width, height), Image.NEAREST)
+    inpaint_mask = (np.array(mask_img) > 127).astype(np.uint8)
+    if dilate_px > 0:
+        k = dilate_px * 2 + 1
+        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((k, k), np.uint8), iterations=1)
+    inpainted = cv2.inpaint(scene_np, inpaint_mask, inpaintRadius=12, flags=cv2.INPAINT_TELEA)
+    print(f"    [REMOVAL] Telea inpaint: {int(inpaint_mask.sum())} px erased")
+    return Image.fromarray(inpainted)
+
+
 # ── Object footprint mask (used for BCG tight boundary) ──────────────────────
 
 
@@ -1029,32 +1060,15 @@ def run_collage_chain(
     scene   = base
 
     for i, edit in enumerate(edits):
-        name = edit["name"]
-        desc = edit["description"]
-
-        sketch_path = os.path.join(sketch_dir, f"{name}.png")
-        if not os.path.isfile(sketch_path):
-            sketch_path = os.path.join(sketch_dir, f"sketch_{name}.png")
-        if not os.path.isfile(sketch_path):
-            raise FileNotFoundError(
-                f"Sketch not found in {sketch_dir!r}. "
-                f"Expected '{name}.png' or 'sketch_{name}.png'."
-            )
+        name   = edit["name"]
+        desc   = edit["description"]
+        action = edit.get("action", "insert")
 
         print(f"\n{'─'*60}")
-        print(f"  Step {i+1}/{len(edits)}  —  {name}")
+        print(f"  Step {i+1}/{len(edits)}  —  {name}  [{action}]")
         print(f"{'─'*60}")
 
-        # Stage A: sketch → object image
-        print(f"  [A] Generating '{desc}' from sketch ...")
-        obj_img = generate_from_sketch(
-            pipe=pipe, sketch_path=sketch_path, description=desc,
-            seed=seed, num_steps=num_steps, guidance=lora_guidance,
-            height=height, width=width, lora_id=lora_id, device=device,
-        )
-        obj_img.save(os.path.join(out_dir, f"obj_gen_{name}.png"))
-
-        # Stage BBOX: placement mask required
+        # Stage BBOX: placement mask required for both insert and remove
         mask_path = os.path.join(sketch_dir, f"mask_{name}.png")
         if not os.path.isfile(mask_path):
             raise FileNotFoundError(
@@ -1064,44 +1078,89 @@ def run_collage_chain(
         print(f"  [BBOX] Placement mask: mask_{name}.png")
         bx1, by1, bx2, by2 = _bbox_from_placement_mask(mask_path, width, height)
         print(f"      bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
-        with open(os.path.join(out_dir, f"bbox_{name}.txt"), "w") as f:
+        with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
             f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
-        # Stage MASK: extract object mask
-        ref_mask = _compute_obj_mask(obj_img)
-        n_px = ref_mask.sum()
-        print(f"  [MASK] Object pixels: {n_px} ({100*n_px/(height*width):.1f}%)")
-        if n_px < 50:
-            print("         Fallback: using center 50% crop as object region")
-            ref_mask = np.zeros((height, width), dtype=np.uint8)
-            ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
+        if action == "insert":
+            # Stage A: sketch → object image
+            sketch_path = os.path.join(sketch_dir, f"{name}.png")
+            if not os.path.isfile(sketch_path):
+                sketch_path = os.path.join(sketch_dir, f"sketch_{name}.png")
+            if not os.path.isfile(sketch_path):
+                raise FileNotFoundError(
+                    f"Sketch not found in {sketch_dir!r}. "
+                    f"Expected '{name}.png' or 'sketch_{name}.png'."
+                )
+            print(f"  [A] Generating '{desc}' from sketch ...")
+            obj_img = generate_from_sketch(
+                pipe=pipe, sketch_path=sketch_path, description=desc,
+                seed=seed, num_steps=num_steps, guidance=lora_guidance,
+                height=height, width=width, lora_id=lora_id, device=device,
+            )
+            obj_img.save(os.path.join(out_dir, f"obj_gen_{name}.png"))
 
-        # Stage COL: build collage scene with posed object
-        print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
-        collage_scene, paste_box = build_collage_scene(
-            scene        = scene,
-            obj_img      = obj_img,
-            ref_mask     = ref_mask,
-            target_bbox  = (bx1, by1, bx2, by2),
-            collage_mode = collage_mode,
-        )
-        collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
-        print(f"      Saved collage: collage_{name}.png")
+            # Stage MASK: extract object silhouette
+            ref_mask = _compute_obj_mask(obj_img)
+            n_px = ref_mask.sum()
+            print(f"  [MASK] Object pixels: {n_px} ({100*n_px/(height*width):.1f}%)")
+            if n_px < 50:
+                print("         Fallback: using center 50% crop as object region")
+                ref_mask = np.zeros((height, width), dtype=np.uint8)
+                ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
 
-        # Object footprint mask — used by BCG to define the tight boundary
-        obj_mask_har = _collage_obj_mask(collage_scene, scene)
-        n_har = int(obj_mask_har.sum())
-        print(f"  [MASK] Object footprint: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
+            # Stage COL: paste object into scene
+            print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
+            collage_scene, _ = build_collage_scene(
+                scene        = scene,
+                obj_img      = obj_img,
+                ref_mask     = ref_mask,
+                target_bbox  = (bx1, by1, bx2, by2),
+                collage_mode = collage_mode,
+            )
+            collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
+            print(f"      Saved collage: collage_{name}.png")
+
+            obj_mask_har = _collage_obj_mask(collage_scene, scene)
+            n_har = int(obj_mask_har.sum())
+            print(f"  [MASK] Object footprint: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
+
+            blend_p = f"A photorealistic room with a {desc} placed naturally."
+
+        else:  # remove
+            print(f"  [A] Removal — skipping object generation")
+
+            # Stage COL: inpaint the object away as the Kontext reference
+            print(f"  [COL] Building removal collage (Telea inpaint) ...")
+            collage_scene = build_removal_collage(
+                scene=scene, mask_path=mask_path, height=height, width=width
+            )
+            collage_scene.save(os.path.join(out_dir, f"collage_remove_{name}.png"))
+            print(f"      Saved: collage_remove_{name}.png")
+
+            # For BCG: use the placement mask as the edit boundary
+            _pmask_arr = np.array(
+                Image.open(mask_path).convert("L").resize((width, height), Image.NEAREST)
+            )
+            obj_mask_har = (_pmask_arr > 127).astype(np.uint8)
+            n_har = int(obj_mask_har.sum())
+            print(f"  [MASK] Removal zone: {n_har} px ({100*n_har/obj_mask_har.size:.1f}%)")
+
+            blend_p = (
+                f"{BASE_PROMPT} "
+                f"The {desc} has been removed. "
+                f"Seamless wooden floor and white walls fill the area. "
+                f"No object, clean empty room."
+            )
 
         # Stage K: FLUX Kontext integration pass with latent-space BCG
-        blend_p = f"A photorealistic room with a {desc} placed naturally."
-        print(f"  [K] Kontext integration pass (kv={use_kv}) ...")
-        print(f"      Prompt: {blend_p[:100]}...")
-        with open(os.path.join(out_dir, f"blend_prompt_{name}.txt"), "w") as f:
+        step_tag = f"{'remove' if action == 'remove' else 'step'}{i+1}_{name}"
+        print(f"  [K] Kontext integration pass  action={action}  kv={use_kv} ...")
+        print(f"      Prompt: {blend_p[:120]}...")
+        with open(os.path.join(out_dir, f"prompt_{step_tag}.txt"), "w") as f:
             f.write(blend_p)
 
-        # BLD latent callback: inside placement mask Kontext generates freely,
-        # outside it converges to the original scene (pixel-identical at sigma=0).
+        # BLD latent callback: inside mask Kontext edits freely;
+        # outside it converges to original scene (pixel-identical at sigma=0).
         pipe_dtype = next(pipe.transformer.parameters()).dtype
         bcg_cb = _make_bcg_latent_callback(
             scene=scene, mask_path=mask_path, pipe=pipe,
@@ -1127,14 +1186,12 @@ def run_collage_chain(
                 bcg_callback=bcg_cb,
             )
 
-        result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
+        result_path = os.path.join(out_dir, f"result_{step_tag}.png")
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # Stage BCG: tight mask from actual object footprint.
-        # Boundary stays at the object edge so it never cuts through flat wall/floor.
-        # Dilation adds ~60 px buffer around the object to capture contact shadows.
-        print(f"  [BCG] Object-tight background restore ...")
+        # Stage BCG: restore background outside object zone
+        print(f"  [BCG] Background restore ...")
         bcg_mask = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=3)
         bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (41, 41), 15)
 
@@ -1143,7 +1200,7 @@ def run_collage_chain(
         m3        = bcg_mask[:, :, None]
         bcg_np    = np.clip(result_np * m3 + scene_np * (1.0 - m3), 0, 255).astype(np.uint8)
         next_scene = Image.fromarray(bcg_np)
-        bcg_path = os.path.join(out_dir, f"result_bcg_{name}.png")
+        bcg_path   = os.path.join(out_dir, f"result_bcg_{step_tag}.png")
         next_scene.save(bcg_path)
         print(f"      Saved: {bcg_path}")
 
