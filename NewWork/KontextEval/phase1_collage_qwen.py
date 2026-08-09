@@ -411,32 +411,43 @@ def _make_bcg_latent_callback(
     return _callback
 
 
-def _make_obj_anchor_callback(
+def _make_obj_latent_composite_callback(
     collage:         Image.Image,
-    mask_path:       str,
+    obj_mask_har:    np.ndarray,        # (H, W) uint8 {0,1} — silhouette in scene coords
     pipe,
     height:          int,
     width:           int,
     device:          str,
     dtype:           torch.dtype = torch.bfloat16,
-    anchor_strength: float = 0.4,
-    anchor_frac:     Tuple[float, float] = (0.3, 0.7),
+    anchor_strength: float = 0.5,
+    inject_frac:     Tuple[float, float] = (0.35, 0.55),
 ):
     """
-    Object identity anchoring — foreground counterpart to the BCG callback.
+    Per-step BLD latent compositing for object identity preservation.
 
-    Encodes the collage (object already pasted at its target position) and
-    during mid-denoising (sigma inside anchor_frac) softly blends the
-    noise-matched collage latent into the object zone, preventing the model
-    from drifting away from the reference appearance.
+    Four research-backed improvements over naive latent anchoring:
 
-    anchor_frac = (lo_sigma, hi_sigma): apply when timestep/1000 is in this
-    range.  Default (0.3, 0.7) = mid-denoising, after structure is set but
-    before fine details lock in.
+    1. Silhouette mask instead of bbox — bilinear downsample of obj_mask_har
+       (the pixel-diff footprint) to latent res, threshold 0.5.  Avoids pasting
+       grey neutral-background fill into the latent.
+
+    2. Gaussian-blurred soft mask (σ=2 latent px, kernel 7) — removes the hard
+       step-discontinuity at the mask boundary that causes seam artifacts.
+
+    3. Per-step fresh-eps noise matching (Blended Latent Diffusion, 2206.02779)
+         z_ref = (1−σ)·z_clean + σ·ε,  ε ~ N(0,I) fresh each step
+       Ensures pasted tokens sit at the same expected noise level as the rest of
+       the latent, so the denoiser sees a spatially consistent input.
+       Fixed noise (old approach) biases the object toward one noise pattern.
+
+    4. Narrow σ-window [0.35, 0.55] (ObjectAdd, 2404.17230 / TiNO-Edit, 2404.11120)
+       — early enough that subsequent denoising steps can integrate the object
+       into the scene; late enough that the pasted content survives those steps.
     """
+    # Encode collage — object already at correct scene position
     collage_np = np.array(collage.convert("RGB"), dtype=np.float32) / 255.0
     collage_t  = torch.from_numpy(collage_np).permute(2, 0, 1).unsqueeze(0)
-    collage_t  = (collage_t * 2.0 - 1.0).to(dtype).unsqueeze(2)   # add T=1
+    collage_t  = (collage_t * 2.0 - 1.0).to(dtype).unsqueeze(2)   # Wan2.1 VAE: add T=1
 
     with torch.no_grad():
         enc_dev = next(pipe.vae.parameters()).device
@@ -444,26 +455,24 @@ def _make_obj_anchor_callback(
         sf      = getattr(pipe.vae.config, "shift_factor",   0.0)
         scale   = getattr(pipe.vae.config, "scaling_factor", 1.0)
         z_raw   = (z_raw - sf) * scale
-    z_obj = z_raw.squeeze(2).to(device, dtype)   # (1, C, lat_h, lat_w)
+    z_clean = z_raw.squeeze(2).to(device, dtype)   # (1, C, lat_h, lat_w)
 
-    lat_h, lat_w = z_obj.shape[-2], z_obj.shape[-1]
+    lat_h, lat_w = z_clean.shape[-2], z_clean.shape[-1]
 
-    noise = torch.randn(z_obj.shape, device=device, dtype=dtype,
-                        generator=torch.Generator(device=device).manual_seed(37))
+    # Bilinear-average downsample of object silhouette → threshold 0.5 → soft edge
+    mask_f   = torch.from_numpy(obj_mask_har.astype(np.float32))[None, None]  # (1,1,H,W)
+    mask_lat = F.interpolate(
+        mask_f, size=(lat_h, lat_w), mode="bilinear", align_corners=False, antialias=True,
+    ).squeeze(0).squeeze(0).numpy()                # (lat_h, lat_w)
+    mask_lat  = (mask_lat >= 0.5).astype(np.float32)
+    mask_soft = cv2.GaussianBlur(mask_lat, (7, 7), 2.0)
+    mask_t    = torch.from_numpy(mask_soft).to(device, dtype)[None, None]  # (1,1,H,W)
 
-    # Object zone mask (foreground = inside placement mask, no inversion)
-    placement_np = np.array(
-        Image.open(mask_path).convert("L").resize((lat_w, lat_h), Image.Resampling.NEAREST)
-    )
-    mask_lat  = (placement_np > 127).astype(np.uint8)
-    mask_soft = cv2.GaussianBlur(mask_lat.astype(np.float32), (7, 7), 2.0)
-    mask_t    = torch.from_numpy(mask_soft).to(device, dtype)[None, None]
-
-    lo_s, hi_s = anchor_frac
+    lo_s, hi_s = inject_frac
     s = anchor_strength
 
-    print(f"    [OBJ-ANC] VAE latent {lat_h}×{lat_w}  "
-          f"strength={s}  sigma=[{lo_s:.2f},{hi_s:.2f}]  "
+    print(f"    [OBJ-COMP] VAE latent {lat_h}×{lat_w}  "
+          f"strength={s}  σ-window=[{lo_s:.2f},{hi_s:.2f}]  "
           f"zone={mask_soft.mean()*100:.1f}%")
 
     def _callback(_pipeline, _step_index, timestep, callback_kwargs):
@@ -473,9 +482,10 @@ def _make_obj_anchor_callback(
         sigma = max(0.0, min(1.0, float(timestep) / 1000.0))
         if not (lo_s <= sigma <= hi_s):
             return callback_kwargs
-        z_ref = ((1.0 - sigma) * z_obj + sigma * noise).to(latents.dtype).to(latents.device)
+        # Fresh eps every step — BLD requirement; fixed noise biases one pattern
+        eps   = torch.randn_like(z_clean)
+        z_ref = ((1.0 - sigma) * z_clean + sigma * eps).to(latents.dtype).to(latents.device)
         m     = mask_t.expand_as(latents).to(latents.dtype).to(latents.device)
-        # Blend inside zone: (1 - s·m)·latents + s·m·z_ref
         callback_kwargs["latents"] = latents * (1.0 - s * m) + z_ref * (s * m)
         return callback_kwargs
 
@@ -893,13 +903,14 @@ def run_collage_chain(
                 bcg_callback=bcg_cb,
             )
         else:
-            anchor_cb = _make_obj_anchor_callback(
-                collage=collage_scene, mask_path=mask_path, pipe=pipe,
-                height=height, width=width, device=device, dtype=pipe_dtype,
+            anchor_cb = _make_obj_latent_composite_callback(
+                collage=collage_scene, obj_mask_har=obj_mask_har,
+                pipe=pipe, height=height, width=width,
+                device=device, dtype=pipe_dtype,
                 anchor_strength=obj_strength * 0.5,
             )
             # BCG restores background (outside zone); anchor preserves object
-            # appearance (inside zone). Apply BCG first, anchor second.
+            # identity (inside zone). BCG first, anchor second.
             combined_cb = _compose_callbacks(bcg_cb, anchor_cb)
             next_scene = run_qwen(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
