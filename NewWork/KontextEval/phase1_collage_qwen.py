@@ -411,6 +411,87 @@ def _make_bcg_latent_callback(
     return _callback
 
 
+def _make_obj_anchor_callback(
+    collage:         Image.Image,
+    mask_path:       str,
+    pipe,
+    height:          int,
+    width:           int,
+    device:          str,
+    dtype:           torch.dtype = torch.bfloat16,
+    anchor_strength: float = 0.4,
+    anchor_frac:     Tuple[float, float] = (0.3, 0.7),
+):
+    """
+    Object identity anchoring — foreground counterpart to the BCG callback.
+
+    Encodes the collage (object already pasted at its target position) and
+    during mid-denoising (sigma inside anchor_frac) softly blends the
+    noise-matched collage latent into the object zone, preventing the model
+    from drifting away from the reference appearance.
+
+    anchor_frac = (lo_sigma, hi_sigma): apply when timestep/1000 is in this
+    range.  Default (0.3, 0.7) = mid-denoising, after structure is set but
+    before fine details lock in.
+    """
+    collage_np = np.array(collage.convert("RGB"), dtype=np.float32) / 255.0
+    collage_t  = torch.from_numpy(collage_np).permute(2, 0, 1).unsqueeze(0)
+    collage_t  = (collage_t * 2.0 - 1.0).to(dtype).unsqueeze(2)   # add T=1
+
+    with torch.no_grad():
+        enc_dev = next(pipe.vae.parameters()).device
+        z_raw   = pipe.vae.encode(collage_t.to(enc_dev)).latent_dist.sample()
+        sf      = getattr(pipe.vae.config, "shift_factor",   0.0)
+        scale   = getattr(pipe.vae.config, "scaling_factor", 1.0)
+        z_raw   = (z_raw - sf) * scale
+    z_obj = z_raw.squeeze(2).to(device, dtype)   # (1, C, lat_h, lat_w)
+
+    lat_h, lat_w = z_obj.shape[-2], z_obj.shape[-1]
+
+    noise = torch.randn(z_obj.shape, device=device, dtype=dtype,
+                        generator=torch.Generator(device=device).manual_seed(37))
+
+    # Object zone mask (foreground = inside placement mask, no inversion)
+    placement_np = np.array(
+        Image.open(mask_path).convert("L").resize((lat_w, lat_h), Image.Resampling.NEAREST)
+    )
+    mask_lat  = (placement_np > 127).astype(np.uint8)
+    mask_soft = cv2.GaussianBlur(mask_lat.astype(np.float32), (7, 7), 2.0)
+    mask_t    = torch.from_numpy(mask_soft).to(device, dtype)[None, None]
+
+    lo_s, hi_s = anchor_frac
+    s = anchor_strength
+
+    print(f"    [OBJ-ANC] VAE latent {lat_h}×{lat_w}  "
+          f"strength={s}  sigma=[{lo_s:.2f},{hi_s:.2f}]  "
+          f"zone={mask_soft.mean()*100:.1f}%")
+
+    def _callback(_pipeline, _step_index, timestep, callback_kwargs):
+        latents = callback_kwargs["latents"]
+        if latents.shape[-2:] != (lat_h, lat_w):
+            return callback_kwargs
+        sigma = max(0.0, min(1.0, float(timestep) / 1000.0))
+        if not (lo_s <= sigma <= hi_s):
+            return callback_kwargs
+        z_ref = ((1.0 - sigma) * z_obj + sigma * noise).to(latents.dtype).to(latents.device)
+        m     = mask_t.expand_as(latents).to(latents.dtype).to(latents.device)
+        # Blend inside zone: (1 - s·m)·latents + s·m·z_ref
+        callback_kwargs["latents"] = latents * (1.0 - s * m) + z_ref * (s * m)
+        return callback_kwargs
+
+    return _callback
+
+
+def _compose_callbacks(cb1, cb2):
+    """Chain two step-end callbacks; either may be None."""
+    if cb1 is None: return cb2
+    if cb2 is None: return cb1
+    def _cb(pipe, step_idx, ts, kwargs):
+        kwargs = cb1(pipe, step_idx, ts, kwargs)
+        return cb2(pipe, step_idx, ts, kwargs)
+    return _cb
+
+
 # ── Qwen collage K/V injection ───────────────────────────────────────────────
 #
 # Architecture:  hidden = [text_tokens | image_tokens]   (joint attention)
@@ -812,10 +893,18 @@ def run_collage_chain(
                 bcg_callback=bcg_cb,
             )
         else:
+            anchor_cb = _make_obj_anchor_callback(
+                collage=collage_scene, mask_path=mask_path, pipe=pipe,
+                height=height, width=width, device=device, dtype=pipe_dtype,
+                anchor_strength=obj_strength * 0.5,
+            )
+            # BCG restores background (outside zone); anchor preserves object
+            # appearance (inside zone). Apply BCG first, anchor second.
+            combined_cb = _compose_callbacks(bcg_cb, anchor_cb)
             next_scene = run_qwen(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
-                height=height, width=width, bcg_callback=bcg_cb,
+                height=height, width=width, bcg_callback=combined_cb,
             )
 
         result_path = os.path.join(out_dir, f"result_step{i+1}_{name}.png")
