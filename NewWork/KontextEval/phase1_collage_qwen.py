@@ -459,14 +459,18 @@ def _make_bcg_latent_callback(
 
     def _callback(_pipeline, _step_index, timestep, callback_kwargs):
         latents = callback_kwargs["latents"]
-        # Guard: only proceed when shape matches our packed z0
         if latents.shape != z0_tok.shape:
             return callback_kwargs
 
         sigma = max(0.0, min(1.0, float(timestep) / 1000.0))
+        # Only lock background in late steps (σ < 0.4).
+        # Early steps (σ ≥ 0.4) run freely so Qwen can form natural shadows
+        # and contact lighting before we start preserving the background.
+        if sigma >= 0.4:
+            return callback_kwargs
+
         z_bg  = ((1.0 - sigma) * z0_tok + sigma * noise).to(latents.dtype).to(latents.device)
         m     = mask_tensor.to(latents.dtype).to(latents.device)
-        # m=1 at edit zone (keep denoised), m=0 at background (restore to z_bg)
         callback_kwargs["latents"] = latents * m + z_bg * (1.0 - m)
         return callback_kwargs
 
@@ -1019,7 +1023,7 @@ def run_collage_chain(
 
         # Stage BCG: pixel-space tight-mask composite
         print(f"  [BCG] Background restore ...")
-        bcg_mask = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=3)
+        bcg_mask = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=1)
         bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (41, 41), 15)
 
         result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
