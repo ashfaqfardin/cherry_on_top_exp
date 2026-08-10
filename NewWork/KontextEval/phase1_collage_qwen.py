@@ -367,6 +367,26 @@ def _collage_obj_mask(collage: Image.Image, scene: Image.Image,
     return mask
 
 
+# ── Latent packing ────────────────────────────────────────────────────────────
+
+def _pack_latents(z: torch.Tensor) -> torch.Tensor:
+    """
+    Pack spatial latents (B, C, H, W) → token sequence (B, H//2 * W//2, C*4).
+
+    Qwen's denoising loop works in packed token space: the callback receives
+    latents shaped (B, n_tok, C_packed) not the VAE's spatial (B, C, H, W).
+    Each token covers a 2×2 block at VAE spatial resolution (= 16 image pixels).
+
+    Packing order (row-major, matches diffusers WanPipeline._pack_latents):
+      token index = i * (W//2) + j  for spatial block (i, j)
+    """
+    B, C, H, W = z.shape
+    h_tok, w_tok = H // 2, W // 2
+    z = z.reshape(B, C, h_tok, 2, w_tok, 2)
+    z = z.permute(0, 2, 4, 1, 3, 5)          # (B, h_tok, w_tok, C, 2, 2)
+    return z.reshape(B, h_tok * w_tok, C * 4) # (B, n_tok, C*4)
+
+
 # ── BLD latent-space BCG (Blended Latent Diffusion, arxiv:2206.02779) ─────────
 
 def _make_bcg_latent_callback(
@@ -380,30 +400,28 @@ def _make_bcg_latent_callback(
     dilation_lat: int = 3,
 ):
     """
-    BLD latent BCG — identical logic to the Kontext version with two fixes:
+    BLD latent BCG in packed token space.
 
-    1. VAE normalisation read dynamically: Qwen uses the Wan2.1-based VAE
-       which has different shift_factor / scaling_factor from FLUX.
-    2. Latent spatial dimensions inferred from the actual VAE encode output
-       so the callback works regardless of whether the pipeline returns
-       unpacked (h//8) or packed (h//16) latents in callback_on_step_end.
+    Qwen's denoising callback receives latents as (B, n_tok, C_packed) where
+    n_tok = (H//16) * (W//16) = 4096 for 1024×1024.  The old spatial shape-check
+    (lat_h, lat_w) always failed → zero blending happened.  This version:
+
+    1. Encodes the background scene and normalises via Qwen's per-channel
+       latents_mean / latents_std vectors (not the FLUX scalar shift_factor).
+    2. Packs the encoded latent to (B, n_tok, 64) to match the callback tensor.
+    3. Builds the BLD mask at token resolution (64×64) instead of VAE spatial
+       resolution (128×128) — each token covers exactly one 16-px image block.
+    4. Injects z_bg = (1−σ)·z0 + σ·ε at background tokens every denoising step.
     """
     scene_np = np.array(scene.convert("RGB"), dtype=np.float32) / 255.0
     scene_t  = torch.from_numpy(scene_np).permute(2, 0, 1).unsqueeze(0)
-    scene_t  = (scene_t * 2.0 - 1.0).to(dtype)
-    # Wan2.1-based VAE expects (B, C, T, H, W); add temporal dim T=1 for images
-    scene_t  = scene_t.unsqueeze(2)
+    scene_t  = (scene_t * 2.0 - 1.0).to(dtype).unsqueeze(2)  # Wan2.1: add T=1
 
     with torch.no_grad():
         enc_dev = next(pipe.vae.parameters()).device
-        # Use .mean (deterministic) — matches pipeline's sample_mode="argmax"
-        z0_raw = pipe.vae.encode(scene_t.to(enc_dev)).latent_dist.mean
-        z0_raw = z0_raw.squeeze(2)  # (1, 16, H_lat, W_lat) — remove T=1 dim
+        z0_raw  = pipe.vae.encode(scene_t.to(enc_dev)).latent_dist.mean
+        z0_raw  = z0_raw.squeeze(2)  # (1, 16, 128, 128) — remove T=1
 
-    # Qwen VAE normalises per-channel with latents_mean / latents_std vectors.
-    # There is NO shift_factor / scaling_factor — falling back to (sf=0, scale=1)
-    # stores unnormalized latents while the denoising loop works with normalised
-    # ones, corrupting every BLD blend step.
     latents_mean = torch.tensor(
         pipe.vae.config.latents_mean, dtype=dtype, device=enc_dev
     ).reshape(1, -1, 1, 1)
@@ -412,36 +430,43 @@ def _make_bcg_latent_callback(
     ).reshape(1, -1, 1, 1)
     z0 = ((z0_raw - latents_mean) / latents_std).to(device, dtype)
 
-    # Infer latent spatial dims from the actual encoded z0 (robust to any VAE stride)
-    lat_h, lat_w = z0.shape[-2], z0.shape[-1]
+    # Pack (1, 16, 128, 128) → (1, 4096, 64) — matches callback latent shape
+    z0_tok = _pack_latents(z0)
+    n_tok  = z0_tok.shape[1]                  # 4096
+    h_tok  = z0.shape[-2] // 2               # 64  (VAE 128 / patch 2)
+    w_tok  = z0.shape[-1] // 2               # 64
 
-    noise = torch.randn(z0.shape, device=device, dtype=dtype,
+    noise = torch.randn(z0_tok.shape, device=device, dtype=dtype,
                         generator=torch.Generator(device=device).manual_seed(42))
 
+    # Mask at token resolution (h_tok × w_tok = 64×64), NOT VAE spatial (128×128)
     placement_np = np.array(
-        Image.open(mask_path).convert("L").resize((lat_w, lat_h), Image.Resampling.NEAREST)
+        Image.open(mask_path).convert("L").resize((w_tok, h_tok), Image.Resampling.NEAREST)
     )
     mask_lat = (placement_np > 127).astype(np.uint8)
     if dilation_lat > 0:
         k = dilation_lat * 2 + 1
         mask_lat = cv2.dilate(mask_lat, np.ones((k, k), np.uint8), iterations=2)
     mask_soft   = cv2.GaussianBlur(mask_lat.astype(np.float32), (7, 7), 2.0)
-    mask_tensor = torch.from_numpy(mask_soft).to(device, dtype)[None, None]
+    # (1, n_tok, 1) — broadcasts over the C_packed feature dim
+    mask_tensor = torch.from_numpy(
+        mask_soft.reshape(1, n_tok, 1)
+    ).to(device, dtype)
 
-    print(f"    [BLD] VAE latent {lat_h}×{lat_w}  "
+    print(f"    [BLD] token {h_tok}×{w_tok}={n_tok}  "
           f"latents_mean[0]={pipe.vae.config.latents_mean[0]:.4f}  "
           f"edit zone={mask_soft.mean()*100:.1f}%")
 
     def _callback(_pipeline, _step_index, timestep, callback_kwargs):
         latents = callback_kwargs["latents"]
-        if latents.shape[-2:] != (lat_h, lat_w):
-            # Packed latents from some schedulers — skip BCG silently
+        # Guard: only proceed when shape matches our packed z0
+        if latents.shape != z0_tok.shape:
             return callback_kwargs
 
-        # Flow-matching: timestep ≈ sigma × 1000
         sigma = max(0.0, min(1.0, float(timestep) / 1000.0))
-        z_bg  = ((1.0 - sigma) * z0 + sigma * noise).to(latents.dtype).to(latents.device)
-        m     = mask_tensor.expand_as(latents).to(latents.dtype).to(latents.device)
+        z_bg  = ((1.0 - sigma) * z0_tok + sigma * noise).to(latents.dtype).to(latents.device)
+        m     = mask_tensor.to(latents.dtype).to(latents.device)
+        # m=1 at edit zone (keep denoised), m=0 at background (restore to z_bg)
         callback_kwargs["latents"] = latents * m + z_bg * (1.0 - m)
         return callback_kwargs
 
@@ -462,34 +487,16 @@ def _make_obj_latent_composite_callback(
     """
     Per-step BLD latent compositing for object identity preservation.
 
-    Four research-backed improvements over naive latent anchoring:
-
-    1. Silhouette mask instead of bbox — bilinear downsample of obj_mask_har
-       (the pixel-diff footprint) to latent res, threshold 0.5.  Avoids pasting
-       grey neutral-background fill into the latent.
-
-    2. Gaussian-blurred soft mask (σ=2 latent px, kernel 7) — removes the hard
-       step-discontinuity at the mask boundary that causes seam artifacts.
-
-    3. Per-step fresh-eps noise matching (Blended Latent Diffusion, 2206.02779)
-         z_ref = (1−σ)·z_clean + σ·ε,  ε ~ N(0,I) fresh each step
-       Ensures pasted tokens sit at the same expected noise level as the rest of
-       the latent, so the denoiser sees a spatially consistent input.
-       Fixed noise (old approach) biases the object toward one noise pattern.
-
-    4. Narrow σ-window [0.35, 0.55] (ObjectAdd, 2404.17230 / TiNO-Edit, 2404.11120)
-       — early enough that subsequent denoising steps can integrate the object
-       into the scene; late enough that the pasted content survives those steps.
+    Works in packed token space (B, n_tok, 64) to match Qwen's callback format.
     """
-    # Encode collage — object already at correct scene position
     collage_np = np.array(collage.convert("RGB"), dtype=np.float32) / 255.0
     collage_t  = torch.from_numpy(collage_np).permute(2, 0, 1).unsqueeze(0)
-    collage_t  = (collage_t * 2.0 - 1.0).to(dtype).unsqueeze(2)   # Wan2.1 VAE: add T=1
+    collage_t  = (collage_t * 2.0 - 1.0).to(dtype).unsqueeze(2)  # Wan2.1: T=1
 
     with torch.no_grad():
         enc_dev = next(pipe.vae.parameters()).device
         z_raw   = pipe.vae.encode(collage_t.to(enc_dev)).latent_dist.mean
-        z_raw   = z_raw.squeeze(2)  # (1, 16, lat_h, lat_w)
+        z_raw   = z_raw.squeeze(2)  # (1, 16, 128, 128)
 
     latents_mean = torch.tensor(
         pipe.vae.config.latents_mean, dtype=dtype, device=enc_dev
@@ -499,35 +506,39 @@ def _make_obj_latent_composite_callback(
     ).reshape(1, -1, 1, 1)
     z_clean = ((z_raw - latents_mean) / latents_std).to(device, dtype)
 
-    lat_h, lat_w = z_clean.shape[-2], z_clean.shape[-1]
+    # Pack to token space
+    z_clean_tok = _pack_latents(z_clean)
+    n_tok = z_clean_tok.shape[1]     # 4096
+    h_tok = z_clean.shape[-2] // 2  # 64
+    w_tok = z_clean.shape[-1] // 2  # 64
 
-    # Bilinear-average downsample of object silhouette → threshold 0.5 → soft edge
-    mask_f   = torch.from_numpy(obj_mask_har.astype(np.float32))[None, None]  # (1,1,H,W)
-    mask_lat = F.interpolate(
-        mask_f, size=(lat_h, lat_w), mode="bilinear", align_corners=False, antialias=True,
-    ).squeeze(0).squeeze(0).numpy()                # (lat_h, lat_w)
-    mask_lat  = (mask_lat >= 0.5).astype(np.float32)
-    mask_soft = cv2.GaussianBlur(mask_lat, (7, 7), 2.0)
-    mask_t    = torch.from_numpy(mask_soft).to(device, dtype)[None, None]  # (1,1,H,W)
+    # Bilinear downsample object silhouette to token resolution
+    mask_f   = torch.from_numpy(obj_mask_har.astype(np.float32))[None, None]
+    mask_tok = F.interpolate(
+        mask_f, size=(h_tok, w_tok), mode="bilinear", align_corners=False, antialias=True,
+    ).squeeze().numpy()
+    mask_tok  = (mask_tok >= 0.5).astype(np.float32)
+    mask_soft = cv2.GaussianBlur(mask_tok, (7, 7), 2.0)
+    # (1, n_tok, 1) — broadcasts over feature dim
+    mask_t    = torch.from_numpy(mask_soft.reshape(1, n_tok, 1)).to(device, dtype)
 
     lo_s, hi_s = inject_frac
     s = anchor_strength
 
-    print(f"    [OBJ-COMP] VAE latent {lat_h}×{lat_w}  "
+    print(f"    [OBJ-COMP] token {h_tok}×{w_tok}={n_tok}  "
           f"strength={s}  σ-window=[{lo_s:.2f},{hi_s:.2f}]  "
           f"zone={mask_soft.mean()*100:.1f}%")
 
     def _callback(_pipeline, _step_index, timestep, callback_kwargs):
         latents = callback_kwargs["latents"]
-        if latents.shape[-2:] != (lat_h, lat_w):
+        if latents.shape != z_clean_tok.shape:
             return callback_kwargs
         sigma = max(0.0, min(1.0, float(timestep) / 1000.0))
         if not (lo_s <= sigma <= hi_s):
             return callback_kwargs
-        # Fresh eps every step — BLD requirement; fixed noise biases one pattern
-        eps   = torch.randn_like(z_clean)
-        z_ref = ((1.0 - sigma) * z_clean + sigma * eps).to(latents.dtype).to(latents.device)
-        m     = mask_t.expand_as(latents).to(latents.dtype).to(latents.device)
+        eps   = torch.randn_like(z_clean_tok)
+        z_ref = ((1.0 - sigma) * z_clean_tok + sigma * eps).to(latents.dtype).to(latents.device)
+        m     = mask_t.to(latents.dtype).to(latents.device)
         callback_kwargs["latents"] = latents * (1.0 - s * m) + z_ref * (s * m)
         return callback_kwargs
 
@@ -553,7 +564,7 @@ def _compose_callbacks(cb1, cb2):
 #   These encode the pasted object's appearance at the correct spatial position
 #   with matching RoPE coordinates → no positional collision.
 #
-# Phase 2 — denoising with injection (cutoff_frac window, default late steps):
+# Phase 2 — denoising with injection (cutoff_frac window, default early steps 0–50%):
 #   K[zone] = (1-s)*K + s*K_ref
 #   V[zone] = (1-s)*V + s*V_ref
 #   Late-step injection (sigma↓) avoids the clean/noisy mismatch that causes
@@ -753,7 +764,7 @@ def run_with_qwen_kv_injection(
     height:       int,
     width:        int,
     obj_strength: float = 0.7,
-    cutoff_frac:  Tuple[float, float] = (0.5, 1.0),
+    cutoff_frac:  Tuple[float, float] = (0.0, 0.5),
     bcg_callback  = None,
 ) -> Image.Image:
     """
@@ -762,9 +773,10 @@ def run_with_qwen_kv_injection(
 
     Phase 2 — full denoising with injection:
         Within cutoff_frac steps, blend captured K,V into live image tokens
-        at target zone positions.  Default window is the late 50% of steps
-        (sigma↓) where the latent is close to clean — matching the noise level
-        of the captured K,V and avoiding early-step artifacts.
+        at target zone positions.  Default window is the EARLY 50% of steps
+        (sigma↑, high noise) per Personalize Anything (arxiv:2503.12590) —
+        early steps are more receptive to appearance guidance because the
+        denoiser is still forming global structure.
     """
     vae_sf = getattr(pipe, "vae_scale_factor", 8)
     n_img  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
@@ -846,7 +858,7 @@ def run_collage_chain(
     device:         str,
     use_kv:         bool = False,
     obj_strength:   float = 0.7,
-    cutoff_frac:    Tuple[float, float] = (0.5, 1.0),
+    cutoff_frac:    Tuple[float, float] = (0.0, 0.5),
 ) -> List[Image.Image]:
     results = [base]
     scene   = base
@@ -1061,7 +1073,7 @@ def parse_args():
                    help="Enable collage K/V injection for object appearance preservation.")
     p.add_argument("--obj_strength", type=float, default=0.7,
                    help="K/V injection strength (0-1). Default 0.7.")
-    p.add_argument("--cutoff_frac",  default="0.5,1.0",
+    p.add_argument("--cutoff_frac",  default="0.0,0.5",
                    help="Injection active window as 'start,end' fractions. Default '0.5,1.0'.")
     p.add_argument("--cpu_offload",  action="store_true",
                    help="Enable model CPU offload. Use if VRAM < 45 GB.")

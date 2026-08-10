@@ -701,13 +701,21 @@ def test_t5_vae_roundtrip(pipe, args):
 
 # ── T6: BLD callback firing ───────────────────────────────────────────────────
 
+def _pack_latents_t6(z: torch.Tensor) -> torch.Tensor:
+    """(B, C, H, W) → (B, H//2 * W//2, C*4) — matches Qwen's 2×2 patch packing."""
+    B, C, H, W = z.shape
+    h_tok, w_tok = H // 2, W // 2
+    z = z.reshape(B, C, h_tok, 2, w_tok, 2)
+    z = z.permute(0, 2, 4, 1, 3, 5)
+    return z.reshape(B, h_tok * w_tok, C * 4)
+
+
 def test_t6_bld_callback(pipe, args, mask_path: str | None = None):
     _sep("T6 — BLD Callback Firing")
 
     dtype  = next(pipe.transformer.parameters()).dtype
     device = str(next(pipe.transformer.parameters()).device)
 
-    # Use a synthetic mask if none provided
     if mask_path is None or not os.path.isfile(mask_path):
         _warn("No mask file found — saving synthetic mask and using it")
         m = _synth_mask(args.width, args.height)
@@ -716,11 +724,6 @@ def test_t6_bld_callback(pipe, args, mask_path: str | None = None):
 
     img = _synth_scene(args.width, args.height)
 
-    # Build the BLD callback using CORRECTED Qwen normalization
-    vsf   = getattr(pipe, "vae_scale_factor", 8)
-    lat_h = args.height // 8   # VAE only (pre-pack)
-    lat_w = args.width  // 8
-
     img_np = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
     img_t  = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)
     img_t  = (img_t * 2.0 - 1.0).to(dtype).unsqueeze(2)
@@ -728,7 +731,7 @@ def test_t6_bld_callback(pipe, args, mask_path: str | None = None):
     with torch.no_grad():
         enc_dev = next(pipe.vae.parameters()).device
         z0_raw  = pipe.vae.encode(img_t.to(enc_dev)).latent_dist.mean
-        z0_raw  = z0_raw.squeeze(2)
+        z0_raw  = z0_raw.squeeze(2)  # (1, 16, 128, 128)
 
     if hasattr(pipe.vae.config, "latents_mean"):
         lm = torch.tensor(pipe.vae.config.latents_mean, dtype=dtype,
@@ -740,24 +743,30 @@ def test_t6_bld_callback(pipe, args, mask_path: str | None = None):
         _warn("latents_mean not found — using identity normalization for test")
         z0 = z0_raw.to(device, dtype)
 
-    actual_lat_h, actual_lat_w = z0.shape[-2], z0.shape[-1]
-    _info(f"VAE encode → z0 shape: {tuple(z0.shape)}")
-    _info(f"Expected token-grid lat: {args.height//16}×{args.width//16}  "
-          f"actual VAE lat (pre-pack): {actual_lat_h}×{actual_lat_w}")
+    _info(f"VAE encode → z0 spatial shape: {tuple(z0.shape)}")
 
-    noise = torch.randn_like(z0, generator=torch.Generator(device=device).manual_seed(42))
+    # Pack (1, 16, 128, 128) → (1, 4096, 64) — matches callback latent shape
+    z0_tok = _pack_latents_t6(z0)
+    n_tok  = z0_tok.shape[1]         # 4096
+    h_tok  = z0.shape[-2] // 2      # 64
+    w_tok  = z0.shape[-1] // 2      # 64
+    _info(f"Packed z0_tok shape: {tuple(z0_tok.shape)}  (expected (1, {n_tok}, 64))")
 
+    noise = torch.randn(z0_tok.shape, device=device, dtype=dtype,
+                        generator=torch.Generator(device=device).manual_seed(42))
+
+    # Mask at token resolution (64×64), flattened to (1, n_tok, 1)
     placement = np.array(Image.open(mask_path).convert("L").resize(
-        (actual_lat_w, actual_lat_h), Image.NEAREST))
+        (w_tok, h_tok), Image.NEAREST))
     mask_lat  = (placement > 127).astype(np.float32)
-    mask_t    = torch.from_numpy(mask_lat).to(device, dtype)[None, None]
+    mask_t    = torch.from_numpy(mask_lat.reshape(1, n_tok, 1)).to(device, dtype)
 
     firing_log: List[dict] = []
 
     def _bld_cb(_pipeline, step_idx, timestep, callback_kwargs):
         latents = callback_kwargs["latents"]
         sigma   = max(0.0, min(1.0, float(timestep) / 1000.0))
-        shape_ok = latents.shape[-2:] == (actual_lat_h, actual_lat_w)
+        shape_ok = latents.shape == z0_tok.shape
         firing_log.append({
             "step":     step_idx,
             "sigma":    sigma,
@@ -767,8 +776,8 @@ def test_t6_bld_callback(pipe, args, mask_path: str | None = None):
             "modified": False,
         })
         if shape_ok:
-            z_bg  = ((1.0 - sigma) * z0 + sigma * noise).to(latents.dtype).to(latents.device)
-            m     = mask_t.expand_as(latents).to(latents.dtype).to(latents.device)
+            z_bg  = ((1.0 - sigma) * z0_tok + sigma * noise).to(latents.dtype).to(latents.device)
+            m     = mask_t.to(latents.dtype).to(latents.device)
             callback_kwargs["latents"] = latents * m + z_bg * (1.0 - m)
             firing_log[-1]["modified"] = True
         return callback_kwargs
