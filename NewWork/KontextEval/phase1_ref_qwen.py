@@ -1,30 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-phase1_ref_qwen.py — No-mask pipeline: side-by-side reference conditioning
+phase1_ref_qwen.py — No-mask pipeline: native multi-image reference conditioning
 
-Simplified alternative to phase1_collage_qwen.py.
-No placement masks, no manual paste, no BLD callbacks, no K/V injection.
+Uses Qwen-Image-Edit-2509's built-in multi-image support (image concatenation
+training) to pass scene + object reference as separate images — no canvas
+stitching, no crop, no bleed artifacts.
 
 Pipeline per insertion step
 ----------------------------
   1. Stage A  : sketch → obj_img  (Qwen renders the sketch)
-  2. Canvas   : [scene 1024×1024 | obj_img reference ref_width×1024] → wider canvas
-  3. Stage K  : Qwen(image=canvas, prompt=place_prompt) → wider output
-  4. Crop     : take left 1024px of output → next scene  (no resize, no quality loss)
+  2. Stage K  : Qwen(image=[scene, obj_img], prompt=place_prompt) → 1024×1024
 
 Pipeline per removal step
 --------------------------
   1. Qwen(image=scene, prompt=remove_prompt) → next scene
-  (no reference panel needed — instruction-following handles it)
-
-Trade-offs vs the masked pipeline
------------------------------------
-  + No mask files required
-  + Natural shadows / lighting from Qwen natively
-  + Much simpler code
-  - Placement is Qwen's choice, not yours
-  - Object identity may drift (Qwen interprets the reference loosely)
-  - Incremental: each step sees prior edits, Qwen may recompose
 
 Usage
 ------
@@ -40,16 +29,15 @@ from __future__ import annotations
 import argparse
 import gc
 import os
-from typing import List, Tuple
+from typing import List
 
-import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from diffusers import QwenImageEditPlusPipeline
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -94,7 +82,9 @@ def load_pipeline(
 # ── Qwen call ─────────────────────────────────────────────────────────────────
 
 def run_qwen(
-    pipe, canvas: Image.Image, prompt: str,
+    pipe,
+    image,           # PIL Image or list of PIL Images
+    prompt: str,
     seed: int, num_steps: int, guidance: float,
     height: int, width: int,
     negative_prompt: str = "blurry, distorted, low quality, watermark, text, artifacts",
@@ -102,7 +92,7 @@ def run_qwen(
     gen = torch.Generator(device=pipe.device).manual_seed(seed)
     return pipe(
         prompt=prompt, negative_prompt=negative_prompt,
-        image=canvas, num_inference_steps=num_steps,
+        image=image, num_inference_steps=num_steps,
         true_cfg_scale=guidance, height=height, width=width,
         generator=gen,
     ).images[0]
@@ -132,86 +122,16 @@ def generate_object(
     ).images[0]
 
 
-# ── Side-by-side canvas builder ────────────────────────────────────────────────
-
-def build_reference_canvas(
-    scene:   Image.Image,
-    obj_img: Image.Image,
-    height:  int = 1024,
-    width:   int = 1024,
-    ref_w:   int = 320,
-    label:   str = "",
-) -> Image.Image:
-    """
-    Build a [scene | reference] canvas at ((width + ref_w) × height).
-
-    The scene fills the left `width` pixels at full resolution — no downscaling.
-    The object reference fills the right `ref_w` pixels.
-    Total canvas: (width + ref_w) × height  e.g. 1344×1024 with defaults.
-    """
-    total_w = width + ref_w
-    canvas  = Image.new("RGB", (total_w, height), (240, 240, 240))
-
-    # Left: scene at full resolution
-    scene_rs = scene.convert("RGB").resize((width, height), Image.LANCZOS)
-    canvas.paste(scene_rs, (0, 0))
-
-    # Divider — placed 4px inside the reference panel so the crop never clips it
-    draw = ImageDraw.Draw(canvas)
-    draw.line([(width + 4, 0), (width + 4, height)], fill=(160, 160, 160), width=3)
-
-    # Right: object reference — fit inside ref panel with padding
-    pad    = 16
-    inner  = ref_w - 2 * pad
-    obj_rs = obj_img.convert("RGB")
-    obj_rs.thumbnail((inner, height - 2 * pad), Image.LANCZOS)
-    ox = width + pad + (inner - obj_rs.width)  // 2
-    oy = pad + (height - 2 * pad - obj_rs.height) // 2
-    canvas.paste(obj_rs, (ox, oy))
-
-    # Label at bottom of reference panel
-    if label:
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-        except OSError:
-            font = ImageFont.load_default()
-        draw.text((width + pad, height - 36), f"REF: {label}", fill=(80, 80, 80), font=font)
-
-    return canvas
-
-
-# ── Crop left panel — exact scene width, no resize needed ─────────────────────
-
-def crop_scene(
-    output: Image.Image,
-    width:  int = 1024,
-    bleed:  int = 16,
-) -> Image.Image:
-    """
-    Crop the left (width - bleed) pixels then resize to width×height.
-    The bleed margin removes any reference-panel edge that Qwen generated
-    at the scene boundary. A 16px resize from 1008→1024 is visually lossless.
-    """
-    cropped = output.crop((0, 0, width - bleed, output.height))
-    return cropped.resize((width, output.height), Image.LANCZOS)
-
-
-# ── Insertion prompt ───────────────────────────────────────────────────────────
+# ── Prompts ────────────────────────────────────────────────────────────────────
 
 def insert_prompt(description: str) -> str:
     return (
-        f"This image has two sections separated by a vertical grey line. "
-        f"The LEFT section (left three-quarters) shows a room. "
-        f"The RIGHT section (right quarter) shows a reference {description}. "
-        f"Edit the LEFT section ONLY: place the {description} from the right reference "
-        f"naturally in the room — resting on the wooden floor with realistic shadows and "
-        f"contact lighting that match the room. "
-        f"Do NOT modify the right reference panel. "
-        f"Keep all other parts of the room exactly as they are."
+        f"The first image shows a room. The second image shows a {description}. "
+        f"Place the {description} from the second image naturally into the room in the first image "
+        f"— resting on the wooden floor with realistic contact shadow and lighting that "
+        f"match the room environment. Keep all other parts of the room exactly as they are."
     )
 
-
-# ── Removal prompt ─────────────────────────────────────────────────────────────
 
 def remove_prompt(description: str) -> str:
     return (
@@ -220,84 +140,6 @@ def remove_prompt(description: str) -> str:
         f"surrounding surfaces. Keep all other objects and parts of the room exactly "
         f"the same."
     )
-
-
-# ── Object mask generation via Qwen ───────────────────────────────────────────
-
-def generate_object_mask(
-    pipe,
-    scene:       Image.Image,
-    description: str,
-    seed:        int,
-    height:      int,
-    width:       int,
-    mask_steps:  int = 20,
-) -> np.ndarray:
-    """
-    Ask the already-loaded Qwen edit pipeline to produce a binary segmentation
-    mask for the named object.  Returns uint8 (H, W) with values 0 / 255.
-
-    Prompt strategy: low CFG (2.0) + explicit binary output instruction.
-    Post-processing: threshold → morphological close (fill holes) → open (denoise).
-    """
-    prompt = (
-        f"Generate a binary segmentation mask of this room image. "
-        f"Color the {description} pure white and everything else pure black. "
-        f"Output a black and white image only — no colors, no gradients, no textures."
-    )
-    neg = "color, texture, photorealistic, gradient, gray, shadows, detailed, realistic"
-
-    gen = torch.Generator(device=pipe.device).manual_seed(seed + 99)
-    mask_img = pipe(
-        prompt=prompt, negative_prompt=neg,
-        image=scene, num_inference_steps=mask_steps,
-        true_cfg_scale=2.0, height=height, width=width,
-        generator=gen,
-    ).images[0]
-
-    mask_np  = np.array(mask_img.convert("L"))
-    mask_bin = (mask_np > 127).astype(np.uint8) * 255
-
-    # Fill holes in the object silhouette, then remove isolated noise pixels
-    k_close = np.ones((11, 11), np.uint8)
-    k_open  = np.ones((5,  5),  np.uint8)
-    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, k_close)
-    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN,  k_open)
-
-    px    = int(mask_bin.sum() // 255)
-    total = height * width
-    print(f"    [MASK-GEN] '{description}': {px} px  ({100*px/total:.1f}% of image)")
-    if px < 200:
-        print(f"    [MASK-GEN] WARNING: mask nearly empty — Qwen may not have understood prompt")
-
-    return mask_bin   # (H, W) uint8
-
-
-# ── Preserved object compositing ───────────────────────────────────────────────
-
-def composite_preserved(
-    result:    Image.Image,
-    preserved: list,          # [(name, mask_np, patch_np), ...]
-    feather:   int = 21,
-) -> Image.Image:
-    """
-    Paste stored object patches back onto result using their Qwen-generated masks.
-    Gaussian-feathered edges prevent hard seams at the object boundary.
-    """
-    if not preserved:
-        return result
-
-    result_np = np.array(result.convert("RGB"), dtype=np.float32)
-
-    for name, mask_np, patch_np in preserved:
-        mask_f = mask_np.astype(np.float32) / 255.0
-        if feather > 0:
-            ksize = feather * 2 + 1
-            mask_f = cv2.GaussianBlur(mask_f, (ksize, ksize), feather / 3.0)
-        alpha     = mask_f[:, :, None]                  # (H, W, 1)
-        result_np = result_np * (1.0 - alpha) + patch_np * alpha
-
-    return Image.fromarray(np.clip(result_np, 0, 255).astype(np.uint8))
 
 
 # ── Main chain ────────────────────────────────────────────────────────────────
@@ -313,17 +155,11 @@ def run_chain(
     obj_guidance: float,
     height:       int,
     width:        int,
-    ref_w:        int,
     out_dir:      str,
-    mask_steps:   int = 20,
 ) -> List[Image.Image]:
-    results  = [base]
-    scene    = base
+    results   = [base]
+    scene     = base
     obj_cache: dict = {}
-
-    # Each entry: (name, mask_np uint8, patch_np float32)
-    # Built after each insertion, popped on removal.
-    preserved: list = []
 
     for i, edit in enumerate(edits):
         name   = edit["name"]
@@ -336,7 +172,6 @@ def run_chain(
         print(f"{'─'*60}")
 
         if action == "insert":
-            # Stage A — generate object image (cached per name)
             if name not in obj_cache:
                 sketch_path = os.path.join(sketch_dir, f"{name}.png")
                 if not os.path.isfile(sketch_path):
@@ -359,77 +194,26 @@ def run_chain(
                 print(f"  [A] Reusing cached obj_gen_{name}.png")
                 obj_img = obj_cache[name]
 
-            canvas = build_reference_canvas(
-                scene=scene, obj_img=obj_img,
-                height=height, width=width, ref_w=ref_w, label=desc,
-            )
-            canvas.save(os.path.join(out_dir, f"canvas_{tag}.png"))
-            print(f"  [CANVAS] {width}px scene | {ref_w}px ref → {width+ref_w}×{height}")
-
+            qwen_image = [scene.convert("RGB"), obj_img.convert("RGB")]
             prompt = insert_prompt(desc)
             neg_p  = "blurry, distorted, low quality, watermark, text, artifacts"
+            print(f"  [K] Multi-image pass: [scene, obj_ref] → {width}×{height}")
 
         else:  # remove
-            canvas = scene
+            qwen_image = scene.convert("RGB")
             prompt = remove_prompt(desc)
             neg_p  = f"blurry, distorted, low quality, watermark, text, artifacts, {desc}"
-            print(f"  [A] Removal — no reference panel")
+            print(f"  [K] Removal pass → {width}×{height}")
 
         with open(os.path.join(out_dir, f"prompt_{tag}.txt"), "w") as f:
             f.write(prompt)
-        print(f"  [K] Qwen pass  ({num_steps} steps, cfg={guidance}) ...")
         print(f"      {prompt[:120]}...")
 
-        canvas_w = (width + ref_w) if action == "insert" else width
-        raw_output = run_qwen(
-            pipe=pipe, canvas=canvas, prompt=prompt,
+        next_scene = run_qwen(
+            pipe=pipe, image=qwen_image, prompt=prompt,
             seed=seed, num_steps=num_steps, guidance=guidance,
-            height=height, width=canvas_w, negative_prompt=neg_p,
+            height=height, width=width, negative_prompt=neg_p,
         )
-        raw_output.save(os.path.join(out_dir, f"raw_{tag}.png"))
-
-        # Crop the scene panel (insertion only)
-        if action == "insert":
-            next_scene = crop_scene(raw_output, width=width)
-            print(f"  [CROP] Left {width}px extracted")
-        else:
-            next_scene = raw_output
-
-        # ── Object preservation ───────────────────────────────────────────────
-        if action == "insert":
-            # 1. Composite any previously preserved objects back onto next_scene.
-            #    Qwen may have slightly changed them; this restores exact pixels.
-            if preserved:
-                print(f"  [PRESERVE] Compositing {len(preserved)} prior object(s) back ...")
-                next_scene = composite_preserved(next_scene, preserved)
-
-            # 2. Generate mask for the NEWLY placed object in next_scene.
-            print(f"  [MASK-GEN] Asking Qwen to mask '{desc}' ...")
-            new_mask = generate_object_mask(
-                pipe=pipe, scene=next_scene, description=desc,
-                seed=seed, height=height, width=width, mask_steps=mask_steps,
-            )
-            Image.fromarray(new_mask).save(
-                os.path.join(out_dir, f"mask_{tag}.png")
-            )
-            # 3. Store (mask + pixel patch) for future compositing
-            patch_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
-            preserved.append((name, new_mask, patch_np))
-            print(f"  [PRESERVE] Stored '{name}' — preserved pool: "
-                  f"{[p[0] for p in preserved]}")
-
-        else:  # remove
-            # Composite remaining preserved objects (the removed one is excluded)
-            preserved = [(n, m, p) for n, m, p in preserved if n != name]
-            if preserved:
-                print(f"  [PRESERVE] Compositing {len(preserved)} remaining object(s) back ...")
-                next_scene = composite_preserved(next_scene, preserved)
-                # Refresh patches to match current scene pixels
-                scene_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
-                preserved = [(n, m, scene_np) for n, m, _ in preserved]
-            print(f"  [PRESERVE] Removed '{name}' from pool: "
-                  f"{[p[0] for p in preserved]}")
-
         next_scene.save(os.path.join(out_dir, f"result_{tag}.png"))
         print(f"      Saved: result_{tag}.png")
 
@@ -475,9 +259,6 @@ def parse_args():
     p.add_argument("--num_steps",    type=int,   default=50)
     p.add_argument("--height",       type=int,   default=1024)
     p.add_argument("--width",        type=int,   default=1024)
-    p.add_argument("--ref_width",    type=int,   default=320,
-                   help="Width of the reference panel in pixels (default 320). "
-                        "Total canvas = --width + --ref_width, e.g. 1024+320=1344px.")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--device",       default="cuda")
     p.add_argument("--cpu_offload",  action="store_true")
@@ -491,15 +272,14 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     print(f"\n{_SEP}")
-    print(f"  phase1_ref_qwen  —  No-mask reference pipeline")
+    print(f"  phase1_ref_qwen  —  No-mask multi-image reference pipeline")
     print(f"{_SEP}")
     print(f"  Model      : {args.model}")
     print(f"  Sketch dir : {args.sketch_dir}")
-    print(f"  Canvas     : {args.width}px scene + {args.ref_width}px reference "
-          f"= {args.width + args.ref_width}×{args.height} total")
+    print(f"  Output     : {args.width}×{args.height}  (scene + obj_ref passed as separate images)")
     print(f"  Guidance   : scene={args.guidance}  obj={args.obj_guidance}")
     print(f"  Steps      : {args.num_steps}")
-    print(f"  Output     : {args.out_dir}")
+    print(f"  Out dir    : {args.out_dir}")
     print(f"{_SEP}\n")
 
     print(f"Loading {args.model} ...")
@@ -509,11 +289,10 @@ def main():
         cpu_offload=args.cpu_offload,
     )
 
-    # Base scene
     print("\n=== Step 0: Base scene ===")
     grey = Image.new("RGB", (args.width, args.height), (200, 200, 190))
     base = run_qwen(
-        pipe=pipe, canvas=grey, prompt=BASE_PROMPT,
+        pipe=pipe, image=grey, prompt=BASE_PROMPT,
         seed=args.seed, num_steps=args.num_steps, guidance=args.guidance,
         height=args.height, width=args.width,
     )
@@ -526,7 +305,6 @@ def main():
         seed=args.seed, num_steps=args.num_steps,
         guidance=args.guidance, obj_guidance=args.obj_guidance,
         height=args.height, width=args.width,
-        ref_w=args.ref_width,
         out_dir=args.out_dir,
     )
 
