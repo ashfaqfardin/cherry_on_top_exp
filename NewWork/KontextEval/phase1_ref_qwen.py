@@ -155,9 +155,9 @@ def build_reference_canvas(
     scene_rs = scene.convert("RGB").resize((width, height), Image.LANCZOS)
     canvas.paste(scene_rs, (0, 0))
 
-    # Divider
+    # Divider — placed 4px inside the reference panel so the crop never clips it
     draw = ImageDraw.Draw(canvas)
-    draw.line([(width, 0), (width, height)], fill=(160, 160, 160), width=3)
+    draw.line([(width + 4, 0), (width + 4, height)], fill=(160, 160, 160), width=3)
 
     # Right: object reference — fit inside ref panel with padding
     pad    = 16
@@ -184,12 +184,15 @@ def build_reference_canvas(
 def crop_scene(
     output: Image.Image,
     width:  int = 1024,
+    bleed:  int = 16,
 ) -> Image.Image:
     """
-    Crop the left `width` pixels from the output.
-    Because the scene was embedded at full resolution, no resize is needed.
+    Crop the left (width - bleed) pixels then resize to width×height.
+    The bleed margin removes any reference-panel edge that Qwen generated
+    at the scene boundary. A 16px resize from 1008→1024 is visually lossless.
     """
-    return output.crop((0, 0, width, output.height))
+    cropped = output.crop((0, 0, width - bleed, output.height))
+    return cropped.resize((width, output.height), Image.LANCZOS)
 
 
 # ── Insertion prompt ───────────────────────────────────────────────────────────
