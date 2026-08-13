@@ -42,6 +42,7 @@ import gc
 import os
 from typing import List, Tuple
 
+import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -221,6 +222,84 @@ def remove_prompt(description: str) -> str:
     )
 
 
+# ── Object mask generation via Qwen ───────────────────────────────────────────
+
+def generate_object_mask(
+    pipe,
+    scene:       Image.Image,
+    description: str,
+    seed:        int,
+    height:      int,
+    width:       int,
+    mask_steps:  int = 20,
+) -> np.ndarray:
+    """
+    Ask the already-loaded Qwen edit pipeline to produce a binary segmentation
+    mask for the named object.  Returns uint8 (H, W) with values 0 / 255.
+
+    Prompt strategy: low CFG (2.0) + explicit binary output instruction.
+    Post-processing: threshold → morphological close (fill holes) → open (denoise).
+    """
+    prompt = (
+        f"Generate a binary segmentation mask of this room image. "
+        f"Color the {description} pure white and everything else pure black. "
+        f"Output a black and white image only — no colors, no gradients, no textures."
+    )
+    neg = "color, texture, photorealistic, gradient, gray, shadows, detailed, realistic"
+
+    gen = torch.Generator(device=pipe.device).manual_seed(seed + 99)
+    mask_img = pipe(
+        prompt=prompt, negative_prompt=neg,
+        image=scene, num_inference_steps=mask_steps,
+        true_cfg_scale=2.0, height=height, width=width,
+        generator=gen,
+    ).images[0]
+
+    mask_np  = np.array(mask_img.convert("L"))
+    mask_bin = (mask_np > 127).astype(np.uint8) * 255
+
+    # Fill holes in the object silhouette, then remove isolated noise pixels
+    k_close = np.ones((11, 11), np.uint8)
+    k_open  = np.ones((5,  5),  np.uint8)
+    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, k_close)
+    mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN,  k_open)
+
+    px    = int(mask_bin.sum() // 255)
+    total = height * width
+    print(f"    [MASK-GEN] '{description}': {px} px  ({100*px/total:.1f}% of image)")
+    if px < 200:
+        print(f"    [MASK-GEN] WARNING: mask nearly empty — Qwen may not have understood prompt")
+
+    return mask_bin   # (H, W) uint8
+
+
+# ── Preserved object compositing ───────────────────────────────────────────────
+
+def composite_preserved(
+    result:    Image.Image,
+    preserved: list,          # [(name, mask_np, patch_np), ...]
+    feather:   int = 21,
+) -> Image.Image:
+    """
+    Paste stored object patches back onto result using their Qwen-generated masks.
+    Gaussian-feathered edges prevent hard seams at the object boundary.
+    """
+    if not preserved:
+        return result
+
+    result_np = np.array(result.convert("RGB"), dtype=np.float32)
+
+    for name, mask_np, patch_np in preserved:
+        mask_f = mask_np.astype(np.float32) / 255.0
+        if feather > 0:
+            ksize = feather * 2 + 1
+            mask_f = cv2.GaussianBlur(mask_f, (ksize, ksize), feather / 3.0)
+        alpha     = mask_f[:, :, None]                  # (H, W, 1)
+        result_np = result_np * (1.0 - alpha) + patch_np * alpha
+
+    return Image.fromarray(np.clip(result_np, 0, 255).astype(np.uint8))
+
+
 # ── Main chain ────────────────────────────────────────────────────────────────
 
 def run_chain(
@@ -236,10 +315,15 @@ def run_chain(
     width:        int,
     ref_w:        int,
     out_dir:      str,
+    mask_steps:   int = 20,
 ) -> List[Image.Image]:
     results  = [base]
     scene    = base
-    obj_cache: dict = {}   # name → obj_img  (reuse across steps)
+    obj_cache: dict = {}
+
+    # Each entry: (name, mask_np uint8, patch_np float32)
+    # Built after each insertion, popped on removal.
+    preserved: list = []
 
     for i, edit in enumerate(edits):
         name   = edit["name"]
@@ -252,7 +336,7 @@ def run_chain(
         print(f"{'─'*60}")
 
         if action == "insert":
-            # Stage A — generate object image (cached)
+            # Stage A — generate object image (cached per name)
             if name not in obj_cache:
                 sketch_path = os.path.join(sketch_dir, f"{name}.png")
                 if not os.path.isfile(sketch_path):
@@ -275,31 +359,27 @@ def run_chain(
                 print(f"  [A] Reusing cached obj_gen_{name}.png")
                 obj_img = obj_cache[name]
 
-            # Build side-by-side canvas (scene at full res + reference panel)
             canvas = build_reference_canvas(
                 scene=scene, obj_img=obj_img,
                 height=height, width=width, ref_w=ref_w, label=desc,
             )
             canvas.save(os.path.join(out_dir, f"canvas_{tag}.png"))
-            print(f"  [CANVAS] Saved: canvas_{tag}.png  "
-                  f"({width}px scene | {ref_w}px ref → {width+ref_w}×{height} total)")
+            print(f"  [CANVAS] {width}px scene | {ref_w}px ref → {width+ref_w}×{height}")
 
-            prompt   = insert_prompt(desc)
-            neg_p    = "blurry, distorted, low quality, watermark, text, artifacts"
+            prompt = insert_prompt(desc)
+            neg_p  = "blurry, distorted, low quality, watermark, text, artifacts"
 
         else:  # remove
-            canvas = scene   # no reference panel needed
+            canvas = scene
             prompt = remove_prompt(desc)
             neg_p  = f"blurry, distorted, low quality, watermark, text, artifacts, {desc}"
-            print(f"  [A] Removal — using scene directly (no reference panel)")
+            print(f"  [A] Removal — no reference panel")
 
-        # Save prompt
         with open(os.path.join(out_dir, f"prompt_{tag}.txt"), "w") as f:
             f.write(prompt)
         print(f"  [K] Qwen pass  ({num_steps} steps, cfg={guidance}) ...")
-        print(f"      Prompt: {prompt[:120]}...")
+        print(f"      {prompt[:120]}...")
 
-        # Wider canvas for insert (scene + ref); scene-only for remove
         canvas_w = (width + ref_w) if action == "insert" else width
         raw_output = run_qwen(
             pipe=pipe, canvas=canvas, prompt=prompt,
@@ -308,12 +388,47 @@ def run_chain(
         )
         raw_output.save(os.path.join(out_dir, f"raw_{tag}.png"))
 
+        # Crop the scene panel (insertion only)
         if action == "insert":
-            # Crop exactly the left `width` pixels — scene was at full res, no resize needed
             next_scene = crop_scene(raw_output, width=width)
-            print(f"  [CROP] Cropped left {width}px → {width}×{height}  (no resize)")
+            print(f"  [CROP] Left {width}px extracted")
         else:
             next_scene = raw_output
+
+        # ── Object preservation ───────────────────────────────────────────────
+        if action == "insert":
+            # 1. Composite any previously preserved objects back onto next_scene.
+            #    Qwen may have slightly changed them; this restores exact pixels.
+            if preserved:
+                print(f"  [PRESERVE] Compositing {len(preserved)} prior object(s) back ...")
+                next_scene = composite_preserved(next_scene, preserved)
+
+            # 2. Generate mask for the NEWLY placed object in next_scene.
+            print(f"  [MASK-GEN] Asking Qwen to mask '{desc}' ...")
+            new_mask = generate_object_mask(
+                pipe=pipe, scene=next_scene, description=desc,
+                seed=seed, height=height, width=width, mask_steps=mask_steps,
+            )
+            Image.fromarray(new_mask).save(
+                os.path.join(out_dir, f"mask_{tag}.png")
+            )
+            # 3. Store (mask + pixel patch) for future compositing
+            patch_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
+            preserved.append((name, new_mask, patch_np))
+            print(f"  [PRESERVE] Stored '{name}' — preserved pool: "
+                  f"{[p[0] for p in preserved]}")
+
+        else:  # remove
+            # Composite remaining preserved objects (the removed one is excluded)
+            preserved = [(n, m, p) for n, m, p in preserved if n != name]
+            if preserved:
+                print(f"  [PRESERVE] Compositing {len(preserved)} remaining object(s) back ...")
+                next_scene = composite_preserved(next_scene, preserved)
+                # Refresh patches to match current scene pixels
+                scene_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
+                preserved = [(n, m, scene_np) for n, m, _ in preserved]
+            print(f"  [PRESERVE] Removed '{name}' from pool: "
+                  f"{[p[0] for p in preserved]}")
 
         next_scene.save(os.path.join(out_dir, f"result_{tag}.png"))
         print(f"      Saved: result_{tag}.png")
