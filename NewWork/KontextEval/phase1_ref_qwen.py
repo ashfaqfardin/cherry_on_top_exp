@@ -8,9 +8,9 @@ No placement masks, no manual paste, no BLD callbacks, no K/V injection.
 Pipeline per insertion step
 ----------------------------
   1. Stage A  : sketch → obj_img  (Qwen renders the sketch)
-  2. Canvas   : [scene (75%) | obj_img reference (25%)] → 1024×1024
-  3. Stage K  : Qwen(image=canvas, prompt=place_prompt) → 1024×1024 output
-  4. Crop     : take left 75% of output → resize to 1024×1024 → next scene
+  2. Canvas   : [scene 1024×1024 | obj_img reference ref_width×1024] → wider canvas
+  3. Stage K  : Qwen(image=canvas, prompt=place_prompt) → wider output
+  4. Crop     : take left 1024px of output → next scene  (no resize, no quality loss)
 
 Pipeline per removal step
 --------------------------
@@ -134,39 +134,37 @@ def generate_object(
 # ── Side-by-side canvas builder ────────────────────────────────────────────────
 
 def build_reference_canvas(
-    scene:      Image.Image,
-    obj_img:    Image.Image,
-    height:     int = 1024,
-    width:      int = 1024,
-    scene_frac: float = 0.75,
-    label:      str = "",
+    scene:   Image.Image,
+    obj_img: Image.Image,
+    height:  int = 1024,
+    width:   int = 1024,
+    ref_w:   int = 320,
+    label:   str = "",
 ) -> Image.Image:
     """
-    Build a [scene | reference] canvas at (width × height).
+    Build a [scene | reference] canvas at ((width + ref_w) × height).
 
-    scene_frac=0.75 → left 768px = scene, right 256px = object reference.
-    A thin grey divider separates the panels. An optional label is rendered
-    in the reference panel to help Qwen understand the layout.
+    The scene fills the left `width` pixels at full resolution — no downscaling.
+    The object reference fills the right `ref_w` pixels.
+    Total canvas: (width + ref_w) × height  e.g. 1344×1024 with defaults.
     """
-    scene_w = int(width * scene_frac)
-    ref_w   = width - scene_w
+    total_w = width + ref_w
+    canvas  = Image.new("RGB", (total_w, height), (240, 240, 240))
 
-    canvas = Image.new("RGB", (width, height), (240, 240, 240))
-
-    # Left: scene
-    scene_rs = scene.convert("RGB").resize((scene_w, height), Image.LANCZOS)
+    # Left: scene at full resolution
+    scene_rs = scene.convert("RGB").resize((width, height), Image.LANCZOS)
     canvas.paste(scene_rs, (0, 0))
 
     # Divider
     draw = ImageDraw.Draw(canvas)
-    draw.line([(scene_w, 0), (scene_w, height)], fill=(160, 160, 160), width=3)
+    draw.line([(width, 0), (width, height)], fill=(160, 160, 160), width=3)
 
     # Right: object reference — fit inside ref panel with padding
-    pad   = 16
-    inner = ref_w - 2 * pad
+    pad    = 16
+    inner  = ref_w - 2 * pad
     obj_rs = obj_img.convert("RGB")
     obj_rs.thumbnail((inner, height - 2 * pad), Image.LANCZOS)
-    ox = scene_w + pad + (inner - obj_rs.width)  // 2
+    ox = width + pad + (inner - obj_rs.width)  // 2
     oy = pad + (height - 2 * pad - obj_rs.height) // 2
     canvas.paste(obj_rs, (ox, oy))
 
@@ -176,26 +174,22 @@ def build_reference_canvas(
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
         except OSError:
             font = ImageFont.load_default()
-        draw.text((scene_w + pad, height - 36), f"REF: {label}", fill=(80, 80, 80), font=font)
+        draw.text((width + pad, height - 36), f"REF: {label}", fill=(80, 80, 80), font=font)
 
     return canvas
 
 
-# ── Crop left panel and restore to full resolution ─────────────────────────────
+# ── Crop left panel — exact scene width, no resize needed ─────────────────────
 
 def crop_scene(
-    output:     Image.Image,
-    height:     int = 1024,
-    width:      int = 1024,
-    scene_frac: float = 0.75,
+    output: Image.Image,
+    width:  int = 1024,
 ) -> Image.Image:
     """
-    Crop the left scene_frac of the output and resize back to (width × height).
-    The reference panel is discarded.
+    Crop the left `width` pixels from the output.
+    Because the scene was embedded at full resolution, no resize is needed.
     """
-    scene_w = int(output.width * scene_frac)
-    cropped = output.crop((0, 0, scene_w, output.height))
-    return cropped.resize((width, height), Image.LANCZOS)
+    return output.crop((0, 0, width, output.height))
 
 
 # ── Insertion prompt ───────────────────────────────────────────────────────────
@@ -228,17 +222,17 @@ def remove_prompt(description: str) -> str:
 
 def run_chain(
     pipe,
-    base:       Image.Image,
-    edits:      List[dict],
-    sketch_dir: str,
-    seed:       int,
-    num_steps:  int,
-    guidance:   float,
+    base:         Image.Image,
+    edits:        List[dict],
+    sketch_dir:   str,
+    seed:         int,
+    num_steps:    int,
+    guidance:     float,
     obj_guidance: float,
-    height:     int,
-    width:      int,
-    scene_frac: float,
-    out_dir:    str,
+    height:       int,
+    width:        int,
+    ref_w:        int,
+    out_dir:      str,
 ) -> List[Image.Image]:
     results  = [base]
     scene    = base
@@ -278,15 +272,14 @@ def run_chain(
                 print(f"  [A] Reusing cached obj_gen_{name}.png")
                 obj_img = obj_cache[name]
 
-            # Build side-by-side canvas
+            # Build side-by-side canvas (scene at full res + reference panel)
             canvas = build_reference_canvas(
                 scene=scene, obj_img=obj_img,
-                height=height, width=width,
-                scene_frac=scene_frac, label=desc,
+                height=height, width=width, ref_w=ref_w, label=desc,
             )
             canvas.save(os.path.join(out_dir, f"canvas_{tag}.png"))
             print(f"  [CANVAS] Saved: canvas_{tag}.png  "
-                  f"(scene={int(width*scene_frac)}px | ref={width-int(width*scene_frac)}px)")
+                  f"({width}px scene | {ref_w}px ref → {width+ref_w}×{height} total)")
 
             prompt   = insert_prompt(desc)
             neg_p    = "blurry, distorted, low quality, watermark, text, artifacts"
@@ -303,18 +296,19 @@ def run_chain(
         print(f"  [K] Qwen pass  ({num_steps} steps, cfg={guidance}) ...")
         print(f"      Prompt: {prompt[:120]}...")
 
+        # Wider canvas for insert (scene + ref); scene-only for remove
+        canvas_w = (width + ref_w) if action == "insert" else width
         raw_output = run_qwen(
             pipe=pipe, canvas=canvas, prompt=prompt,
             seed=seed, num_steps=num_steps, guidance=guidance,
-            height=height, width=width, negative_prompt=neg_p,
+            height=height, width=canvas_w, negative_prompt=neg_p,
         )
         raw_output.save(os.path.join(out_dir, f"raw_{tag}.png"))
 
         if action == "insert":
-            # Crop left panel → resize to full resolution
-            next_scene = crop_scene(raw_output, height=height, width=width,
-                                    scene_frac=scene_frac)
-            print(f"  [CROP] Cropped left {scene_frac:.0%} → resized to {width}×{height}")
+            # Crop exactly the left `width` pixels — scene was at full res, no resize needed
+            next_scene = crop_scene(raw_output, width=width)
+            print(f"  [CROP] Cropped left {width}px → {width}×{height}  (no resize)")
         else:
             next_scene = raw_output
 
@@ -363,8 +357,9 @@ def parse_args():
     p.add_argument("--num_steps",    type=int,   default=50)
     p.add_argument("--height",       type=int,   default=1024)
     p.add_argument("--width",        type=int,   default=1024)
-    p.add_argument("--scene_frac",   type=float, default=0.75,
-                   help="Fraction of canvas width given to the scene (default 0.75 = 768px).")
+    p.add_argument("--ref_width",    type=int,   default=320,
+                   help="Width of the reference panel in pixels (default 320). "
+                        "Total canvas = --width + --ref_width, e.g. 1024+320=1344px.")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--device",       default="cuda")
     p.add_argument("--cpu_offload",  action="store_true")
@@ -382,8 +377,8 @@ def main():
     print(f"{_SEP}")
     print(f"  Model      : {args.model}")
     print(f"  Sketch dir : {args.sketch_dir}")
-    print(f"  Scene frac : {args.scene_frac}  ({int(args.width*args.scene_frac)}px scene "
-          f"| {args.width-int(args.width*args.scene_frac)}px reference)")
+    print(f"  Canvas     : {args.width}px scene + {args.ref_width}px reference "
+          f"= {args.width + args.ref_width}×{args.height} total")
     print(f"  Guidance   : scene={args.guidance}  obj={args.obj_guidance}")
     print(f"  Steps      : {args.num_steps}")
     print(f"  Output     : {args.out_dir}")
@@ -413,7 +408,7 @@ def main():
         seed=args.seed, num_steps=args.num_steps,
         guidance=args.guidance, obj_guidance=args.obj_guidance,
         height=args.height, width=args.width,
-        scene_frac=args.scene_frac,
+        ref_w=args.ref_width,
         out_dir=args.out_dir,
     )
 
