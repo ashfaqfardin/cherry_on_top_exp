@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import math
 import os
 from typing import List
 
@@ -37,7 +38,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import QwenImageEditPlusPipeline
+from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
+from huggingface_hub import hf_hub_download
 from PIL import Image
 from typing import Dict, Tuple
 
@@ -64,6 +66,28 @@ BASE_PROMPT = (
 
 _SEP = "═" * 60
 
+LIGHTNING_REPO = "lightx2v/Qwen-Image-Lightning"
+LIGHTNING_SUBFOLDER = "Qwen-Image-Edit-2509"
+
+# Scheduler config required by the Lightning distilled weights.
+# shift=1.0 + use_dynamic_shifting=True replaces the base model's higher shift.
+LIGHTNING_SCHEDULER_CFG = {
+    "base_image_seq_len": 256,
+    "base_shift": math.log(3),
+    "invert_sigmas": False,
+    "max_image_seq_len": 8192,
+    "max_shift": math.log(3),
+    "num_train_timesteps": 1000,
+    "shift": 1.0,
+    "shift_terminal": None,
+    "stochastic_sampling": False,
+    "time_shift_type": "exponential",
+    "use_beta_sigmas": False,
+    "use_dynamic_shifting": True,
+    "use_exponential_sigmas": False,
+    "use_karras_sigmas": False,
+}
+
 
 # ── Pipeline loading ───────────────────────────────────────────────────────────
 
@@ -74,14 +98,47 @@ def load_pipeline(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     cpu_offload: bool = False,
+    lightning: bool = False,
+    lightning_steps: int = 8,
 ) -> QwenImageEditPlusPipeline:
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        model, torch_dtype=dtype, token=hf_token, cache_dir=cache_dir,
-    )
+    # Auto-enable CPU offload when GPU VRAM is likely too small.
+    # bf16 transformer (20B) + text encoder (7B) needs ~55 GB.
+    # Lightning LoRA does NOT reduce the bf16 transformer size — offload still needed.
+    if not cpu_offload and device != "cpu" and torch.cuda.is_available():
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        if total_gb < 65:
+            print(f"  [AUTO] GPU has {total_gb:.0f} GB — enabling cpu_offload "
+                  f"(bf16 model needs ~55 GB)")
+            cpu_offload = True
+
+    kwargs: dict = dict(torch_dtype=dtype, token=hf_token, cache_dir=cache_dir)
+    if lightning:
+        kwargs["scheduler"] = FlowMatchEulerDiscreteScheduler.from_config(
+            LIGHTNING_SCHEDULER_CFG
+        )
+        print(f"  [Lightning] Scheduler: FlowMatch dynamic-shift (shift=1.0, log3 range)")
+
+    pipe = QwenImageEditPlusPipeline.from_pretrained(model, **kwargs)
+
     if cpu_offload:
         pipe.enable_model_cpu_offload()
     else:
         pipe.to(device)
+
+    if lightning:
+        weight_name = (
+            f"Qwen-Image-Edit-2509-Lightning-{lightning_steps}steps-V1.0-bf16.safetensors"
+        )
+        print(f"  [Lightning] Downloading LoRA: {LIGHTNING_REPO}/{LIGHTNING_SUBFOLDER}/{weight_name}")
+        lora_path = hf_hub_download(
+            repo_id=LIGHTNING_REPO,
+            filename=f"{LIGHTNING_SUBFOLDER}/{weight_name}",
+            token=hf_token,
+            cache_dir=cache_dir,
+        )
+        pipe.load_lora_weights(lora_path)
+        print(f"  [Lightning] LoRA loaded — {lightning_steps}-step distillation active")
+
     pipe.set_progress_bar_config(disable=True)
     return pipe
 
@@ -261,10 +318,12 @@ class QwenSKAProcessor:
         # ── CAPTURE (before try-block so it always succeeds even if RoPE fails)
         # Frame layout: [output(0:n_out) | scene_cond(n_out:2*n_out) | obj(2*n_out:)]
         # img_k/v are (B, L, H, d) here; permute to (B, H, n_out, d) for storage.
+        # Store on CPU so captured tensors don't hold GPU memory across editing steps
+        # (critical when cpu_offload is enabled; harmless otherwise).
         if n_out > 0 and L_img >= 2 * n_out:
             self.store.new_kv[self.block_idx] = (
-                img_k[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().clone(),
-                img_v[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().clone(),
+                img_k[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
+                img_v[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
             )
 
         # In capture-only mode the attention computation is handled by the original
@@ -389,6 +448,7 @@ def run_qwen_ska(
     negative_prompt: str,
     ska_store:       SKAStore | None,
     ska_phase:       str      | None,   # "capture" | "inject" | None (skip)
+    ska_gate:        float    = SKA_SIGMA_GATE,
 ) -> Image.Image:
     """
     run_qwen with optional SKA.
@@ -410,7 +470,7 @@ def run_qwen_ska(
     ska_store.new_kv = {}
 
     # Approximate step index where σ first drops below gate (linear FlowMatch schedule)
-    inject_start = max(1, int(num_steps * (1.0 - SKA_SIGMA_GATE)) - 1)
+    inject_start = max(1, int(num_steps * (1.0 - ska_gate)) - 1)
     callback     = _SKACallback(ska_store, inject_start, ska_phase)
 
     originals = _install_ska(pipe.transformer, SKA_BLOCKS, ska_store)
@@ -446,6 +506,7 @@ def run_chain(
     width:        int,
     out_dir:      str,
     use_ska:      bool = True,
+    ska_gate:     float = SKA_SIGMA_GATE,
 ) -> List[Image.Image]:
     results   = [base]
     scene     = base
@@ -516,6 +577,7 @@ def run_chain(
             seed=seed, num_steps=num_steps, guidance=guidance,
             height=height, width=width, negative_prompt=neg_p,
             ska_store=ska_store, ska_phase=ska_phase,
+            ska_gate=ska_gate,
         )
         next_scene.save(os.path.join(out_dir, f"result_{tag}.png"))
         print(f"      Saved: result_{tag}.png")
@@ -552,21 +614,34 @@ def save_grid(images, titles, path, ncols=None, figsize_per=(4, 4)):
 
 def parse_args():
     p = argparse.ArgumentParser(description="No-mask reference pipeline for Qwen-Image-Edit")
-    p.add_argument("--sketch_dir",   required=True)
-    p.add_argument("--hf_token",     required=True)
-    p.add_argument("--cache_dir",    default="./models")
-    p.add_argument("--out_dir",      default="results/phase1_ref_qwen")
-    p.add_argument("--model",        default="Qwen/Qwen-Image-Edit-2509")
-    p.add_argument("--guidance",     type=float, default=4.0)
-    p.add_argument("--obj_guidance", type=float, default=4.0)
-    p.add_argument("--num_steps",    type=int,   default=50)
-    p.add_argument("--height",       type=int,   default=1024)
-    p.add_argument("--width",        type=int,   default=1024)
-    p.add_argument("--seed",         type=int,   default=42)
-    p.add_argument("--device",       default="cuda")
-    p.add_argument("--cpu_offload",  action="store_true")
-    p.add_argument("--no_ska",       action="store_true",
-                   help="Disable Scene K/V Anchoring (run plain multi-image pipeline)")
+    p.add_argument("--sketch_dir",      required=True)
+    p.add_argument("--hf_token",        required=True)
+    p.add_argument("--cache_dir",       default="./models")
+    p.add_argument("--out_dir",         default="results/phase1_ref_qwen")
+    p.add_argument("--model",           default="Qwen/Qwen-Image-Edit-2509")
+    p.add_argument("--guidance",        type=float, default=None,
+                   help="CFG scale — default 1.0 for --lightning, 4.0 otherwise")
+    p.add_argument("--obj_guidance",    type=float, default=None,
+                   help="Object render CFG — default same as --guidance")
+    p.add_argument("--num_steps",       type=int,   default=None,
+                   help="Denoising steps — default 8 for --lightning, 50 otherwise")
+    p.add_argument("--height",          type=int,   default=1024)
+    p.add_argument("--width",           type=int,   default=1024)
+    p.add_argument("--seed",            type=int,   default=42)
+    p.add_argument("--device",          default="cuda")
+    p.add_argument("--cpu_offload",     action="store_true",
+                   help="Force CPU offload (auto-enabled when GPU < 65 GB)")
+    p.add_argument("--base_scene",      default=None,
+                   help="Path to a pre-existing base scene PNG — skips Step 0 generation")
+    p.add_argument("--no_ska",          action="store_true",
+                   help="Disable Scene K/V Anchoring")
+    p.add_argument("--ska_gate",        type=float, default=None,
+                   help="SKA sigma gate — default 0.3; consider 0.5 for 8-step Lightning")
+    # Lightning distillation
+    p.add_argument("--lightning",       action="store_true",
+                   help="Use Lightning distilled LoRA (lightx2v/Qwen-Image-Lightning)")
+    p.add_argument("--lightning_steps", type=int, default=8, choices=[4, 8],
+                   help="Lightning LoRA variant: 4 or 8 steps (default: 8)")
     return p.parse_args()
 
 
@@ -576,15 +651,23 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Resolve None sentinels — Lightning changes the sensible defaults
+    num_steps    = args.num_steps    if args.num_steps    is not None else (8    if args.lightning else 50)
+    guidance     = args.guidance     if args.guidance     is not None else (1.0  if args.lightning else 4.0)
+    obj_guidance = args.obj_guidance if args.obj_guidance is not None else guidance
+    ska_gate     = args.ska_gate     if args.ska_gate     is not None else SKA_SIGMA_GATE
+
     print(f"\n{_SEP}")
     print(f"  phase1_ref_qwen  —  No-mask multi-image reference pipeline")
     print(f"{_SEP}")
     print(f"  Model      : {args.model}")
+    if args.lightning:
+        print(f"  Lightning  : ON  ({args.lightning_steps}-step LoRA from {LIGHTNING_REPO})")
     print(f"  Sketch dir : {args.sketch_dir}")
-    print(f"  Output     : {args.width}×{args.height}  (scene + obj_ref passed as separate images)")
-    print(f"  Guidance   : scene={args.guidance}  obj={args.obj_guidance}")
-    print(f"  Steps      : {args.num_steps}")
-    print(f"  SKA        : {'OFF (--no_ska)' if args.no_ska else f'ON  blocks={SKA_BLOCKS}  σ<{SKA_SIGMA_GATE}'}")
+    print(f"  Output     : {args.width}×{args.height}")
+    print(f"  Guidance   : scene={guidance}  obj={obj_guidance}")
+    print(f"  Steps      : {num_steps}")
+    print(f"  SKA        : {'OFF (--no_ska)' if args.no_ska else f'ON  blocks={SKA_BLOCKS}  σ<{ska_gate}'}")
     print(f"  Out dir    : {args.out_dir}")
     print(f"{_SEP}\n")
 
@@ -593,26 +676,36 @@ def main():
         model=args.model, hf_token=args.hf_token,
         cache_dir=args.cache_dir, device=args.device,
         cpu_offload=args.cpu_offload,
+        lightning=args.lightning,
+        lightning_steps=args.lightning_steps,
     )
 
     print("\n=== Step 0: Base scene ===")
-    grey = Image.new("RGB", (args.width, args.height), (200, 200, 190))
-    base = run_qwen(
-        pipe=pipe, image=grey, prompt=BASE_PROMPT,
-        seed=args.seed, num_steps=args.num_steps, guidance=args.guidance,
-        height=args.height, width=args.width,
-    )
-    base.save(os.path.join(args.out_dir, "base_scene.png"))
-    print(f"  Saved: base_scene.png")
+    base_path = os.path.join(args.out_dir, "base_scene.png")
+    if args.base_scene:
+        base = Image.open(args.base_scene).convert("RGB").resize(
+            (args.width, args.height), Image.Resampling.LANCZOS)
+        base.save(base_path)
+        print(f"  Loaded: {args.base_scene}")
+    else:
+        grey = Image.new("RGB", (args.width, args.height), (200, 200, 190))
+        base = run_qwen(
+            pipe=pipe, image=grey, prompt=BASE_PROMPT,
+            seed=args.seed, num_steps=num_steps, guidance=guidance,
+            height=args.height, width=args.width,
+        )
+        base.save(base_path)
+        print(f"  Saved: base_scene.png")
 
     results = run_chain(
         pipe=pipe, base=base, edits=EDITS,
         sketch_dir=args.sketch_dir,
-        seed=args.seed, num_steps=args.num_steps,
-        guidance=args.guidance, obj_guidance=args.obj_guidance,
+        seed=args.seed, num_steps=num_steps,
+        guidance=guidance, obj_guidance=obj_guidance,
         height=args.height, width=args.width,
         out_dir=args.out_dir,
         use_ska=not args.no_ska,
+        ska_gate=ska_gate,
     )
 
     labels = ["base"] + [
