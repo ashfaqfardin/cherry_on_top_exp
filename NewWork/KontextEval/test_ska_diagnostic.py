@@ -560,15 +560,20 @@ def main():
 
     # ── Encode prompt ─────────────────────────────────────────────────────────
     print("Encoding prompt ...")
+    import inspect as _inspect
+    _ep_sig = _inspect.signature(pipe.encode_prompt).parameters
+
+    _ep_kwargs: dict = {"prompt": args.prompt}
+    if "device"                     in _ep_sig: _ep_kwargs["device"]                     = device
+    if "num_images_per_prompt"      in _ep_sig: _ep_kwargs["num_images_per_prompt"]      = 1
+    if "do_classifier_free_guidance" in _ep_sig: _ep_kwargs["do_classifier_free_guidance"] = False
+    if "negative_prompt"            in _ep_sig: _ep_kwargs["negative_prompt"]            = ""
+
     with torch.no_grad():
-        enc_result = pipe.encode_prompt(
-            prompt          = args.prompt,
-            negative_prompt = "",
-            device          = device,
-            num_images_per_prompt = 1,
-            do_classifier_free_guidance = False,
-        )
-    # Pipeline returns (embeds, neg_embeds, mask, neg_mask) or (embeds, neg_embeds)
+        enc_result = pipe.encode_prompt(**_ep_kwargs)
+
+    # Wan/Qwen pipelines return varying shapes; grab embeds + mask defensively
+    enc_result = enc_result if isinstance(enc_result, (list, tuple)) else (enc_result,)
     prompt_embeds = enc_result[0]
     prompt_mask   = enc_result[2] if len(enc_result) >= 3 else None
     print(f"  Prompt embed shape: {prompt_embeds.shape}")
