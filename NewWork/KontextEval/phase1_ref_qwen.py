@@ -204,16 +204,17 @@ class QwenSKAProcessor:
     """
     Drop-in replacement for QwenDoubleStreamAttnProcessor2_0 on SKA_BLOCKS.
 
-    "capture": standard forward + store scene-conditioning K/V (frame=1 tokens)
-               into store.new_kv for the next editing step.
-    "inject" : standard forward + extend joint K/V with previously stored scene
-               K/V (store.kv) + simultaneously capture new K/V (store.new_kv).
-    "normal" : identical to original processor — used outside the σ<gate window.
+    "normal" : fully delegates to the stored original processor — zero deviation.
+    "capture": project K/V → capture scene-conditioning slice → delegate to original
+               for the attention computation itself.
+    "inject" : project K/V → capture scene slice → extend K/V with stored scene K/V
+               → custom SDPA.  Falls back to original if RoPE or SDPA raise.
     """
 
-    def __init__(self, block_idx: int, store: SKAStore):
+    def __init__(self, block_idx: int, store: SKAStore, original_processor):
         self.block_idx = block_idx
         self.store     = store
+        self.original  = original_processor   # used for normal mode and fallback
 
     def __call__(
         self,
@@ -224,13 +225,25 @@ class QwenSKAProcessor:
         image_rotary_emb:           tuple        | None = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mode = self.store.mode
+
+        # ── normal mode: delegate entirely — no numerical deviation ───────────
+        if mode == "normal":
+            return self.original(
+                attn, hidden_states, encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                image_rotary_emb=image_rotary_emb,
+                **kwargs,
+            )
+
+        # ── capture / inject mode ─────────────────────────────────────────────
         B, L_img, inner_dim = hidden_states.shape
         L_txt    = encoder_hidden_states.shape[1]
         n_heads  = attn.heads
         head_dim = inner_dim // n_heads
         n_out    = self.store.n_out   # tokens per output frame
 
-        # ── project → (B, L, H, d) → norm ────────────────────────────────────
+        # Project → (B, L, H, d) → norm
         img_q = attn.to_q(hidden_states).reshape(B, L_img, n_heads, head_dim)
         img_k = attn.to_k(hidden_states).reshape(B, L_img, n_heads, head_dim)
         img_v = attn.to_v(hidden_states).reshape(B, L_img, n_heads, head_dim)
@@ -245,76 +258,92 @@ class QwenSKAProcessor:
         if getattr(attn, "norm_added_q", None) is not None: txt_q = attn.norm_added_q(txt_q)
         if getattr(attn, "norm_added_k", None) is not None: txt_k = attn.norm_added_k(txt_k)
 
-        # ── RoPE on (B, L, H, d) — BEFORE head transpose ─────────────────────
-        if image_rotary_emb is not None and _apply_rope is not None:
-            try:
+        # ── CAPTURE (before try-block so it always succeeds even if RoPE fails)
+        # Frame layout: [output(0:n_out) | scene_cond(n_out:2*n_out) | obj(2*n_out:)]
+        # img_k/v are (B, L, H, d) here; permute to (B, H, n_out, d) for storage.
+        if n_out > 0 and L_img >= 2 * n_out:
+            self.store.new_kv[self.block_idx] = (
+                img_k[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().clone(),
+                img_v[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().clone(),
+            )
+
+        # In capture-only mode the attention computation is handled by the original
+        # processor (no injection needed, and we avoid any custom SDPA risk).
+        if mode == "capture":
+            return self.original(
+                attn, hidden_states, encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                image_rotary_emb=image_rotary_emb,
+                **kwargs,
+            )
+
+        # ── INJECT mode: extend K/V, then custom SDPA ────────────────────────
+        try:
+            # RoPE on (B, L, H, d) — BEFORE head transpose
+            if image_rotary_emb is not None and _apply_rope is not None:
                 img_freqs, txt_freqs = image_rotary_emb
                 img_q = _apply_rope(img_q, img_freqs, use_real=False)
                 img_k = _apply_rope(img_k, img_freqs, use_real=False)
                 txt_q = _apply_rope(txt_q, txt_freqs, use_real=False)
                 txt_k = _apply_rope(txt_k, txt_freqs, use_real=False)
-            except Exception:
-                pass  # shape mismatch — proceed without RoPE (diagnostic-proven safe)
 
-        # ── transpose to (B, H, L, d) for SDPA ───────────────────────────────
-        img_q = img_q.transpose(1, 2)
-        img_k = img_k.transpose(1, 2)
-        img_v = img_v.transpose(1, 2)
-        txt_q = txt_q.transpose(1, 2)
-        txt_k = txt_k.transpose(1, 2)
-        txt_v = txt_v.transpose(1, 2)
+            # Transpose to (B, H, L, d) for SDPA
+            img_q = img_q.transpose(1, 2)
+            img_k = img_k.transpose(1, 2)
+            img_v = img_v.transpose(1, 2)
+            txt_q = txt_q.transpose(1, 2)
+            txt_k = txt_k.transpose(1, 2)
+            txt_v = txt_v.transpose(1, 2)
 
-        mode = self.store.mode
+            # Extend K/V with previous scene's K/V
+            n_stored = 0
+            if self.store.has_kv and self.block_idx in self.store.kv:
+                s1_k, s1_v = self.store.kv[self.block_idx]   # (B, H, n_out, d)
+                s1_k = s1_k.to(img_k.device, img_k.dtype)
+                s1_v = s1_v.to(img_v.device, img_v.dtype)
+                img_k = torch.cat([img_k, s1_k], dim=2)
+                img_v = torch.cat([img_v, s1_v], dim=2)
+                n_stored = s1_k.shape[2]
 
-        # ── CAPTURE: scene-conditioning slice [n_out : 2*n_out] → new_kv ─────
-        # Frame layout: [output(0:n_out) | scene_cond(n_out:2*n_out) | obj(2*n_out:)]
-        # Capture BEFORE inject so new_kv holds the CURRENT scene (not the injected one).
-        if mode in ("capture", "inject") and n_out > 0 and L_img >= 2 * n_out:
-            self.store.new_kv[self.block_idx] = (
-                img_k[:, :, n_out : 2 * n_out, :].detach().clone(),
-                img_v[:, :, n_out : 2 * n_out, :].detach().clone(),
+            # Joint attention
+            joint_q = torch.cat([txt_q, img_q], dim=2)
+            joint_k = torch.cat([txt_k, img_k], dim=2)
+            joint_v = torch.cat([txt_v, img_v], dim=2)
+
+            attn_mask = None
+            if encoder_hidden_states_mask is not None:
+                img_ones = torch.ones((B, L_img), dtype=torch.bool, device=hidden_states.device)
+                kv_bool  = torch.cat([encoder_hidden_states_mask, img_ones], dim=1)
+                if n_stored > 0:
+                    kv_bool = torch.cat([
+                        kv_bool,
+                        torch.ones((B, n_stored), dtype=torch.bool, device=hidden_states.device),
+                    ], dim=1)
+                attn_mask = (1.0 - kv_bool.float()[:, None, None, :]) * torch.finfo(joint_q.dtype).min
+
+            joint_out = F.scaled_dot_product_attention(
+                joint_q, joint_k, joint_v,
+                attn_mask=attn_mask, dropout_p=0.0, is_causal=False,
+            )   # (B, H, L_txt+L_img, d)
+
+            txt_out = joint_out[:, :, :L_txt, :].transpose(1, 2).reshape(B, L_txt, inner_dim)
+            img_out = joint_out[:, :, L_txt:L_txt + L_img, :].transpose(1, 2).reshape(B, L_img, inner_dim)
+
+            img_out = attn.to_out[0](img_out)
+            img_out = attn.to_out[1](img_out)
+            txt_out = attn.to_add_out(txt_out)
+
+            return img_out, txt_out
+
+        except Exception:
+            # RoPE/SDPA failed — fall back to original for this call.
+            # Capture already populated new_kv above, so next step can inject.
+            return self.original(
+                attn, hidden_states, encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                image_rotary_emb=image_rotary_emb,
+                **kwargs,
             )
-
-        # ── INJECT: extend K/V with previous scene's K/V (store.kv) ──────────
-        n_stored = 0
-        if mode == "inject" and self.store.has_kv and self.block_idx in self.store.kv:
-            s1_k, s1_v = self.store.kv[self.block_idx]
-            s1_k = s1_k.to(img_k.device, img_k.dtype)
-            s1_v = s1_v.to(img_v.device, img_v.dtype)
-            img_k = torch.cat([img_k, s1_k], dim=2)   # (B, H, L_img+n_stored, d)
-            img_v = torch.cat([img_v, s1_v], dim=2)
-            n_stored = s1_k.shape[2]
-
-        # ── joint attention ───────────────────────────────────────────────────
-        joint_q = torch.cat([txt_q, img_q], dim=2)   # queries never extended
-        joint_k = torch.cat([txt_k, img_k], dim=2)
-        joint_v = torch.cat([txt_v, img_v], dim=2)
-
-        attn_mask = None
-        if encoder_hidden_states_mask is not None:
-            img_ones = torch.ones((B, L_img), dtype=torch.bool, device=hidden_states.device)
-            kv_bool  = torch.cat([encoder_hidden_states_mask, img_ones], dim=1)
-            if n_stored > 0:
-                kv_bool = torch.cat([
-                    kv_bool,
-                    torch.ones((B, n_stored), dtype=torch.bool, device=hidden_states.device),
-                ], dim=1)
-            attn_mask = (1.0 - kv_bool.float()[:, None, None, :]) * torch.finfo(joint_q.dtype).min
-
-        joint_out = F.scaled_dot_product_attention(
-            joint_q, joint_k, joint_v,
-            attn_mask=attn_mask, dropout_p=0.0, is_causal=False,
-        )   # (B, H, L_txt+L_img, d)
-
-        # ── split, un-transpose, project ──────────────────────────────────────
-        txt_out = joint_out[:, :, :L_txt, :].transpose(1, 2).reshape(B, L_txt, inner_dim)
-        img_out = joint_out[:, :, L_txt:L_txt + L_img, :].transpose(1, 2).reshape(B, L_img, inner_dim)
-
-        img_out = attn.to_out[0](img_out)
-        img_out = attn.to_out[1](img_out)
-        txt_out = attn.to_add_out(txt_out)
-
-        return img_out, txt_out
 
 
 class _SKACallback:
@@ -337,8 +366,9 @@ def _install_ska(transformer, blocks: list, store: SKAStore) -> dict:
     originals = {}
     for idx in blocks:
         blk = transformer.transformer_blocks[idx]
-        originals[idx] = blk.attn.processor
-        blk.attn.set_processor(QwenSKAProcessor(idx, store))
+        orig = blk.attn.processor
+        originals[idx] = orig
+        blk.attn.set_processor(QwenSKAProcessor(idx, store, orig))
     return originals
 
 
