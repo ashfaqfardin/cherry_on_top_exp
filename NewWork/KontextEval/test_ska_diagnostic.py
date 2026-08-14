@@ -86,19 +86,10 @@ class QwenSKADiagnosticProcessor:
         self.block_idx = block_idx
         self.store     = store
 
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _to_heads(x: torch.Tensor, n_heads: int, head_dim: int) -> torch.Tensor:
-        B, L, _ = x.shape
-        return x.reshape(B, L, n_heads, head_dim).transpose(1, 2)   # (B, H, L, d)
-
-    @staticmethod
-    def _from_heads(x: torch.Tensor) -> torch.Tensor:
-        B, H, L, d = x.shape
-        return x.transpose(1, 2).reshape(B, L, H * d)               # (B, L, H*d)
-
     # ── main call ─────────────────────────────────────────────────────────────
+    #
+    # RoPE order (critical): apply_rotary_emb_qwen expects (B, L, H, d).
+    # We therefore norm → RoPE → transpose, NOT project → transpose → norm → RoPE.
 
     def __call__(
         self,
@@ -111,35 +102,28 @@ class QwenSKADiagnosticProcessor:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         B, L_img, inner_dim = hidden_states.shape
-        L_txt  = encoder_hidden_states.shape[1]
+        L_txt    = encoder_hidden_states.shape[1]
         n_heads  = attn.heads
         head_dim = inner_dim // n_heads
 
-        # ── image stream ──────────────────────────────────────────────────────
-        img_q = attn.to_q(hidden_states)
-        img_k = attn.to_k(hidden_states)
-        img_v = attn.to_v(hidden_states)
+        # ── image stream: project → (B, L, H, d) ─────────────────────────────
+        img_q = attn.to_q(hidden_states).reshape(B, L_img, n_heads, head_dim)
+        img_k = attn.to_k(hidden_states).reshape(B, L_img, n_heads, head_dim)
+        img_v = attn.to_v(hidden_states).reshape(B, L_img, n_heads, head_dim)
 
-        img_q = self._to_heads(img_q, n_heads, head_dim)
-        img_k = self._to_heads(img_k, n_heads, head_dim)
-        img_v = self._to_heads(img_v, n_heads, head_dim)
+        # norm on last dim (head_dim) — works for any prefix shape
+        if getattr(attn, "norm_q", None) is not None: img_q = attn.norm_q(img_q)
+        if getattr(attn, "norm_k", None) is not None: img_k = attn.norm_k(img_k)
 
-        if getattr(attn, "norm_q",  None) is not None: img_q = attn.norm_q(img_q)
-        if getattr(attn, "norm_k",  None) is not None: img_k = attn.norm_k(img_k)
-
-        # ── text stream ───────────────────────────────────────────────────────
-        txt_q = attn.add_q_proj(encoder_hidden_states)
-        txt_k = attn.add_k_proj(encoder_hidden_states)
-        txt_v = attn.add_v_proj(encoder_hidden_states)
-
-        txt_q = self._to_heads(txt_q, n_heads, head_dim)
-        txt_k = self._to_heads(txt_k, n_heads, head_dim)
-        txt_v = self._to_heads(txt_v, n_heads, head_dim)
+        # ── text stream: project → (B, L_txt, H, d) ──────────────────────────
+        txt_q = attn.add_q_proj(encoder_hidden_states).reshape(B, L_txt, n_heads, head_dim)
+        txt_k = attn.add_k_proj(encoder_hidden_states).reshape(B, L_txt, n_heads, head_dim)
+        txt_v = attn.add_v_proj(encoder_hidden_states).reshape(B, L_txt, n_heads, head_dim)
 
         if getattr(attn, "norm_added_q", None) is not None: txt_q = attn.norm_added_q(txt_q)
         if getattr(attn, "norm_added_k", None) is not None: txt_k = attn.norm_added_k(txt_k)
 
-        # ── RoPE ─────────────────────────────────────────────────────────────
+        # ── RoPE on (B, L, H, d) — BEFORE head transpose ─────────────────────
         if image_rotary_emb is not None and _HAS_ROPE:
             img_freqs, txt_freqs = image_rotary_emb
             img_q = apply_rotary_emb_qwen(img_q, img_freqs, use_real=False)
@@ -147,51 +131,57 @@ class QwenSKADiagnosticProcessor:
             txt_q = apply_rotary_emb_qwen(txt_q, txt_freqs, use_real=False)
             txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs, use_real=False)
 
-        # ── CAPTURE: store post-RoPE K, V ─────────────────────────────────────
+        # ── transpose to (B, H, L, d) for SDPA ───────────────────────────────
+        img_q = img_q.transpose(1, 2)
+        img_k = img_k.transpose(1, 2)
+        img_v = img_v.transpose(1, 2)
+        txt_q = txt_q.transpose(1, 2)
+        txt_k = txt_k.transpose(1, 2)
+        txt_v = txt_v.transpose(1, 2)
+
+        # ── CAPTURE: store post-RoPE, post-transpose K, V ─────────────────────
         if self.store.mode == "capture":
             self.store.kv[self.block_idx] = (
                 img_k.detach().clone(),
                 img_v.detach().clone(),
             )
 
-        # ── INJECT: extend joint K, V with stored S1 K, V ────────────────────
+        # ── INJECT: extend K, V with stored S1 K, V ──────────────────────────
         n_stored = 0
         if self.store.mode == "inject" and self.block_idx in self.store.kv:
             s1_k, s1_v = self.store.kv[self.block_idx]
             s1_k = s1_k.to(img_k.device, img_k.dtype)
             s1_v = s1_v.to(img_v.device, img_v.dtype)
-            img_k = torch.cat([img_k, s1_k], dim=2)   # extend seq dim
+            img_k = torch.cat([img_k, s1_k], dim=2)   # (B, H, L_img+n_stored, d)
             img_v = torch.cat([img_v, s1_v], dim=2)
             n_stored = s1_k.shape[2]
 
-        # ── joint attention ───────────────────────────────────────────────────
-        joint_q = torch.cat([txt_q, img_q], dim=2)          # (B, H, L_txt+L_img, d)
-        joint_k = torch.cat([txt_k, img_k], dim=2)          # (B, H, L_txt+L_img+n_stored, d)
+        # ── joint attention (B, H, L_q, d) ───────────────────────────────────
+        joint_q = torch.cat([txt_q, img_q], dim=2)   # queries never extended
+        joint_k = torch.cat([txt_k, img_k], dim=2)
         joint_v = torch.cat([txt_v, img_v], dim=2)
 
-        # build additive mask  (0 = attend, -inf = masked)
+        # additive mask (0 = attend, -inf = masked)
         attn_mask = None
         if encoder_hidden_states_mask is not None:
-            img_ones    = torch.ones((B, L_img),    dtype=torch.bool, device=hidden_states.device)
-            kv_bool     = torch.cat([encoder_hidden_states_mask, img_ones], dim=1)
+            img_ones = torch.ones((B, L_img), dtype=torch.bool, device=hidden_states.device)
+            kv_bool  = torch.cat([encoder_hidden_states_mask, img_ones], dim=1)
             if n_stored > 0:
-                stored_ones = torch.ones((B, n_stored), dtype=torch.bool, device=hidden_states.device)
-                kv_bool = torch.cat([kv_bool, stored_ones], dim=1)
-            # (B, 1, 1, L_kv)  →  additive: 0 where attend, -inf where pad
+                kv_bool = torch.cat([
+                    kv_bool,
+                    torch.ones((B, n_stored), dtype=torch.bool, device=hidden_states.device),
+                ], dim=1)
             kv_float  = kv_bool.float()[:, None, None, :]
             attn_mask = (1.0 - kv_float) * torch.finfo(joint_q.dtype).min
 
         joint_out = F.scaled_dot_product_attention(
             joint_q, joint_k, joint_v,
             attn_mask=attn_mask, dropout_p=0.0, is_causal=False,
-        )  # (B, H, L_txt+L_img, d)  — query side never extended
+        )   # (B, H, L_txt+L_img, d)
 
-        # ── split and project ─────────────────────────────────────────────────
-        txt_out = joint_out[:, :, :L_txt,        :]
-        img_out = joint_out[:, :, L_txt:L_txt+L_img, :]   # exact L_img tokens
-
-        txt_out = self._from_heads(txt_out)
-        img_out = self._from_heads(img_out)
+        # ── split, un-transpose, project ──────────────────────────────────────
+        txt_out = joint_out[:, :, :L_txt, :].transpose(1, 2).reshape(B, L_txt, inner_dim)
+        img_out = joint_out[:, :, L_txt:L_txt + L_img, :].transpose(1, 2).reshape(B, L_img, inner_dim)
 
         img_out = attn.to_out[0](img_out)
         img_out = attn.to_out[1](img_out)
