@@ -178,7 +178,7 @@ def remove_prompt(description: str) -> str:
 # Diagnostic verdict: blocks 52-57 give +0.020 mean gain at σ<0.3.
 # Inject scene K/V from step N into step N+1 to anchor background appearance.
 
-SKA_BLOCKS     = list(range(52, 58))   # inclusive: 52,53,54,55,56,57
+SKA_BLOCKS     = list(range(51, 58))   # inclusive: 52,53,54,55,56,57
 SKA_SIGMA_GATE = 0.3                    # activate only for σ < this value
 
 
