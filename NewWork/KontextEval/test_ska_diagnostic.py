@@ -471,7 +471,8 @@ def plot_results(
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--scene",         required=True,  help="Path to scene image (S1)")
+    p.add_argument("--scene",         default=None,
+                   help="Path to scene image (S1). If omitted, generates one from --scene_prompt.")
     p.add_argument("--hf_token",      required=True)
     p.add_argument("--cache_dir",     default="./models")
     p.add_argument("--out_dir",       default="results/ska_diagnostic")
@@ -479,6 +480,10 @@ def parse_args():
     p.add_argument("--height",        type=int,   default=1024)
     p.add_argument("--width",         type=int,   default=1024)
     p.add_argument("--prompt",        default="A room with a wooden floor and white walls.")
+    p.add_argument("--scene_prompt",  default=(
+                       "An empty room with a wooden floor, white walls, "
+                       "and a window letting in natural light."),
+                   help="Text prompt used to generate S1 when --scene is not provided.")
     p.add_argument("--timestep",      type=float, default=0.1,
                    help="Timestep fed to transformer (0=clean, 1=pure noise). "
                         "Use 0.1 for nearly-clean features.")
@@ -517,11 +522,29 @@ def main():
         pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
 
-    # ── Prepare images ────────────────────────────────────────────────────────
-    print("Preparing S1 and S2 ...")
-    scene_s1 = Image.open(args.scene).convert("RGB").resize(
-        (args.width, args.height), Image.Resampling.LANCZOS
-    )
+    # ── Prepare S1 ───────────────────────────────────────────────────────────
+    if args.scene is not None:
+        print(f"Loading S1 from {args.scene} ...")
+        scene_s1 = Image.open(args.scene).convert("RGB").resize(
+            (args.width, args.height), Image.Resampling.LANCZOS
+        )
+    else:
+        print("No --scene provided. Generating base scene with Qwen ...")
+        grey     = Image.new("RGB", (args.width, args.height), (200, 200, 190))
+        gen      = torch.Generator(device=device).manual_seed(42)
+        scene_s1 = pipe(
+            prompt           = args.scene_prompt,
+            negative_prompt  = "blurry, distorted, low quality, watermark, text",
+            image            = grey,
+            num_inference_steps = 30,
+            true_cfg_scale   = 4.0,
+            height           = args.height,
+            width            = args.width,
+            generator        = gen,
+        ).images[0]
+        print("  Base scene generated.")
+
+    print("Preparing S2 (VAE round-trip) ...")
     scene_s2 = vae_roundtrip(pipe, scene_s1, device, dtype)
 
     scene_s1.save(os.path.join(args.out_dir, "s1_input.png"))
