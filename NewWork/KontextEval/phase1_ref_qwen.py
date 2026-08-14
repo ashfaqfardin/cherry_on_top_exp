@@ -93,7 +93,7 @@ def run_qwen(
     return pipe(
         prompt=prompt, negative_prompt=negative_prompt,
         image=image, num_inference_steps=num_steps,
-        true_cfg_scale=guidance, guidance_scale=1.0,
+        true_cfg_scale=guidance,
         height=height, width=width,
         generator=gen,
     ).images[0]
@@ -101,13 +101,30 @@ def run_qwen(
 
 # ── Stage A: sketch → object image ────────────────────────────────────────────
 
+def _tight_crop(img: Image.Image, pad: int = 32) -> Image.Image:
+    """Crop to the bounding box of non-white pixels, add padding, keep square."""
+    arr  = np.array(img.convert("RGB"))
+    mask = np.any(arr < 240, axis=2)          # non-white pixels
+    if not mask.any():
+        return img
+    rows  = np.where(mask.any(axis=1))[0]
+    cols  = np.where(mask.any(axis=0))[0]
+    r0, r1 = int(rows[0]), int(rows[-1])
+    c0, c1 = int(cols[0]), int(cols[-1])
+    r0, r1 = max(0, r0 - pad), min(arr.shape[0], r1 + pad)
+    c0, c1 = max(0, c0 - pad), min(arr.shape[1], c1 + pad)
+    side   = max(r1 - r0, c1 - c0)           # square crop
+    cr = img.crop((c0, r0, c0 + side, r0 + side))
+    return cr.resize((512, 512), Image.Resampling.LANCZOS)
+
+
 def generate_object(
     pipe, sketch_path: str, description: str,
     seed: int, num_steps: int, guidance: float,
     height: int, width: int,
 ) -> Image.Image:
     sketch = Image.open(sketch_path).convert("RGB").resize(
-        (width, height), Image.LANCZOS
+        (width, height), Image.Resampling.LANCZOS
     )
     prompt = (
         f"Render this hand-drawn sketch as a photorealistic {description}. "
@@ -115,37 +132,38 @@ def generate_object(
         f"Studio lighting, no shadows, no background objects, high detail."
     )
     gen = torch.Generator(device=pipe.device).manual_seed(seed)
-    return pipe(
+    obj = pipe(
         prompt=prompt,
         negative_prompt="blurry, distorted, low quality, watermark, text, artifacts, background, room, floor",
         image=sketch, num_inference_steps=num_steps,
-        true_cfg_scale=guidance, guidance_scale=1.0,
+        true_cfg_scale=guidance,
         height=height, width=width,
         generator=gen,
     ).images[0]
+    # Tight-crop to the object so Picture 2 tokens are mostly object, not white bg
+    return _tight_crop(obj)
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
 def insert_prompt(description: str) -> str:
-    # The pipeline prepends "Picture 1: <img> Picture 2: <img>" to this prompt,
-    # so reference images by those labels. Avoid specifying center placement.
+    # Pipeline prepends "Picture 1: <img>Picture 2: <img>" with no trailing space,
+    # so start with a newline to avoid token boundary issues.
+    # Picture 1 = scene, Picture 2 = obj_ref (our image list order).
     return (
-        f"Picture 1 shows a room. Picture 2 shows a {description}. "
-        f"Edit Picture 1: place the {description} from Picture 2 into the room "
-        f"— position it naturally to one side of the room, resting on the wooden floor "
-        f"with a realistic contact shadow and lighting consistent with the room. "
-        f"Do not place it in the dead center of the image. "
-        f"Keep all existing objects and all other parts of the room exactly as they are."
+        f"\nPicture 1 shows a room. Picture 2 shows a {description}. "
+        f"Place the {description} from Picture 2 into the room in Picture 1. "
+        f"Choose a natural position off-center — near a wall or corner, resting on the wooden floor. "
+        f"Add a realistic contact shadow and match the room lighting. "
+        f"Do not move or change any other part of the room."
     )
 
 
 def remove_prompt(description: str) -> str:
     return (
-        f"Remove the {description} from the room completely. "
-        f"Fill the vacated area with seamless wooden floor and white wall that match "
-        f"the surrounding surfaces exactly. "
-        f"Keep all other objects and all other parts of the room exactly as they are."
+        f"\nRemove the {description} from this room. "
+        f"Fill the area with seamless wooden floor and white wall matching the surroundings. "
+        f"Do not change anything else in the room."
     )
 
 
