@@ -93,7 +93,8 @@ def run_qwen(
     return pipe(
         prompt=prompt, negative_prompt=negative_prompt,
         image=image, num_inference_steps=num_steps,
-        true_cfg_scale=guidance, height=height, width=width,
+        true_cfg_scale=guidance, guidance_scale=1.0,
+        height=height, width=width,
         generator=gen,
     ).images[0]
 
@@ -109,15 +110,17 @@ def generate_object(
         (width, height), Image.LANCZOS
     )
     prompt = (
-        f"Render this sketch as a photorealistic {description} "
-        "on a plain white background. No shadows. Studio lighting. High quality."
+        f"Render this hand-drawn sketch as a photorealistic {description}. "
+        f"Place it centered on a plain white background. "
+        f"Studio lighting, no shadows, no background objects, high detail."
     )
     gen = torch.Generator(device=pipe.device).manual_seed(seed)
     return pipe(
         prompt=prompt,
-        negative_prompt="blurry, distorted, low quality, watermark, text, artifacts",
+        negative_prompt="blurry, distorted, low quality, watermark, text, artifacts, background, room, floor",
         image=sketch, num_inference_steps=num_steps,
-        true_cfg_scale=guidance, height=height, width=width,
+        true_cfg_scale=guidance, guidance_scale=1.0,
+        height=height, width=width,
         generator=gen,
     ).images[0]
 
@@ -125,20 +128,24 @@ def generate_object(
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
 def insert_prompt(description: str) -> str:
+    # The pipeline prepends "Picture 1: <img> Picture 2: <img>" to this prompt,
+    # so reference images by those labels. Avoid specifying center placement.
     return (
-        f"The first image shows a room. The second image shows a {description}. "
-        f"Place the {description} from the second image naturally into the room in the first image "
-        f"— resting on the wooden floor with realistic contact shadow and lighting that "
-        f"match the room environment. Keep all other parts of the room exactly as they are."
+        f"Picture 1 shows a room. Picture 2 shows a {description}. "
+        f"Edit Picture 1: place the {description} from Picture 2 into the room "
+        f"— position it naturally to one side of the room, resting on the wooden floor "
+        f"with a realistic contact shadow and lighting consistent with the room. "
+        f"Do not place it in the dead center of the image. "
+        f"Keep all existing objects and all other parts of the room exactly as they are."
     )
 
 
 def remove_prompt(description: str) -> str:
     return (
         f"Remove the {description} from the room completely. "
-        f"Fill the area with seamless wooden floor and white wall that match the "
-        f"surrounding surfaces. Keep all other objects and parts of the room exactly "
-        f"the same."
+        f"Fill the vacated area with seamless wooden floor and white wall that match "
+        f"the surrounding surfaces exactly. "
+        f"Keep all other objects and all other parts of the room exactly as they are."
     )
 
 
@@ -254,8 +261,8 @@ def parse_args():
     p.add_argument("--cache_dir",    default="./models")
     p.add_argument("--out_dir",      default="results/phase1_ref_qwen")
     p.add_argument("--model",        default="Qwen/Qwen-Image-Edit-2509")
-    p.add_argument("--guidance",     type=float, default=3.5)
-    p.add_argument("--obj_guidance", type=float, default=3.5)
+    p.add_argument("--guidance",     type=float, default=4.0)
+    p.add_argument("--obj_guidance", type=float, default=4.0)
     p.add_argument("--num_steps",    type=int,   default=50)
     p.add_argument("--height",       type=int,   default=1024)
     p.add_argument("--width",        type=int,   default=1024)
