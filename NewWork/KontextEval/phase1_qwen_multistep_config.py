@@ -63,6 +63,9 @@ from phase1_ref_qwen import (   # noqa: E402
     SKA_SIGMA_GATE,
     SKAStore,
     _tight_crop,
+    _encode_latent,
+    _decode_latent,
+    _latent_composite,
     insert_prompt,
     run_qwen,
     run_qwen_ska,
@@ -142,18 +145,21 @@ def generate_object_from_sketch(
 
 def run_scene(
     pipe,
-    scene_cfg:    dict,
-    sketch_dir:   str,
-    out_dir:      str,
-    seed:         int,
-    num_steps:    int,
-    guidance:     float,
-    obj_guidance: float,
-    height:       int,
-    width:        int,
-    use_ska:      bool,
-    ska_gate:     float,
-    inject_mode:  str = "v",   # "kv" | "k" | "v" — experiment 1 toggle
+    scene_cfg:      dict,
+    sketch_dir:     str,
+    out_dir:        str,
+    seed:           int,
+    num_steps:      int,
+    guidance:       float,
+    obj_guidance:   float,
+    height:         int,
+    width:          int,
+    use_ska:        bool,
+    ska_gate:       float,
+    inject_mode:    str   = "v",     # "kv" | "k" | "v"
+    latent_anchor:  bool  = True,    # T1: latent background anchoring
+    lat_tau:        float = 0.3,     # latent diff threshold (object vs background)
+    lat_temp:       float = 0.05,    # sigmoid edge sharpness
 ) -> tuple[list[Image.Image], list[dict]]:
     """Process one scene.  Returns (images, step_meta) for evaluation."""
     scene_id  = scene_cfg["id"]
@@ -181,6 +187,14 @@ def run_scene(
     step_meta = []           # [{name, description, add_prompt}] per insertion step
     scene     = base
     ska_store = SKAStore(inject_mode=inject_mode) if use_ska else None
+
+    # ── T1: Latent Background Anchoring state ─────────────────────────────────
+    z_prev:     "torch.Tensor | None" = None
+    accum_mask: "torch.Tensor | None" = None
+    if latent_anchor:
+        print(f"  [LBA] Encoding base scene latent (τ={lat_tau}, T={lat_temp}) ...")
+        z_prev = _encode_latent(pipe, base.convert("RGB"), height, width)
+        print(f"        z shape: {tuple(z_prev.shape)}  dtype: {z_prev.dtype}")
 
     for i, obj_cfg in enumerate(objects):
         name = obj_cfg["name"]
@@ -223,7 +237,7 @@ def run_scene(
         with open(os.path.join(scene_out, f"prompt_step{i+1}_{name}.txt"), "w") as f:
             f.write(add_prompt)
 
-        updated = run_qwen_ska(
+        updated_raw = run_qwen_ska(
             pipe=pipe,
             image=[scene.convert("RGB"), obj_img.convert("RGB")],
             prompt=add_prompt,
@@ -232,6 +246,25 @@ def run_scene(
             negative_prompt="blurry, distorted, low quality, watermark, text, artifacts",
             ska_store=ska_store, ska_phase=ska_phase, ska_gate=ska_gate,
         )
+
+        # ── T1: Latent composite ───────────────────────────────────────────────
+        if latent_anchor and z_prev is not None:
+            z_raw = _encode_latent(pipe, updated_raw.convert("RGB"), height, width)
+            z_comp, accum_mask = _latent_composite(
+                z_raw, z_prev, accum_mask, tau=lat_tau, temp=lat_temp,
+            )
+            updated = _decode_latent(pipe, z_comp)
+            z_prev  = z_comp  # carry composite latent forward (not the raw)
+            # Mask visualisation — object region bright, background dark
+            m_arr = (accum_mask[0, 0].cpu().numpy() * 255).round().astype(np.uint8)
+            Image.fromarray(m_arr).save(
+                os.path.join(scene_out, f"lat_mask_step{i+1}_{name}.png")
+            )
+            obj_frac = float(accum_mask.mean()) * 100
+            print(f"      [LBA] object region: {obj_frac:.1f}% of latent grid")
+        else:
+            updated = updated_raw
+
         out_path = os.path.join(scene_out, f"result_step{i+1}_{name}.png")
         updated.save(out_path)
         print(f"      Saved: result_step{i+1}_{name}.png")
@@ -554,6 +587,13 @@ def parse_args() -> argparse.Namespace:
                    help="Path for evaluation CSV (default: out_dir/metrics.csv)")
     p.add_argument("--inject_mode",  default="v", choices=["kv", "k", "v"],
                    help="Exp-1 toggle: inject K only ('k'), V only ('v'), or both ('kv'). Default: 'v'")
+    # ── T1: Latent Background Anchoring ───────────────────────────────────────
+    p.add_argument("--no_latent_anchor", action="store_true",
+                   help="Disable T1 latent background anchoring (ablation)")
+    p.add_argument("--lat_tau",  type=float, default=0.3,
+                   help="Latent diff threshold for object/background separation (default 0.3)")
+    p.add_argument("--lat_temp", type=float, default=0.05,
+                   help="Sigmoid temperature for latent mask edge sharpness (default 0.05)")
     return p.parse_args()
 
 
@@ -576,6 +616,7 @@ def main() -> None:
     print(f"  Scenes     : {len(scenes)}")
     print(f"  Qwen model : {'Lightning ' + str(num_steps) + '-step' if args.lightning else 'Standard ' + str(num_steps) + '-step'}")
     print(f"  SKA        : {'OFF (ablation)' if args.no_ska else f'ON  gate={ska_gate}  inject={args.inject_mode}'}")
+    print(f"  LBA        : {'OFF (ablation)' if args.no_latent_anchor else f'ON  tau={args.lat_tau}  T={args.lat_temp}'}")
     print(f"  Eval       : {'OFF' if args.no_eval else 'ON'}")
     print(f"{'═' * 60}")
 
@@ -617,6 +658,9 @@ def main() -> None:
             use_ska=not args.no_ska,
             ska_gate=ska_gate,
             inject_mode=args.inject_mode,
+            latent_anchor=not args.no_latent_anchor,
+            lat_tau=args.lat_tau,
+            lat_temp=args.lat_temp,
         )
 
         # Save grid for this scene

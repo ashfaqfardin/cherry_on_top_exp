@@ -163,6 +163,86 @@ def run_qwen(
     ).images[0]
 
 
+# ── T1: Latent Background Anchoring (LBA) ────────────────────────────────────
+
+def _encode_latent(
+    pipe,
+    pil_img: Image.Image,
+    height:  int,
+    width:   int,
+) -> torch.Tensor:
+    """Encode PIL image → unscaled VAE latent on CPU float32.
+
+    'Unscaled' = raw encoder output before ×vae.config.scaling_factor.
+    This matches what the denoiser's final z looks like after the pipeline
+    divides by scaling_factor before calling vae.decode().
+    """
+    img = pil_img.convert("RGB").resize((width, height), Image.LANCZOS)
+    arr = np.array(img, dtype=np.float32) / 127.5 - 1.0       # → [-1, 1]
+    t   = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+    try:
+        vae_dev  = next(pipe.vae.parameters()).device
+        vae_dtyp = next(pipe.vae.parameters()).dtype
+    except StopIteration:
+        vae_dev, vae_dtyp = torch.device("cpu"), torch.float32
+    t = t.to(vae_dev, vae_dtyp)
+    with torch.no_grad():
+        z = pipe.vae.encode(t).latent_dist.mean   # (1, C, H/8, W/8)
+    return z.cpu().float()
+
+
+def _decode_latent(
+    pipe,
+    z: torch.Tensor,   # unscaled (1, C, H/8, W/8), any device
+) -> Image.Image:
+    """Decode unscaled VAE latent → PIL RGB image."""
+    try:
+        vae_dev  = next(pipe.vae.parameters()).device
+        vae_dtyp = next(pipe.vae.parameters()).dtype
+    except StopIteration:
+        vae_dev, vae_dtyp = torch.device("cpu"), torch.float32
+    z = z.to(vae_dev, vae_dtyp)
+    with torch.no_grad():
+        dec = pipe.vae.decode(z).sample           # (1, 3, H, W) in [-1, 1]
+    dec = (dec.float().clamp(-1, 1) / 2 + 0.5)   # → [0, 1]
+    arr = (dec[0].cpu().permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def _latent_composite(
+    z_raw:      torch.Tensor,              # (1, C, H/8, W/8) current step output
+    z_prev:     torch.Tensor,              # (1, C, H/8, W/8) previous composite
+    accum_mask: "torch.Tensor | None",     # (1, 1, H/8, W/8) running object mask
+    tau:        float = 0.3,               # per-channel latent-diff threshold
+    temp:       float = 0.05,             # sigmoid edge sharpness
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Composite z_raw and z_prev using a soft latent-difference mask.
+
+    Object regions  (|z_raw - z_prev| > tau) → take from z_raw  (new content)
+    Background      (|z_raw - z_prev| < tau) → take from z_prev (preserved)
+
+    The accumulated mask only grows across steps: once a pixel is classified as
+    part of an inserted object it stays that way.  Background pixels therefore
+    always trace back to the initial empty-room encoding, with zero additional
+    VAE encode-decode cycles introducing error.
+
+    Returns (z_composite, updated_accum_mask).
+    """
+    z_raw  = z_raw.cpu().float()
+    z_prev = z_prev.cpu().float()
+
+    diff      = (z_raw - z_prev).abs().mean(dim=1, keepdim=True)   # (1,1,H/8,W/8)
+    step_mask = torch.sigmoid((diff - tau) / temp)                  # ∈ (0, 1)
+
+    if accum_mask is None:
+        accum_mask = step_mask
+    else:
+        accum_mask = torch.max(accum_mask.cpu().float(), step_mask)  # monotonically grows
+
+    z_comp = accum_mask * z_raw + (1.0 - accum_mask) * z_prev
+    return z_comp, accum_mask
+
+
 # ── Stage A: sketch → object image ────────────────────────────────────────────
 
 def _tight_crop(img: Image.Image, pad: int = 32) -> Image.Image:
