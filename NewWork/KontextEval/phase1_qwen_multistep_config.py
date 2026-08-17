@@ -66,6 +66,8 @@ from phase1_ref_qwen import (   # noqa: E402
     _encode_latent,
     _decode_latent,
     _latent_composite,
+    _make_room_prior_mask,
+    _DSACallback,
     insert_prompt,
     run_qwen,
     run_qwen_ska,
@@ -157,9 +159,13 @@ def run_scene(
     use_ska:        bool,
     ska_gate:       float,
     inject_mode:    str   = "v",     # "kv" | "k" | "v"
-    latent_anchor:  bool  = True,    # T1: latent background anchoring
-    lat_tau:        float = 0.3,     # latent diff threshold (object vs background)
-    lat_temp:       float = 0.05,    # sigmoid edge sharpness
+    latent_anchor:  bool  = True,    # T1: post-hoc latent compositing (legacy)
+    lat_tau:        float = 0.3,     # T1 latent diff threshold
+    lat_temp:       float = 0.05,    # T1 sigmoid edge sharpness
+    dsa:            bool  = True,    # T3: denoising-step anchoring (preferred)
+    dsa_alpha:      float = 0.8,     # DSA anchor strength in background (0=free, 1=locked)
+    dsa_top:        float = 0.25,    # ceiling anchor fraction
+    dsa_side:       float = 0.12,    # wall-edge anchor fraction
 ) -> tuple[list[Image.Image], list[dict]]:
     """Process one scene.  Returns (images, step_meta) for evaluation."""
     scene_id  = scene_cfg["id"]
@@ -191,10 +197,19 @@ def run_scene(
     # ── T1: Latent Background Anchoring state ─────────────────────────────────
     z_prev:     "torch.Tensor | None" = None
     accum_mask: "torch.Tensor | None" = None
-    if latent_anchor:
-        print(f"  [LBA] Encoding base scene latent (τ={lat_tau}, T={lat_temp}) ...")
+    if latent_anchor or dsa:
+        print(f"  [LBA/DSA] Encoding base scene latent ...")
         z_prev = _encode_latent(pipe, base.convert("RGB"), height, width)
-        print(f"        z shape: {tuple(z_prev.shape)}  dtype: {z_prev.dtype}")
+        print(f"            z shape: {tuple(z_prev.shape)}  dtype: {z_prev.dtype}")
+
+    # ── T3: DSA — build room prior mask once (shared across all steps) ─────────
+    dsa_obj_mask: "torch.Tensor | None" = None
+    if dsa and z_prev is not None:
+        lat_h = z_prev.shape[2]
+        lat_w = z_prev.shape[3]
+        dsa_obj_mask = _make_room_prior_mask(lat_h, lat_w, dsa_top, dsa_side)
+        print(f"  [DSA]  Room prior mask: {lat_h}×{lat_w}  "
+              f"free={float(dsa_obj_mask.mean())*100:.1f}%  α={dsa_alpha}")
 
     for i, obj_cfg in enumerate(objects):
         name = obj_cfg["name"]
@@ -237,6 +252,11 @@ def run_scene(
         with open(os.path.join(scene_out, f"prompt_step{i+1}_{name}.txt"), "w") as f:
             f.write(add_prompt)
 
+        # Build per-step DSA callback (fresh noise draw each insertion)
+        step_dsa = None
+        if dsa and z_prev is not None and dsa_obj_mask is not None:
+            step_dsa = _DSACallback(z_prev, dsa_obj_mask, alpha=dsa_alpha)
+
         updated_raw = run_qwen_ska(
             pipe=pipe,
             image=[scene.convert("RGB"), obj_img.convert("RGB")],
@@ -245,25 +265,29 @@ def run_scene(
             height=height, width=width,
             negative_prompt="blurry, distorted, low quality, watermark, text, artifacts",
             ska_store=ska_store, ska_phase=ska_phase, ska_gate=ska_gate,
+            dsa_callback=step_dsa,
         )
 
-        # ── T1: Latent composite ───────────────────────────────────────────────
+        # ── T1: post-hoc latent composite (legacy, off by default) ───────────
         if latent_anchor and z_prev is not None:
             z_raw = _encode_latent(pipe, updated_raw.convert("RGB"), height, width)
             z_comp, accum_mask = _latent_composite(
                 z_raw, z_prev, accum_mask, tau=lat_tau, temp=lat_temp,
             )
             updated = _decode_latent(pipe, z_comp)
-            z_prev  = z_comp  # carry composite latent forward (not the raw)
-            # Mask visualisation — object region bright, background dark
+            obj_frac = float(accum_mask.mean()) * 100
+            print(f"      [LBA] object region: {obj_frac:.1f}% of latent grid")
+            # Mask visualisation
             m_arr = (accum_mask[0, 0].cpu().numpy() * 255).round().astype(np.uint8)
             Image.fromarray(m_arr).save(
                 os.path.join(scene_out, f"lat_mask_step{i+1}_{name}.png")
             )
-            obj_frac = float(accum_mask.mean()) * 100
-            print(f"      [LBA] object region: {obj_frac:.1f}% of latent grid")
         else:
             updated = updated_raw
+
+        # ── Update z_prev for next step (DSA anchors to progressive state) ────
+        if (latent_anchor or dsa) and z_prev is not None:
+            z_prev = _encode_latent(pipe, updated.convert("RGB"), height, width)
 
         out_path = os.path.join(scene_out, f"result_step{i+1}_{name}.png")
         updated.save(out_path)
@@ -589,11 +613,20 @@ def parse_args() -> argparse.Namespace:
                    help="Exp-1 toggle: inject K only ('k'), V only ('v'), or both ('kv'). Default: 'v'")
     # ── T1: Latent Background Anchoring ───────────────────────────────────────
     p.add_argument("--no_latent_anchor", action="store_true",
-                   help="Disable T1 latent background anchoring (ablation)")
+                   help="Disable T1 post-hoc latent compositing")
     p.add_argument("--lat_tau",  type=float, default=0.3,
-                   help="Latent diff threshold for object/background separation (default 0.3)")
+                   help="T1 latent diff threshold (default 0.3)")
     p.add_argument("--lat_temp", type=float, default=0.05,
-                   help="Sigmoid temperature for latent mask edge sharpness (default 0.05)")
+                   help="T1 sigmoid edge sharpness (default 0.05)")
+    # ── T3: Denoising-Step Anchoring ──────────────────────────────────────────
+    p.add_argument("--no_dsa",    action="store_true",
+                   help="Disable T3 denoising-step anchoring (ablation)")
+    p.add_argument("--dsa_alpha", type=float, default=0.8,
+                   help="DSA anchor strength in background region (0=free, 1=locked; default 0.8)")
+    p.add_argument("--dsa_top",   type=float, default=0.25,
+                   help="DSA ceiling anchor fraction from top (default 0.25)")
+    p.add_argument("--dsa_side",  type=float, default=0.12,
+                   help="DSA wall-edge anchor fraction from sides (default 0.12)")
     return p.parse_args()
 
 
@@ -616,7 +649,8 @@ def main() -> None:
     print(f"  Scenes     : {len(scenes)}")
     print(f"  Qwen model : {'Lightning ' + str(num_steps) + '-step' if args.lightning else 'Standard ' + str(num_steps) + '-step'}")
     print(f"  SKA        : {'OFF (ablation)' if args.no_ska else f'ON  gate={ska_gate}  inject={args.inject_mode}'}")
-    print(f"  LBA        : {'OFF (ablation)' if args.no_latent_anchor else f'ON  tau={args.lat_tau}  T={args.lat_temp}'}")
+    print(f"  LBA (T1)   : {'OFF' if args.no_latent_anchor else f'ON  tau={args.lat_tau}  T={args.lat_temp}'}")
+    print(f"  DSA (T3)   : {'OFF (ablation)' if args.no_dsa else f'ON  α={args.dsa_alpha}  top={args.dsa_top}  side={args.dsa_side}'}")
     print(f"  Eval       : {'OFF' if args.no_eval else 'ON'}")
     print(f"{'═' * 60}")
 
@@ -661,6 +695,10 @@ def main() -> None:
             latent_anchor=not args.no_latent_anchor,
             lat_tau=args.lat_tau,
             lat_temp=args.lat_temp,
+            dsa=not args.no_dsa,
+            dsa_alpha=args.dsa_alpha,
+            dsa_top=args.dsa_top,
+            dsa_side=args.dsa_side,
         )
 
         # Save grid for this scene

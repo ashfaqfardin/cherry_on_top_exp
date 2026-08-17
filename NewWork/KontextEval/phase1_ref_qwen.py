@@ -623,6 +623,98 @@ class QwenSKAProcessor:
             )
 
 
+def _make_room_prior_mask(
+    lat_h:        int,
+    lat_w:        int,
+    top_anchor:   float = 0.25,   # top fraction to fully anchor (ceiling)
+    side_anchor:  float = 0.12,   # side fraction to fully anchor (wall edges)
+    temp:         float = 0.04,   # sigmoid transition sharpness
+) -> torch.Tensor:
+    """Object-region prior for interior rooms: floor/center is free, ceiling/walls anchored.
+
+    Returns (1, 1, lat_h, lat_w) ∈ [0, 1].
+      1  = object region  → model generates freely
+      0  = background     → anchored to reference scene during denoising
+    """
+    y = torch.linspace(0.0, 1.0, lat_h)   # 0 = ceiling, 1 = floor
+    x = torch.linspace(0.0, 1.0, lat_w)   # 0 = left wall, 1 = right wall
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+
+    # Vertical: anchor ceiling (top top_anchor fraction), free toward floor
+    v = torch.sigmoid((yy - top_anchor) / temp)
+
+    # Horizontal: anchor side walls, free in the middle
+    x_from_center = (xx - 0.5).abs()            # 0 at center, 0.5 at edges
+    h = torch.sigmoid((0.5 - side_anchor - x_from_center) / temp)
+
+    mask = (v * h).clamp(0.0, 1.0)
+    return mask.unsqueeze(0).unsqueeze(0)   # (1, 1, lat_h, lat_w)
+
+
+class _DSACallback:
+    """Denoising-Step Anchoring (DSA).
+
+    At each denoising step i, blends the current latent with a noise-matched
+    version of the reference scene in the background region.  This prevents
+    the diffusion model from generating hallucinated content (neon artifacts)
+    in unchanged background areas during the denoising process itself.
+
+    Mathematical guarantee:
+        z_t_bg  =  (1 - α) · z_t_model  +  α · z_t_ref
+        where z_t_ref  =  (1 - σ_t) · z_prev_scaled  +  σ_t · ε,  ε ~ N(0,I)
+
+    The mixing coefficient α is applied only in the background region
+    (1 - obj_mask), so the object region is completely free for generation.
+    """
+
+    def __init__(
+        self,
+        z_prev_unscaled: torch.Tensor,   # (1, C, lat_h, lat_w) unscaled VAE latent
+        obj_mask:        torch.Tensor,   # (1, 1, lat_h, lat_w) ∈ [0,1]; 1=object, 0=BG
+        alpha:           float = 0.8,    # anchor strength in background (0=free, 1=full lock)
+        start_step:      int   = 0,      # first step to begin anchoring (0 = all steps)
+    ):
+        self.z_prev   = z_prev_unscaled.cpu().float()
+        self.obj_mask = obj_mask.cpu().float()
+        self.alpha    = alpha
+        self.start_step = start_step
+        self._noise   = None   # same noise reused across steps for coherence
+
+    def __call__(self, pipe, i: int, t, callback_kwargs: dict) -> dict:
+        if i < self.start_step:
+            return callback_kwargs
+        latents = callback_kwargs.get("latents")
+        if latents is None:
+            return callback_kwargs
+
+        dev, dtyp = latents.device, latents.dtype
+        scaling   = getattr(pipe.vae.config, "scaling_factor", 0.18215)
+
+        # Scale reference latent into the denoiser's space
+        z_scaled = (self.z_prev * scaling).to(dev, dtyp)
+
+        # Reuse the same noise draw across steps for temporal coherence
+        if self._noise is None or self._noise.shape != z_scaled.shape:
+            self._noise = torch.randn_like(z_scaled)
+        noise = self._noise.to(dev, dtyp)
+
+        # Normalise timestep t → σ ∈ [0, 1]
+        # FlowMatchEuler: t ∈ {0..num_train_timesteps}, σ = t / T
+        T = float(getattr(pipe.scheduler.config, "num_train_timesteps", 1000))
+        t_val = float(t.mean()) if t.dim() > 0 else float(t)
+        sigma = (t_val / T)
+
+        # Flow-matching forward process: x_t = (1-σ)·x_0 + σ·ε
+        z_ref_noised = (1.0 - sigma) * z_scaled + sigma * noise
+
+        # Background blending mask: α in BG, 0 in object region
+        bg_weight = (self.alpha * (1.0 - self.obj_mask)).to(dev, dtyp)
+
+        latents_out = (1.0 - bg_weight) * latents + bg_weight * z_ref_noised
+        callback_kwargs["latents"] = latents_out
+        return callback_kwargs
+
+
 class _SKACallback:
     """
     callback_on_step_end: fires after step i completes, sets mode for step i+1.
@@ -667,32 +759,52 @@ def run_qwen_ska(
     ska_store:       SKAStore | None,
     ska_phase:       str      | None,   # "capture" | "inject" | None (skip)
     ska_gate:        float    = SKA_SIGMA_GATE,
+    dsa_callback:    "_DSACallback | None" = None,  # T3 denoising-step anchoring
 ) -> Image.Image:
     """
-    run_qwen with optional SKA.
+    run_qwen with optional SKA (K/V) and/or DSA (denoising-step anchoring).
 
     ska_phase="capture" — capture scene K/V for future injection; no injection.
     ska_phase="inject"  — inject previous scene K/V + capture current scene K/V.
     ska_phase=None      — plain run_qwen (removal steps, or SKA disabled).
+    dsa_callback        — if given, anchors background latent at each denoising step.
 
     After the call, ska_store.kv is updated via promote().
     """
-    if ska_phase is None or ska_store is None:
+    # Build the composed callback: SKA (sets processor mode) + DSA (modifies latents)
+    ska_active = ska_phase is not None and ska_store is not None
+
+    if ska_active:
+        h_tok = height // (pipe.vae_scale_factor * 2)
+        w_tok = width  // (pipe.vae_scale_factor * 2)
+        ska_store.n_out      = h_tok * w_tok
+        ska_store.mode       = "normal"
+        ska_store.new_kv     = {}
+        ska_store.new_obj_kv = {}
+        inject_start = max(1, int(num_steps * (1.0 - ska_gate)) - 1)
+        ska_cb = _SKACallback(ska_store, inject_start, ska_phase)
+    else:
+        ska_cb = None
+
+    # Compose: SKA fires first (sets mode), DSA fires second (edits latents)
+    if ska_cb is not None and dsa_callback is not None:
+        _ska_ref, _dsa_ref = ska_cb, dsa_callback
+        class _Composed:
+            def __call__(self, pipe, i, t, kw):
+                kw = _ska_ref(pipe, i, t, kw)
+                kw = _dsa_ref(pipe, i, t, kw)
+                return kw
+        callback = _Composed()
+    elif ska_cb is not None:
+        callback = ska_cb
+    elif dsa_callback is not None:
+        callback = dsa_callback
+    else:
+        # Nothing to do — plain run_qwen
         return run_qwen(pipe, image, prompt, seed, num_steps, guidance,
                         height, width, negative_prompt)
 
-    h_tok = height // (pipe.vae_scale_factor * 2)
-    w_tok = width  // (pipe.vae_scale_factor * 2)
-    ska_store.n_out      = h_tok * w_tok
-    ska_store.mode       = "normal"
-    ska_store.new_kv     = {}
-    ska_store.new_obj_kv = {}
-
-    # Approximate step index where σ first drops below gate (linear FlowMatch schedule)
-    inject_start = max(1, int(num_steps * (1.0 - ska_gate)) - 1)
-    callback     = _SKACallback(ska_store, inject_start, ska_phase)
-
-    originals = _install_ska(pipe.transformer, SKA_BLOCKS, ska_store)
+    originals = _install_ska(pipe.transformer, SKA_BLOCKS, ska_store) if ska_active else {}
     try:
         gen = torch.Generator(device=pipe.device).manual_seed(seed)
         result = pipe(
@@ -702,10 +814,12 @@ def run_qwen_ska(
             height=height, width=width,
             generator=gen,
             callback_on_step_end=callback,
+            callback_on_step_end_tensor_inputs=["latents"],
         ).images[0]
     finally:
-        _restore_ska(pipe.transformer, originals)
-        ska_store.promote()   # new_kv → kv for next step
+        if ska_active:
+            _restore_ska(pipe.transformer, originals)
+            ska_store.promote()
 
     return result
 
