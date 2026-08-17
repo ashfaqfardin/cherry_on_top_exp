@@ -262,7 +262,12 @@ class SKAStore:
     # 3-tuple type alias
     _KVI = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
-    def __init__(self, replace_thresh: float = 0.85, inject_bg: bool = False):
+    def __init__(
+        self,
+        replace_thresh: float = 0.85,
+        inject_bg:      bool  = False,
+        inject_mode:    str   = "v",   # "kv" | "k" | "v"
+    ):
         self.kv:         Dict[int, "SKAStore._KVI"] = {}
         self.new_kv:     Dict[int, "SKAStore._KVI"] = {}
         self.obj_kv:     Dict[int, "SKAStore._KVI"] = {}
@@ -271,7 +276,8 @@ class SKAStore:
         self.n_out:          int   = 0
         self.has_kv:         bool  = False
         self.replace_thresh: float = replace_thresh
-        self.inject_bg:      bool  = inject_bg  # bg injection corrupts walls; off by default
+        self.inject_bg:      bool  = inject_bg    # bg injection corrupts walls; off by default
+        self.inject_mode:    str   = inject_mode  # "kv" | "k" | "v" — exp1 toggle
 
     @property
     def has_obj_kv(self) -> bool:
@@ -313,10 +319,16 @@ def _ska_replace(
     slice_start: int,
     ref_kvi:     Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     thresh:      float,
+    inject_mode: str = "kv",   # "kv" | "k" | "v"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """At the stored token positions (given by idx), replace current K/V with
-    the stored reference wherever cosine similarity (averaged over heads) < thresh.
+    """At the stored token positions (given by idx), replace current K and/or V
+    with the stored reference wherever cosine similarity (averaged over heads) < thresh.
     Operates pre-RoPE; img_k/img_v shapes are (B, L, H, d).
+
+    inject_mode="k"  — replace K only (V stays as-is); tests attention routing
+    inject_mode="v"  — replace V only (K stays as-is); tests content retrieval
+    inject_mode="kv" — replace both (original behaviour)
+    Similarity gating always uses K for the comparison regardless of mode.
     """
     ref_k, ref_v, idx = ref_kvi
     ref_k = ref_k.to(img_k.device, img_k.dtype)   # (B, H, n_sel, d)
@@ -328,13 +340,16 @@ def _ska_replace(
     cur_k = img_k[:, abs_idx].permute(0, 2, 1, 3)  # (B, H, n_sel, d)
     cur_v = img_v[:, abs_idx].permute(0, 2, 1, 3)
 
+    # Similarity is always computed on K (K encodes routing; more diagnostic)
     sim     = F.cosine_similarity(cur_k.mean(dim=1), ref_k.mean(dim=1), dim=-1)  # (B, n_sel)
     replace = (sim < thresh)[:, None, :, None].expand_as(cur_k)                  # (B, H, n_sel, d)
 
-    img_k = img_k.clone()
-    img_v = img_v.clone()
-    img_k[:, abs_idx] = torch.where(replace, ref_k, cur_k).permute(0, 2, 1, 3)
-    img_v[:, abs_idx] = torch.where(replace, ref_v, cur_v).permute(0, 2, 1, 3)
+    if inject_mode in ("kv", "k"):
+        img_k = img_k.clone()
+        img_k[:, abs_idx] = torch.where(replace, ref_k, cur_k).permute(0, 2, 1, 3)
+    if inject_mode in ("kv", "v"):
+        img_v = img_v.clone()
+        img_v[:, abs_idx] = torch.where(replace, ref_v, cur_v).permute(0, 2, 1, 3)
     return img_k, img_v
 
 
@@ -453,6 +468,8 @@ class QwenSKAProcessor:
         # This happens pre-RoPE so the correction is in the projected feature space.
         thresh = self.store.replace_thresh
 
+        mode = self.store.inject_mode
+
         # Background: snap drifted bg tokens in scene_cond frame back to reference.
         # Disabled by default (inject_bg=False): injecting bg K/V from a prior denoising
         # trajectory into the current scene_cond frame conflicts with the model's internal
@@ -463,14 +480,14 @@ class QwenSKAProcessor:
                 and L_img >= 2 * n_out):
             img_k, img_v = _ska_replace(
                 img_k, img_v, n_out,
-                self.store.kv[self.block_idx], thresh,
+                self.store.kv[self.block_idx], thresh, mode,
             )
 
         # Object: snap drifted obj tokens in obj frame back to reference
         if self.store.has_obj_kv and self.block_idx in self.store.obj_kv and L_img >= 3 * n_out:
             img_k, img_v = _ska_replace(
                 img_k, img_v, 2 * n_out,
-                self.store.obj_kv[self.block_idx], thresh,
+                self.store.obj_kv[self.block_idx], thresh, mode,
             )
 
         try:

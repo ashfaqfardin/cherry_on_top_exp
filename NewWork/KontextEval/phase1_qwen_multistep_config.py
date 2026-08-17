@@ -153,6 +153,7 @@ def run_scene(
     width:        int,
     use_ska:      bool,
     ska_gate:     float,
+    inject_mode:  str = "v",   # "kv" | "k" | "v" — experiment 1 toggle
 ) -> tuple[list[Image.Image], list[dict]]:
     """Process one scene.  Returns (images, step_meta) for evaluation."""
     scene_id  = scene_cfg["id"]
@@ -179,7 +180,7 @@ def run_scene(
     images    = [base]
     step_meta = []           # [{name, description, add_prompt}] per insertion step
     scene     = base
-    ska_store = SKAStore() if use_ska else None
+    ska_store = SKAStore(inject_mode=inject_mode) if use_ska else None
 
     for i, obj_cfg in enumerate(objects):
         name = obj_cfg["name"]
@@ -551,6 +552,8 @@ def parse_args() -> argparse.Namespace:
                    help="Device for eval models (cpu or cuda)")
     p.add_argument("--out_csv",      default=None,
                    help="Path for evaluation CSV (default: out_dir/metrics.csv)")
+    p.add_argument("--inject_mode",  default="v", choices=["kv", "k", "v"],
+                   help="Exp-1 toggle: inject K only ('k'), V only ('v'), or both ('kv'). Default: 'v'")
     return p.parse_args()
 
 
@@ -572,7 +575,7 @@ def main() -> None:
     print(f"  phase1_qwen_multistep_config")
     print(f"  Scenes     : {len(scenes)}")
     print(f"  Qwen model : {'Lightning ' + str(num_steps) + '-step' if args.lightning else 'Standard ' + str(num_steps) + '-step'}")
-    print(f"  SKA        : {'OFF (ablation)' if args.no_ska else f'ON  gate={ska_gate}'}")
+    print(f"  SKA        : {'OFF (ablation)' if args.no_ska else f'ON  gate={ska_gate}  inject={args.inject_mode}'}")
     print(f"  Eval       : {'OFF' if args.no_eval else 'ON'}")
     print(f"{'═' * 60}")
 
@@ -613,6 +616,7 @@ def main() -> None:
             width=args.width,
             use_ska=not args.no_ska,
             ska_gate=ska_gate,
+            inject_mode=args.inject_mode,
         )
 
         # Save grid for this scene
