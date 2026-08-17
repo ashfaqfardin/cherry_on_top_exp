@@ -242,26 +242,42 @@ SKA_SIGMA_GATE = 0.3                    # activate only for σ < this value
 class SKAStore:
     """Persistent K/V cache shared across editing steps.
 
-    Two parallel stores:
-      kv     / new_kv     — scene_cond frame (background)
-      obj_kv / new_obj_kv — obj frame (current object being inserted)
-    Both are injected in the next step; the model routes attention by content.
+    Two parallel stores (captured and compared independently):
+      kv     / new_kv     — background tokens from scene_cond frame
+      obj_kv / new_obj_kv — object tokens from obj frame
+
+    Each entry is a 3-tuple  (k, v, idx)  where:
+      k, v : (B, H, n_sel, d)  — K/V of the selected tokens only
+      idx  : (n_sel,)           — token positions within the source frame
+
+    Token selection uses the model's own attention: output tokens attend more
+    strongly to background scene_cond tokens (they copy background) and to
+    actual object pixels in the obj frame (ignoring white fill). Tokens whose
+    importance exceeds the per-frame mean are kept.
+
+    Injection: compare-and-replace at only the stored positions.
+    Tokens whose current K drifts from the stored reference (cos-sim < thresh)
+    are snapped back. Sequence length is never extended.
     """
-    def __init__(self):
-        self.kv:         Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        self.new_kv:     Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        self.obj_kv:     Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        self.new_obj_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        self.mode:   str  = "normal"   # "normal" | "capture" | "inject"
-        self.n_out:  int  = 0          # output image token count (n_tok per frame)
-        self.has_kv: bool = False
+    # 3-tuple type alias
+    _KVI = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+    def __init__(self, replace_thresh: float = 0.85):
+        self.kv:         Dict[int, "SKAStore._KVI"] = {}
+        self.new_kv:     Dict[int, "SKAStore._KVI"] = {}
+        self.obj_kv:     Dict[int, "SKAStore._KVI"] = {}
+        self.new_obj_kv: Dict[int, "SKAStore._KVI"] = {}
+        self.mode:           str   = "normal"
+        self.n_out:          int   = 0
+        self.has_kv:         bool  = False
+        self.replace_thresh: float = replace_thresh
 
     @property
     def has_obj_kv(self) -> bool:
         return bool(self.obj_kv)
 
     def promote(self):
-        """After each editing step: commit new_kv/new_obj_kv → kv/obj_kv."""
+        """Commit new_kv/new_obj_kv → kv/obj_kv for next step's injection."""
         if self.new_kv:
             self.kv     = dict(self.new_kv)
             self.new_kv = {}
@@ -270,6 +286,55 @@ class SKAStore:
             self.obj_kv     = dict(self.new_obj_kv)
             self.new_obj_kv = {}
         self.mode = "normal"
+
+
+def _attn_importance(
+    q_out: torch.Tensor,   # (B, H, n_out, d)  pre-RoPE, output frame queries
+    k_ref: torch.Tensor,   # (B, H, n_ref, d)  pre-RoPE, reference frame keys
+    head_dim: int,
+    n_sample_heads: int = 4,
+) -> torch.Tensor:
+    """Return per-token importance for k_ref: how much do output queries attend to
+    each reference token (summed over queries, averaged over sampled heads).
+    Returns shape (B, n_ref).
+    """
+    H = min(n_sample_heads, q_out.shape[1])
+    scale = head_dim ** -0.5
+    # (B, H, n_out, n_ref) → sum over output queries → (B, H, n_ref) → mean heads → (B, n_ref)
+    with torch.no_grad():
+        logits = (q_out[:, :H] @ k_ref[:, :H].transpose(-1, -2)) * scale  # (B,H,n_out,n_ref)
+        return logits.softmax(dim=-1).sum(dim=-2).mean(dim=1)              # (B, n_ref)
+
+
+def _ska_replace(
+    img_k:       torch.Tensor,
+    img_v:       torch.Tensor,
+    slice_start: int,
+    ref_kvi:     Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    thresh:      float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """At the stored token positions (given by idx), replace current K/V with
+    the stored reference wherever cosine similarity (averaged over heads) < thresh.
+    Operates pre-RoPE; img_k/img_v shapes are (B, L, H, d).
+    """
+    ref_k, ref_v, idx = ref_kvi
+    ref_k = ref_k.to(img_k.device, img_k.dtype)   # (B, H, n_sel, d)
+    ref_v = ref_v.to(img_v.device, img_v.dtype)
+    idx   = idx.to(img_k.device)                   # (n_sel,)
+
+    abs_idx = slice_start + idx                    # absolute positions in img_k
+
+    cur_k = img_k[:, abs_idx].permute(0, 2, 1, 3)  # (B, H, n_sel, d)
+    cur_v = img_v[:, abs_idx].permute(0, 2, 1, 3)
+
+    sim     = F.cosine_similarity(cur_k.mean(dim=1), ref_k.mean(dim=1), dim=-1)  # (B, n_sel)
+    replace = (sim < thresh)[:, None, :, None].expand_as(cur_k)                  # (B, H, n_sel, d)
+
+    img_k = img_k.clone()
+    img_v = img_v.clone()
+    img_k[:, abs_idx] = torch.where(replace, ref_k, cur_k).permute(0, 2, 1, 3)
+    img_v[:, abs_idx] = torch.where(replace, ref_v, cur_v).permute(0, 2, 1, 3)
+    return img_k, img_v
 
 
 class QwenSKAProcessor:
@@ -330,22 +395,44 @@ class QwenSKAProcessor:
         if getattr(attn, "norm_added_q", None) is not None: txt_q = attn.norm_added_q(txt_q)
         if getattr(attn, "norm_added_k", None) is not None: txt_k = attn.norm_added_k(txt_k)
 
-        # ── CAPTURE (before try-block so it always succeeds even if RoPE fails)
-        # Frame layout: [output(0:n_out) | scene_cond(n_out:2*n_out) | obj(2*n_out:)]
-        # img_k/v are (B, L, H, d) here; permute to (B, H, n_out, d) for storage.
-        # Store on CPU so captured tensors don't hold GPU memory across editing steps
-        # (critical when cpu_offload is enabled; harmless otherwise).
+        # ── CAPTURE — attention-mask-based selective token capture ───────────────
+        # Frame layout: [output(0:n_out) | scene_cond(n_out:2*n_out) | obj(2*n_out:3*n_out)]
+        #
+        # Derive spatial masks from the model's own attention:
+        #   bg mask  — scene_cond tokens that output queries attend to most
+        #              (output attends strongly to bg tokens it is copying)
+        #   obj mask — obj frame tokens that output queries attend to most
+        #              (output attends strongly to actual object pixels, not white fill)
+        #
+        # Only above-average-importance tokens are stored, so captured K/V is
+        # dense on signal and sparse on noise/fill. Each entry is (k, v, idx).
+        # Store on CPU to avoid holding GPU memory across editing steps.
         if n_out > 0 and L_img >= 2 * n_out:
-            # Background: scene_cond frame (input reference scene)
+            q_out = img_q[:, 0:n_out].permute(0, 2, 1, 3)           # (B, H, n_out, d)
+            k_bg  = img_k[:, n_out:2 * n_out].permute(0, 2, 1, 3)   # (B, H, n_out, d)
+
+            bg_imp = _attn_importance(q_out, k_bg, head_dim)          # (B, n_out)
+            bg_mask = bg_imp > bg_imp.mean(dim=-1, keepdim=True)       # (B, n_out) bool
+            bg_idx  = bg_mask[0].nonzero(as_tuple=True)[0]            # (n_sel,)
+
             self.store.new_kv[self.block_idx] = (
-                img_k[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
-                img_v[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
+                img_k[:, n_out:2 * n_out][:, bg_idx].permute(0, 2, 1, 3).detach().cpu(),
+                img_v[:, n_out:2 * n_out][:, bg_idx].permute(0, 2, 1, 3).detach().cpu(),
+                bg_idx.detach().cpu(),
             )
+
         if n_out > 0 and L_img >= 3 * n_out:
-            # Object: obj frame (current object being inserted)
+            q_out  = img_q[:, 0:n_out].permute(0, 2, 1, 3)            # (B, H, n_out, d)
+            k_obj  = img_k[:, 2 * n_out:3 * n_out].permute(0, 2, 1, 3)
+
+            obj_imp  = _attn_importance(q_out, k_obj, head_dim)        # (B, n_out)
+            obj_mask = obj_imp > obj_imp.mean(dim=-1, keepdim=True)
+            obj_idx  = obj_mask[0].nonzero(as_tuple=True)[0]
+
             self.store.new_obj_kv[self.block_idx] = (
-                img_k[:, 2 * n_out:3 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
-                img_v[:, 2 * n_out:3 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
+                img_k[:, 2 * n_out:3 * n_out][:, obj_idx].permute(0, 2, 1, 3).detach().cpu(),
+                img_v[:, 2 * n_out:3 * n_out][:, obj_idx].permute(0, 2, 1, 3).detach().cpu(),
+                obj_idx.detach().cpu(),
             )
 
         # In capture-only mode the attention computation is handled by the original
@@ -358,7 +445,27 @@ class QwenSKAProcessor:
                 **kwargs,
             )
 
-        # ── INJECT mode: extend K/V, then custom SDPA ────────────────────────
+        # ── INJECT mode: compare-and-replace drifted tokens, then custom SDPA ─
+        # Compare current pre-RoPE K/V for each reference frame against the
+        # stored reference.  Tokens whose cosine similarity (averaged over heads)
+        # falls below replace_thresh are snapped back to the stored K/V.
+        # This happens pre-RoPE so the correction is in the projected feature space.
+        thresh = self.store.replace_thresh
+
+        # Background: snap drifted bg tokens in scene_cond frame back to reference
+        if self.store.has_kv and self.block_idx in self.store.kv and L_img >= 2 * n_out:
+            img_k, img_v = _ska_replace(
+                img_k, img_v, n_out,
+                self.store.kv[self.block_idx], thresh,
+            )
+
+        # Object: snap drifted obj tokens in obj frame back to reference
+        if self.store.has_obj_kv and self.block_idx in self.store.obj_kv and L_img >= 3 * n_out:
+            img_k, img_v = _ska_replace(
+                img_k, img_v, 2 * n_out,
+                self.store.obj_kv[self.block_idx], thresh,
+            )
+
         try:
             # RoPE on (B, L, H, d) — BEFORE head transpose
             if image_rotary_emb is not None and _apply_rope is not None:
@@ -376,26 +483,7 @@ class QwenSKAProcessor:
             txt_k = txt_k.transpose(1, 2)
             txt_v = txt_v.transpose(1, 2)
 
-            # Extend K/V with stored background K/V (scene_cond from previous step)
-            n_stored = 0
-            if self.store.has_kv and self.block_idx in self.store.kv:
-                s_bg_k, s_bg_v = self.store.kv[self.block_idx]   # (B, H, n_out, d)
-                s_bg_k = s_bg_k.to(img_k.device, img_k.dtype)
-                s_bg_v = s_bg_v.to(img_v.device, img_v.dtype)
-                img_k = torch.cat([img_k, s_bg_k], dim=2)
-                img_v = torch.cat([img_v, s_bg_v], dim=2)
-                n_stored += s_bg_k.shape[2]
-
-            # Extend K/V with stored object K/V (obj frame from previous step)
-            if self.store.has_obj_kv and self.block_idx in self.store.obj_kv:
-                s_obj_k, s_obj_v = self.store.obj_kv[self.block_idx]
-                s_obj_k = s_obj_k.to(img_k.device, img_k.dtype)
-                s_obj_v = s_obj_v.to(img_v.device, img_v.dtype)
-                img_k = torch.cat([img_k, s_obj_k], dim=2)
-                img_v = torch.cat([img_v, s_obj_v], dim=2)
-                n_stored += s_obj_k.shape[2]
-
-            # Joint attention
+            # Joint attention — sequence length unchanged (no extra token appending)
             joint_q = torch.cat([txt_q, img_q], dim=2)
             joint_k = torch.cat([txt_k, img_k], dim=2)
             joint_v = torch.cat([txt_v, img_v], dim=2)
@@ -404,11 +492,6 @@ class QwenSKAProcessor:
             if encoder_hidden_states_mask is not None:
                 img_ones = torch.ones((B, L_img), dtype=torch.bool, device=hidden_states.device)
                 kv_bool  = torch.cat([encoder_hidden_states_mask, img_ones], dim=1)
-                if n_stored > 0:
-                    kv_bool = torch.cat([
-                        kv_bool,
-                        torch.ones((B, n_stored), dtype=torch.bool, device=hidden_states.device),
-                    ], dim=1)
                 attn_mask = (1.0 - kv_bool.float()[:, None, None, :]) * torch.finfo(joint_q.dtype).min
 
             joint_out = F.scaled_dot_product_attention(
@@ -417,7 +500,7 @@ class QwenSKAProcessor:
             )   # (B, H, L_txt+L_img, d)
 
             txt_out = joint_out[:, :, :L_txt, :].transpose(1, 2).reshape(B, L_txt, inner_dim)
-            img_out = joint_out[:, :, L_txt:L_txt + L_img, :].transpose(1, 2).reshape(B, L_img, inner_dim)
+            img_out = joint_out[:, :, L_txt:, :].transpose(1, 2).reshape(B, L_img, inner_dim)
 
             img_out = attn.to_out[0](img_out)
             img_out = attn.to_out[1](img_out)
@@ -427,7 +510,7 @@ class QwenSKAProcessor:
 
         except Exception:
             # RoPE/SDPA failed — fall back to original for this call.
-            # Capture already populated new_kv above, so next step can inject.
+            # Capture already populated new_kv/new_obj_kv, so next step can inject.
             return self.original(
                 attn, hidden_states, encoder_hidden_states,
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
@@ -496,9 +579,10 @@ def run_qwen_ska(
 
     h_tok = height // (pipe.vae_scale_factor * 2)
     w_tok = width  // (pipe.vae_scale_factor * 2)
-    ska_store.n_out  = h_tok * w_tok
-    ska_store.mode   = "normal"
-    ska_store.new_kv = {}
+    ska_store.n_out      = h_tok * w_tok
+    ska_store.mode       = "normal"
+    ska_store.new_kv     = {}
+    ska_store.new_obj_kv = {}
 
     # Approximate step index where σ first drops below gate (linear FlowMatch schedule)
     inject_start = max(1, int(num_steps * (1.0 - ska_gate)) - 1)
