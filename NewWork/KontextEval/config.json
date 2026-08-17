@@ -1,7 +1,7 @@
 {
   "_comment": "Multi-scene config for phase1_qwen_multistep_config.py. Add scenes freely. Each object needs a matching sketch in sketch_dir.",
 
-  "sketch_dir": "NewWork/KontextEval/inputs",
+  "sketch_dir": "cherry_on_top_exp/NewWork/KontextEval/inputs",
 
   "scenes": [
     {
