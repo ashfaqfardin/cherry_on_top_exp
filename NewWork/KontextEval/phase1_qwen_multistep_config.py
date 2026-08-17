@@ -6,8 +6,7 @@ Config-driven multi-scene, multi-step object insertion using Qwen-Image-Edit-250
 
 Pipeline (all via Qwen — no FLUX/ControlNet at runtime):
   Step 0  : scene_prompt  + black image → Qwen                → base_scene.png
-  Step A  : object sketch               → Canny edges (OpenCV) → canny_{name}.png
-  Step B  : Canny image   + render prompt → Qwen              → obj_{name}.png
+  Step A  : object sketch               + render prompt → Qwen → obj_{name}.png
   Step 1+ : [scene, obj]  + add_prompt  → Qwen + SKA          → result_step{N}_{name}.png
 
 Evaluation metrics (run per scene after all insertions complete):
@@ -72,9 +71,6 @@ from phase1_ref_qwen import (   # noqa: E402
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-CANNY_LOW  = 50
-CANNY_HIGH = 150
-CANNY_BLUR = 5       # Gaussian kernel size before Canny (must be odd)
 BG_THRESH  = 30      # pixel-diff threshold for background mask detection
 BG_MIN_FRAC = 0.10   # if <10% of pixels qualify as BG, fall back to center crop
 
@@ -89,38 +85,7 @@ def load_config(path: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. CANNY PREPROCESSING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def apply_canny(
-    sketch_path: str,
-    target_size: tuple[int, int] = (1024, 1024),
-    low_thresh:  int = CANNY_LOW,
-    high_thresh: int = CANNY_HIGH,
-    blur_ksize:  int = CANNY_BLUR,
-) -> Image.Image:
-    """Extract Canny edges from a sketch.
-
-    Preprocessing follows the white-edges-on-black format used by
-    ControlNet-Union mode=0 (InstantX/FLUX.1-dev-Controlnet-Union).
-    Returns a 3-channel RGB PIL image.
-    """
-    try:
-        import cv2
-    except ImportError:
-        raise ImportError("opencv-python required:  pip install opencv-python")
-
-    img = cv2.imread(sketch_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read sketch: {sketch_path!r}")
-    img     = cv2.resize(img, target_size, interpolation=cv2.INTER_LANCZOS4)
-    blurred = cv2.GaussianBlur(img, (blur_ksize, blur_ksize), 0)
-    edges   = cv2.Canny(blurred, low_thresh, high_thresh)
-    return Image.fromarray(cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. QWEN CALLS
+# 2. QWEN CALLS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_scene(
@@ -143,22 +108,23 @@ def generate_scene(
     )
 
 
-def generate_object_from_canny(
+def generate_object_from_sketch(
     pipe,
-    canny_img:   Image.Image,
+    sketch_path: str,
     description: str,
     seed: int, num_steps: int, guidance: float,
     height: int, width: int,
 ) -> Image.Image:
-    """Canny edge map → Qwen → photorealistic isolated object (tight-cropped)."""
+    """Sketch → Qwen → photorealistic isolated object (tight-cropped)."""
+    sketch = Image.open(sketch_path).convert("RGB").resize((width, height), Image.LANCZOS)
     prompt = (
-        f"Render the object defined by these edge lines as a photorealistic {description}. "
-        f"Use the edges to define the exact shape and proportions. "
+        f"Render the object shown in this sketch as a photorealistic {description}. "
+        f"Use the sketch to define the exact shape and proportions. "
         f"Plain white background, studio lighting, sharp details, no cast shadows."
     )
     obj = run_qwen(
         pipe,
-        image=canny_img.convert("RGB"),
+        image=sketch,
         prompt=prompt,
         seed=seed, num_steps=num_steps, guidance=guidance,
         height=height, width=width,
@@ -187,8 +153,6 @@ def run_scene(
     width:        int,
     use_ska:      bool,
     ska_gate:     float,
-    canny_low:    int,
-    canny_high:   int,
 ) -> tuple[list[Image.Image], list[dict]]:
     """Process one scene.  Returns (images, step_meta) for evaluation."""
     scene_id  = scene_cfg["id"]
@@ -225,7 +189,7 @@ def run_scene(
         print(f"  Object {i + 1}/{len(objects)}  —  {name}")
         print(_sep)
 
-        # ── Step A: sketch → Canny ─────────────────────────────────────────────
+        # ── Step A: sketch → Qwen → object image ──────────────────────────────
         sketch_file = obj_cfg.get("sketch", f"sketch_{name}.png")
         sketch_path = os.path.join(sketch_dir, sketch_file)
         if not os.path.isfile(sketch_path):
@@ -236,17 +200,9 @@ def run_scene(
                 f"'{sketch_file}' and '{name}.png' in {sketch_dir!r}"
             )
 
-        print(f"  [A] Canny ← {os.path.basename(sketch_path)}")
-        canny = apply_canny(
-            sketch_path, target_size=(width, height),
-            low_thresh=canny_low, high_thresh=canny_high,
-        )
-        canny.save(os.path.join(scene_out, f"canny_{name}.png"))
-
-        # ── Step B: Canny → Qwen → object image ───────────────────────────────
-        print(f"  [B] Rendering '{desc}' from Canny ...")
-        obj_img = generate_object_from_canny(
-            pipe, canny, desc,
+        print(f"  [A] Rendering '{desc}' from sketch {os.path.basename(sketch_path)} ...")
+        obj_img = generate_object_from_sketch(
+            pipe, sketch_path, desc,
             seed=seed, num_steps=num_steps, guidance=obj_guidance,
             height=height, width=width,
         )
@@ -585,9 +541,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ska_gate",     type=float, default=None,
                    help="SKA sigma gate (default 0.3; try 0.5 for 8-step Lightning)")
     p.add_argument("--no_ska",       action="store_true", help="Disable SKA (ablation baseline)")
-    # Canny
-    p.add_argument("--canny_low",    type=int,   default=CANNY_LOW)
-    p.add_argument("--canny_high",   type=int,   default=CANNY_HIGH)
     # Lightning
     p.add_argument("--lightning",       action="store_true")
     p.add_argument("--lightning_steps", type=int, default=8, choices=[4, 8])
@@ -660,8 +613,6 @@ def main() -> None:
             width=args.width,
             use_ska=not args.no_ska,
             ska_gate=ska_gate,
-            canny_low=args.canny_low,
-            canny_high=args.canny_high,
         )
 
         # Save grid for this scene
