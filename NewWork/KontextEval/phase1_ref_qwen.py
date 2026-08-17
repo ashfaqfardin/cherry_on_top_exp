@@ -695,7 +695,7 @@ class _DSACallback:
         scaling   = getattr(pipe.vae.config, "scaling_factor", 0.18215)
 
         # Scale reference latent into the denoiser's space
-        z_scaled = (self.z_prev * scaling).to(dev, dtyp)  # (1, C, H/8, W/8)
+        z_scaled = (self.z_prev * scaling).to(dev, dtyp)  # (1, C, ref_H, ref_W)
 
         # Reuse the same noise draw across steps for temporal coherence
         if self._noise is None or self._noise.shape != z_scaled.shape:
@@ -708,21 +708,36 @@ class _DSACallback:
         sigma = t_val / T
 
         # Flow-matching forward process: x_t = (1-σ)·x_0 + σ·ε
-        z_ref_noised = (1.0 - sigma) * z_scaled + sigma * noise  # (1, C, H/8, W/8)
+        z_ref_noised = (1.0 - sigma) * z_scaled + sigma * noise  # (1, C, ref_H, ref_W)
 
-        # Background blending mask: α in BG, 0 in object region
-        bg_weight = (self.alpha * (1.0 - self.obj_mask)).to(dev, dtyp)
+        # Extract the spatial slice to anchor (frame 0 for 5D video latents)
+        is_5d = latents.dim() == 5
+        frame = latents[:, :, 0] if is_5d else latents  # (B, C, lat_H, lat_W)
 
-        # The pipeline may pass 4D (B,C,H,W) or 5D (B,C,T,H,W) latents depending
-        # on whether Qwen's video VAE is used in flat or video mode.
-        # We anchor only the spatial dimensions; for 5D we operate on frame 0.
-        if latents.dim() == 5:
-            frame = latents[:, :, 0]  # (B, C, H/8, W/8)
-            anchored = (1.0 - bg_weight) * frame + bg_weight * z_ref_noised
+        # Qwen's pipeline denoises in the patchified token space (lat = VAE/2), so
+        # lat_H/lat_W may differ from ref_H/ref_W.  Resize both reference and mask
+        # to match whatever resolution the callback delivers — no assumptions.
+        lat_h, lat_w = frame.shape[-2], frame.shape[-1]
+        ref_h, ref_w = z_ref_noised.shape[-2], z_ref_noised.shape[-1]
+        if (lat_h, lat_w) != (ref_h, ref_w):
+            z_ref_noised = F.interpolate(
+                z_ref_noised.float(), size=(lat_h, lat_w),
+                mode="bilinear", align_corners=False,
+            ).to(dtyp)
+
+        obj_mask_resized = F.interpolate(
+            self.obj_mask.float().to(dev), size=(lat_h, lat_w),
+            mode="bilinear", align_corners=False,
+        ).to(dtyp)
+        bg_weight = self.alpha * (1.0 - obj_mask_resized)  # (1, 1, lat_H, lat_W)
+
+        anchored = (1.0 - bg_weight) * frame + bg_weight * z_ref_noised
+
+        if is_5d:
             latents_out = latents.clone()
             latents_out[:, :, 0] = anchored
         else:
-            latents_out = (1.0 - bg_weight) * latents + bg_weight * z_ref_noised
+            latents_out = anchored
 
         callback_kwargs["latents"] = latents_out
         return callback_kwargs
