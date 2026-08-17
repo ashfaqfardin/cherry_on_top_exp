@@ -262,7 +262,7 @@ class SKAStore:
     # 3-tuple type alias
     _KVI = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
-    def __init__(self, replace_thresh: float = 0.85):
+    def __init__(self, replace_thresh: float = 0.85, inject_bg: bool = False):
         self.kv:         Dict[int, "SKAStore._KVI"] = {}
         self.new_kv:     Dict[int, "SKAStore._KVI"] = {}
         self.obj_kv:     Dict[int, "SKAStore._KVI"] = {}
@@ -271,6 +271,7 @@ class SKAStore:
         self.n_out:          int   = 0
         self.has_kv:         bool  = False
         self.replace_thresh: float = replace_thresh
+        self.inject_bg:      bool  = inject_bg  # bg injection corrupts walls; off by default
 
     @property
     def has_obj_kv(self) -> bool:
@@ -452,8 +453,14 @@ class QwenSKAProcessor:
         # This happens pre-RoPE so the correction is in the projected feature space.
         thresh = self.store.replace_thresh
 
-        # Background: snap drifted bg tokens in scene_cond frame back to reference
-        if self.store.has_kv and self.block_idx in self.store.kv and L_img >= 2 * n_out:
+        # Background: snap drifted bg tokens in scene_cond frame back to reference.
+        # Disabled by default (inject_bg=False): injecting bg K/V from a prior denoising
+        # trajectory into the current scene_cond frame conflicts with the model's internal
+        # state and produces neon glitch artifacts on walls/ceiling.
+        if (self.store.inject_bg
+                and self.store.has_kv
+                and self.block_idx in self.store.kv
+                and L_img >= 2 * n_out):
             img_k, img_v = _ska_replace(
                 img_k, img_v, n_out,
                 self.store.kv[self.block_idx], thresh,
