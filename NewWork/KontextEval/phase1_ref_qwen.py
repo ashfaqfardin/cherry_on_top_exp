@@ -240,20 +240,35 @@ SKA_SIGMA_GATE = 0.3                    # activate only for σ < this value
 
 
 class SKAStore:
-    """Persistent K/V cache shared across editing steps."""
+    """Persistent K/V cache shared across editing steps.
+
+    Two parallel stores:
+      kv     / new_kv     — scene_cond frame (background)
+      obj_kv / new_obj_kv — obj frame (current object being inserted)
+    Both are injected in the next step; the model routes attention by content.
+    """
     def __init__(self):
-        self.kv:     Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        self.new_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.kv:         Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.new_kv:     Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.obj_kv:     Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.new_obj_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self.mode:   str  = "normal"   # "normal" | "capture" | "inject"
         self.n_out:  int  = 0          # output image token count (n_tok per frame)
         self.has_kv: bool = False
 
+    @property
+    def has_obj_kv(self) -> bool:
+        return bool(self.obj_kv)
+
     def promote(self):
-        """After each editing step: commit new_kv → kv for next step's injection."""
+        """After each editing step: commit new_kv/new_obj_kv → kv/obj_kv."""
         if self.new_kv:
             self.kv     = dict(self.new_kv)
             self.new_kv = {}
             self.has_kv = True
+        if self.new_obj_kv:
+            self.obj_kv     = dict(self.new_obj_kv)
+            self.new_obj_kv = {}
         self.mode = "normal"
 
 
@@ -321,9 +336,16 @@ class QwenSKAProcessor:
         # Store on CPU so captured tensors don't hold GPU memory across editing steps
         # (critical when cpu_offload is enabled; harmless otherwise).
         if n_out > 0 and L_img >= 2 * n_out:
+            # Background: scene_cond frame (input reference scene)
             self.store.new_kv[self.block_idx] = (
                 img_k[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
                 img_v[:, n_out:2 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
+            )
+        if n_out > 0 and L_img >= 3 * n_out:
+            # Object: obj frame (current object being inserted)
+            self.store.new_obj_kv[self.block_idx] = (
+                img_k[:, 2 * n_out:3 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
+                img_v[:, 2 * n_out:3 * n_out, :, :].permute(0, 2, 1, 3).detach().cpu(),
             )
 
         # In capture-only mode the attention computation is handled by the original
@@ -354,15 +376,24 @@ class QwenSKAProcessor:
             txt_k = txt_k.transpose(1, 2)
             txt_v = txt_v.transpose(1, 2)
 
-            # Extend K/V with previous scene's K/V
+            # Extend K/V with stored background K/V (scene_cond from previous step)
             n_stored = 0
             if self.store.has_kv and self.block_idx in self.store.kv:
-                s1_k, s1_v = self.store.kv[self.block_idx]   # (B, H, n_out, d)
-                s1_k = s1_k.to(img_k.device, img_k.dtype)
-                s1_v = s1_v.to(img_v.device, img_v.dtype)
-                img_k = torch.cat([img_k, s1_k], dim=2)
-                img_v = torch.cat([img_v, s1_v], dim=2)
-                n_stored = s1_k.shape[2]
+                s_bg_k, s_bg_v = self.store.kv[self.block_idx]   # (B, H, n_out, d)
+                s_bg_k = s_bg_k.to(img_k.device, img_k.dtype)
+                s_bg_v = s_bg_v.to(img_v.device, img_v.dtype)
+                img_k = torch.cat([img_k, s_bg_k], dim=2)
+                img_v = torch.cat([img_v, s_bg_v], dim=2)
+                n_stored += s_bg_k.shape[2]
+
+            # Extend K/V with stored object K/V (obj frame from previous step)
+            if self.store.has_obj_kv and self.block_idx in self.store.obj_kv:
+                s_obj_k, s_obj_v = self.store.obj_kv[self.block_idx]
+                s_obj_k = s_obj_k.to(img_k.device, img_k.dtype)
+                s_obj_v = s_obj_v.to(img_v.device, img_v.dtype)
+                img_k = torch.cat([img_k, s_obj_k], dim=2)
+                img_v = torch.cat([img_v, s_obj_v], dim=2)
+                n_stored += s_obj_k.shape[2]
 
             # Joint attention
             joint_q = torch.cat([txt_q, img_q], dim=2)
