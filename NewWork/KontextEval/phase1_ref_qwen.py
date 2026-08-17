@@ -171,40 +171,44 @@ def _encode_latent(
     height:  int,
     width:   int,
 ) -> torch.Tensor:
-    """Encode PIL image → unscaled VAE latent on CPU float32.
+    """Encode PIL image → unscaled VAE latent on CPU float32, shape (1, C, H/8, W/8).
 
-    'Unscaled' = raw encoder output before ×vae.config.scaling_factor.
-    This matches what the denoiser's final z looks like after the pipeline
-    divides by scaling_factor before calling vae.decode().
+    Qwen's VAE is a video VAE: encode() expects (B, C, T, H, W).
+    We add a T=1 frame dim before encoding and squeeze it off afterward so all
+    downstream code (DSA, latent composite) works with standard 4D tensors.
     """
     img = pil_img.convert("RGB").resize((width, height), Image.LANCZOS)
-    arr = np.array(img, dtype=np.float32) / 127.5 - 1.0       # → [-1, 1]
+    arr = np.array(img, dtype=np.float32) / 127.5 - 1.0        # → [-1, 1]
     t   = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
     try:
         vae_dev  = next(pipe.vae.parameters()).device
         vae_dtyp = next(pipe.vae.parameters()).dtype
     except StopIteration:
         vae_dev, vae_dtyp = torch.device("cpu"), torch.float32
-    t = t.to(vae_dev, vae_dtyp)
+    t = t.unsqueeze(2).to(vae_dev, vae_dtyp)   # (1, 3, 1, H, W) — video VAE needs T dim
     with torch.no_grad():
-        z = pipe.vae.encode(t).latent_dist.mean   # (1, C, H/8, W/8)
-    return z.cpu().float()
+        z = pipe.vae.encode(t).latent_dist.mean  # (1, C, 1, H/8, W/8)
+    return z[:, :, 0].cpu().float()              # squeeze T → (1, C, H/8, W/8)
 
 
 def _decode_latent(
     pipe,
     z: torch.Tensor,   # unscaled (1, C, H/8, W/8), any device
 ) -> Image.Image:
-    """Decode unscaled VAE latent → PIL RGB image."""
+    """Decode unscaled VAE latent → PIL RGB image.
+
+    Adds and removes the T=1 frame dim required by Qwen's video VAE.
+    """
     try:
         vae_dev  = next(pipe.vae.parameters()).device
         vae_dtyp = next(pipe.vae.parameters()).dtype
     except StopIteration:
         vae_dev, vae_dtyp = torch.device("cpu"), torch.float32
-    z = z.to(vae_dev, vae_dtyp)
+    z = z.unsqueeze(2).to(vae_dev, vae_dtyp)    # (1, C, H/8, W/8) → (1, C, 1, H/8, W/8)
     with torch.no_grad():
-        dec = pipe.vae.decode(z).sample           # (1, 3, H, W) in [-1, 1]
-    dec = (dec.float().clamp(-1, 1) / 2 + 0.5)   # → [0, 1]
+        dec = pipe.vae.decode(z).sample          # (1, 3, 1, H, W)
+    dec = dec[:, :, 0]                           # squeeze T → (1, 3, H, W)
+    dec = (dec.float().clamp(-1, 1) / 2 + 0.5)  # → [0, 1]
     arr = (dec[0].cpu().permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
     return Image.fromarray(arr)
 
@@ -691,7 +695,7 @@ class _DSACallback:
         scaling   = getattr(pipe.vae.config, "scaling_factor", 0.18215)
 
         # Scale reference latent into the denoiser's space
-        z_scaled = (self.z_prev * scaling).to(dev, dtyp)
+        z_scaled = (self.z_prev * scaling).to(dev, dtyp)  # (1, C, H/8, W/8)
 
         # Reuse the same noise draw across steps for temporal coherence
         if self._noise is None or self._noise.shape != z_scaled.shape:
@@ -699,18 +703,27 @@ class _DSACallback:
         noise = self._noise.to(dev, dtyp)
 
         # Normalise timestep t → σ ∈ [0, 1]
-        # FlowMatchEuler: t ∈ {0..num_train_timesteps}, σ = t / T
         T = float(getattr(pipe.scheduler.config, "num_train_timesteps", 1000))
         t_val = float(t.mean()) if t.dim() > 0 else float(t)
-        sigma = (t_val / T)
+        sigma = t_val / T
 
         # Flow-matching forward process: x_t = (1-σ)·x_0 + σ·ε
-        z_ref_noised = (1.0 - sigma) * z_scaled + sigma * noise
+        z_ref_noised = (1.0 - sigma) * z_scaled + sigma * noise  # (1, C, H/8, W/8)
 
         # Background blending mask: α in BG, 0 in object region
         bg_weight = (self.alpha * (1.0 - self.obj_mask)).to(dev, dtyp)
 
-        latents_out = (1.0 - bg_weight) * latents + bg_weight * z_ref_noised
+        # The pipeline may pass 4D (B,C,H,W) or 5D (B,C,T,H,W) latents depending
+        # on whether Qwen's video VAE is used in flat or video mode.
+        # We anchor only the spatial dimensions; for 5D we operate on frame 0.
+        if latents.dim() == 5:
+            frame = latents[:, :, 0]  # (B, C, H/8, W/8)
+            anchored = (1.0 - bg_weight) * frame + bg_weight * z_ref_noised
+            latents_out = latents.clone()
+            latents_out[:, :, 0] = anchored
+        else:
+            latents_out = (1.0 - bg_weight) * latents + bg_weight * z_ref_noised
+
         callback_kwargs["latents"] = latents_out
         return callback_kwargs
 
