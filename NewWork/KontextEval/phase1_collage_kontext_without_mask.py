@@ -1076,7 +1076,8 @@ def run_two_image_chain(
     """
     Two-image Kontext chain — no depth, no collage, no mask.
 
-    Reference = vertical composite: obj (top, full res) + scene (bottom, full res).
+    Reference = horizontal composite: scene (left, full res) + obj (right, full res).
+    Scene goes left because the left position dominates FLUX Kontext token ordering.
     FLUX decides entirely where to place the object.
 
     With --kv_injection:
@@ -1119,21 +1120,21 @@ def run_two_image_chain(
             )
             obj_img.save(os.path.join(out_dir, f"two_image_obj_{name}.png"))
 
-            # Stack obj on top of scene at full resolution — no squeezing.
-            # height/width in the pipe() call set the OUTPUT size; the reference
-            # image is just encoded to latents independently so any size works.
+            # Horizontal composite: scene LEFT (dominant), obj RIGHT (reference).
+            # height/width in pipe() set OUTPUT size; reference can be any aspect ratio.
+            # Left position dominates in FLUX Kontext token ordering, so scene goes first.
             obj_full  = obj_img.resize((width, height), Image.LANCZOS)
-            composite = Image.new("RGB", (width, height * 2))
-            composite.paste(obj_full, (0, 0))
-            composite.paste(scene,    (0, height))
+            composite = Image.new("RGB", (width * 2, height))
+            composite.paste(scene,    (0, 0))
+            composite.paste(obj_full, (width, 0))
             composite.save(os.path.join(out_dir, f"two_image_composite_{name}.png"))
 
             prompt = (
-                f"The top image shows a {desc} on a white background. "
-                f"The bottom image shows an empty room scene. "
-                f"Insert the {desc} from the top image naturally into the room. "
+                f"The left image shows an empty room scene. "
+                f"The right image shows a {desc} on a white background. "
+                f"Insert the {desc} from the right image naturally into the room. "
                 f"Place it on the floor with correct perspective, lighting, and scale. "
-                f"Add a contact shadow. Output the complete room scene."
+                f"Add a contact shadow. Output only the complete room scene."
             )
 
             if use_kv:
