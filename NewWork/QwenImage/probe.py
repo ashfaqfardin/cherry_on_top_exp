@@ -87,39 +87,46 @@ class CaptureAttnProcessor:
         self._cpu     = capture_cpu
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
-                 attention_mask=None, *args, **kwargs):
+                 attention_mask=None, image_rotary_emb=None,
+                 encoder_hidden_states_mask=None, *args, **kwargs):
         step = self._counter[0]
 
-        # Compute Q, K, V
+        # Compute Q, K, V for capture (image stream only; text stream uses add_q_proj etc.)
+        ks = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
         q = attn.to_q(hidden_states)
-        k = attn.to_k(encoder_hidden_states if encoder_hidden_states is not None
-                      else hidden_states)
-        v = attn.to_v(encoder_hidden_states if encoder_hidden_states is not None
-                      else hidden_states)
+        k = attn.to_k(ks)
+        v = attn.to_v(ks)
 
         # Reshape to (B, H, N, d) for storage
         def reshape_qkv(x: torch.Tensor) -> torch.Tensor:
             B, N, C = x.shape
-            x = x.view(B, N, attn.heads, C // attn.heads).transpose(1, 2)
-            return x   # (B, H, N, d)
+            return x.view(B, N, attn.heads, C // attn.heads).transpose(1, 2)
 
         q_h = reshape_qkv(q)
         k_h = reshape_qkv(k)
         v_h = reshape_qkv(v)
 
-        # Delegate to the original processor for the actual computation
-        out = self._orig(attn, hidden_states, encoder_hidden_states,
-                         attention_mask, *args, **kwargs)
+        # Delegate to the original processor — pass ALL kwargs so RoPE is applied correctly
+        out = self._orig(
+            attn, hidden_states, encoder_hidden_states,
+            attention_mask, *args,
+            image_rotary_emb=image_rotary_emb,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            **kwargs,
+        )
+
+        # Dual-stream blocks return (img_out, txt_out) tuple; capture img stream only
+        _out_t = out[0] if isinstance(out, tuple) else out
 
         frame = FeatureFrame(
             block_idx=self._block, step=step,
             q=q_h.detach().cpu().float() if self._cpu else q_h.detach(),
             k=k_h.detach().cpu().float() if self._cpu else k_h.detach(),
             v=v_h.detach().cpu().float() if self._cpu else v_h.detach(),
-            attn_out=out.detach().cpu().float() if self._cpu else out.detach(),
+            attn_out=_out_t.detach().cpu().float() if self._cpu else _out_t.detach(),
         )
         self._store.setdefault(self._block, {})[step] = frame
-        return out
+        return out   # return original (tuple or tensor) unchanged
 
 
 # ── Step-tracking callback ─────────────────────────────────────────────────────

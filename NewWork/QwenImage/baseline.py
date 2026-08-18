@@ -9,13 +9,16 @@ Every background pixel is generated AT MOST ONCE across the full session.
 z_anchor grows monotonically: after step k it contains z_0 for the background
 and frozen z_j outputs for all placed objects j ≤ k.
 
-Key fix (vs. prior write_once_compose.py)
-------------------------------------------
-  _patch_prepare_latents() — fixes the two-image mode bug where the pipeline's
-  bare .squeeze() strips the batch dim from image_latents (1,C,H,W)→(C,H,W),
-  causing torch.cat([latents, image_latents], dim=1) to crash with 4 vs 3 dims.
-  The VAE itself is NOT patched: _pack_latents() needs the raw 5-D video-VAE
-  output and patching at the VAE level breaks that internal call.
+Key fixes (vs. prior write_once_compose.py)
+-------------------------------------------
+  _patch_vae_for_pipeline() — patches the video VAE encode/decode to operate in
+  4-D (B,C,H,W) mode. Without this, two conditioning images are packed as a
+  2-frame video whose seq dimension is 2× the noisy latent → shape mismatch at
+  line 811 of the pipeline. With the patch each image contributes 2×C channels
+  at the same seq length, so the channel-cat succeeds.
+
+  _patch_prepare_latents() — fallback for any residual dim-count mismatch after
+  the VAE patch; should be a no-op in normal operation.
 
 Usage (Colab)
 -------------
@@ -210,20 +213,61 @@ def _fix_cat_dims():
         torch.cat = _orig_cat
 
 
+def _patch_vae_for_pipeline(pipe) -> None:
+    """Patch the video VAE so encode/decode accept and return 4-D (B,C,H,W) tensors.
+
+    Without this patch, when two conditioning images are passed (image=[img1, img2])
+    the pipeline stacks them as a 2-frame video (1,C,2,H,W), whose packed seq
+    dimension is 2× that of the noisy latent → shape mismatch at line 811 of the
+    pipeline __call__:
+        torch.cat([latents, image_latents], dim=1)
+        # latents:      (1, C_pack, 4096)
+        # image_latents:(1, C_pack, 8192)  ← double seq → crash
+
+    With this patch each conditioning image is encoded as a 4-D latent so the
+    pipeline stacks them channel-wise (2×C) at the same seq length:
+        # latents:      (1,   C_pack, 4096) — noisy, one frame
+        # image_latents:(1, 2×C_pack, 4096) — two cond frames, channel-stacked ✓
+    """
+    try:
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+    except ImportError:
+        try:
+            from diffusers.models.autoencoder_kl import DiagonalGaussianDistribution
+        except ImportError:
+            DiagonalGaussianDistribution = None
+
+    _orig_encode = pipe.vae.encode
+    _orig_decode = pipe.vae.decode
+
+    def _encode_4d(x, *a, **kw):
+        if x.dim() == 4:
+            x = x.unsqueeze(2)          # (B,C,H,W) → (B,C,1,H,W)
+        out = _orig_encode(x, *a, **kw)
+        if DiagonalGaussianDistribution is not None and hasattr(out, "latent_dist"):
+            p = out.latent_dist.parameters
+            if p.dim() == 5:            # (B,C,1,H,W) → (B,C,H,W)
+                out.latent_dist = DiagonalGaussianDistribution(p.squeeze(2))
+        return out
+
+    def _decode_4d(z, *a, **kw):
+        if z.dim() == 4:
+            z = z.unsqueeze(2)          # (B,C,H,W) → (B,C,1,H,W)
+        out = _orig_decode(z, *a, **kw)
+        if hasattr(out, "sample") and out.sample.dim() == 5:
+            out.sample = out.sample.squeeze(2)   # (B,3,1,H,W) → (B,3,H,W)
+        return out
+
+    pipe.vae.encode = _encode_4d
+    pipe.vae.decode = _decode_4d
+    print("[patch] VAE encode/decode: T-dim managed automatically (4-D I/O)")
+
+
 def _patch_prepare_latents(pipe) -> None:
-    """Fix batch-dim being stripped from image_latents in two-image mode.
+    """Safety net: fix batch-dim being stripped from image_latents in two-image mode.
 
-    The pipeline's prepare_latents() calls .squeeze() on image_latents after
-    patchification (_pack_latents). With batch_size=1, bare .squeeze() on a
-    (1,C,H,W) tensor removes the batch dim → (C,H,W) = 3-D → crash at:
-        torch.cat([latents, image_latents], dim=1)  # got 4 and 3
-
-    Fix: after prepare_latents() returns, unsqueeze(0) if image_latents is 3-D.
-    Single-image base generation is unaffected (already returns 4-D).
-
-    NOTE: we intentionally do NOT patch pipe.vae.encode/decode because
-    _pack_latents() inside the pipeline needs the raw 5-D video-VAE output.
-    Patching at the VAE level breaks that internal call.
+    With _patch_vae_for_pipeline active this should be a no-op (both packed
+    tensors have the same dim count). Kept as a fallback for unexpected shapes.
     """
     _orig = pipe.prepare_latents
 
@@ -284,6 +328,7 @@ def load_pipeline(
         )
         pipe.load_lora_weights(lora_path)
         print(f"  [load] Lightning {lightning_steps}-step LoRA")
+    _patch_vae_for_pipeline(pipe)
     _patch_prepare_latents(pipe)
     pipe.set_progress_bar_config(disable=True)
     return pipe
@@ -293,31 +338,33 @@ def load_pipeline(
 
 def encode_latent(pipe, pil_img: Image.Image, height: int, width: int) -> torch.Tensor:
     """PIL → unscaled VAE latent (1, C, H/8, W/8) on CPU float32.
-    Adds T=1 for the video VAE, strips it from output.
+    T-dim is handled automatically by _patch_vae_for_pipeline.
     """
     img = pil_img.convert("RGB").resize((width, height), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 127.5 - 1.0
-    t   = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # (1,3,1,H,W)
+    t   = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
     try:
         dev  = next(pipe.vae.parameters()).device
         dtyp = next(pipe.vae.parameters()).dtype
     except StopIteration:
         dev, dtyp = torch.device("cpu"), torch.float32
     with torch.no_grad():
-        z = pipe.vae.encode(t.to(dev, dtyp)).latent_dist.mean  # (1,C,1,H/8,W/8)
-    return z[:, :, 0].cpu().float()
+        z = pipe.vae.encode(t.to(dev, dtyp)).latent_dist.mean  # (1,C,H/8,W/8)
+    return z.cpu().float()
 
 
 def decode_latent(pipe, z: torch.Tensor) -> Image.Image:
-    """Unscaled VAE latent (1, C, H/8, W/8) → PIL RGB."""
+    """Unscaled VAE latent (1, C, H/8, W/8) → PIL RGB.
+    T-dim is handled automatically by _patch_vae_for_pipeline.
+    """
     try:
         dev  = next(pipe.vae.parameters()).device
         dtyp = next(pipe.vae.parameters()).dtype
     except StopIteration:
         dev, dtyp = torch.device("cpu"), torch.float32
     with torch.no_grad():
-        dec = pipe.vae.decode(z.unsqueeze(2).to(dev, dtyp)).sample  # (1,3,1,H,W)
-    dec = dec[:, :, 0].float().clamp(-1, 1) / 2 + 0.5
+        dec = pipe.vae.decode(z.to(dev, dtyp)).sample  # (1,3,H,W)
+    dec = dec.float().clamp(-1, 1) / 2 + 0.5
     arr = (dec[0].cpu().permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
     return Image.fromarray(arr)
 

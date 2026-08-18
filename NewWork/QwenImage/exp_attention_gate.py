@@ -99,43 +99,79 @@ class GatedAttnProcessor:
         return s <= self._step_counter[0] <= e
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
-                 attention_mask=None, *args, **kwargs):
+                 attention_mask=None, image_rotary_emb=None,
+                 encoder_hidden_states_mask=None, *args, **kwargs):
+        # Always pass explicit RoPE kwargs so diffusers doesn't drop them
+        _pass_kwargs = dict(
+            image_rotary_emb=image_rotary_emb,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+        )
+
+        # Dual-stream blocks (encoder_hidden_states is not None) return a tuple
+        # (img_out, txt_out). Full reimplementation needed to gate these — for now
+        # fall through with correct kwargs so the tuple return reaches the block.
+        if encoder_hidden_states is not None:
+            return self._orig(attn, hidden_states, encoder_hidden_states,
+                              attention_mask, *args, **_pass_kwargs, **kwargs)
+
+        # No-gate path: pass through with all kwargs (fixes SSIM at alpha=0.0)
         if not self._should_gate() or self._alpha < 1e-6:
             return self._orig(attn, hidden_states, encoder_hidden_states,
-                              attention_mask, *args, **kwargs)
+                              attention_mask, *args, **_pass_kwargs, **kwargs)
 
-        # Build Q, K
-        q = attn.head_to_batch_dim(attn.to_q(hidden_states))   # (B*H, N_q, d)
-        ks = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        k = attn.head_to_batch_dim(attn.to_k(ks))              # (B*H, N_k, d)
-        v = attn.head_to_batch_dim(attn.to_v(ks))
+        # Single-stream gated attention -----------------------------------------
+        B, N, C = hidden_states.shape
+        H = attn.heads
+        d = C // H
 
-        # Attention scores
-        scale  = q.shape[-1] ** -0.5
-        scores = torch.bmm(q, k.transpose(1, 2)) * scale       # (B*H, N_q, N_k)
+        # Projections + QK-norm (Wan uses norm_q / norm_k)
+        q = attn.to_q(hidden_states)
+        k = attn.to_k(hidden_states)
+        v = attn.to_v(hidden_states)
+        if hasattr(attn, "norm_q"):
+            q = attn.norm_q(q)
+        if hasattr(attn, "norm_k"):
+            k = attn.norm_k(k)
 
-        N_q = scores.shape[1]
-        N_k = scores.shape[2]
+        # Reshape to (B, H, N, d)
+        q = q.view(B, N, H, d).transpose(1, 2)
+        k = k.view(B, N, H, d).transpose(1, 2)
+        v = v.view(B, N, H, d).transpose(1, 2)
 
-        # Apply gate: bg_ids (Q) → obj_ids (K) = -inf
-        bg_valid  = self._bg_ids[self._bg_ids < N_q]
-        obj_valid = self._obj_ids[self._obj_ids < N_k]
+        # Apply RoPE if provided (position-sensitive attention)
+        if image_rotary_emb is not None:
+            try:
+                from diffusers.models.embeddings import apply_rotary_emb as _ape
+                q = _ape(q, image_rotary_emb)
+                k = _ape(k, image_rotary_emb)
+            except Exception:
+                pass
+
+        # Scaled dot-product scores
+        scale  = d ** -0.5
+        scores = torch.einsum("bhnd,bhmd->bhnm", q, k) * scale  # (B, H, N, N)
+
+        # Gate mask: bg_ids (Q) → obj_ids (K) set to -inf * alpha
+        N_q, N_k = scores.shape[2], scores.shape[3]
+        bg_valid  = self._bg_ids[self._bg_ids  < N_q].to(scores.device)
+        obj_valid = self._obj_ids[self._obj_ids < N_k].to(scores.device)
 
         if len(bg_valid) > 0 and len(obj_valid) > 0:
-            mask_val = -1e9 * self._alpha
-            scores[:, bg_valid.unsqueeze(1), obj_valid.unsqueeze(0)] += mask_val
+            gate = torch.zeros(N_q, N_k, device=scores.device, dtype=scores.dtype)
+            gate[bg_valid[:, None], obj_valid[None, :]] = -1e9 * self._alpha
+            scores = scores + gate.unsqueeze(0).unsqueeze(0)
 
-        # Existing attention mask from pipeline
         if attention_mask is not None:
             scores = scores + attention_mask
 
         probs = scores.softmax(dim=-1)
-        out   = torch.bmm(probs, v)
-        out   = attn.batch_to_head_dim(out)
+        out   = torch.einsum("bhnm,bhmd->bhnd", probs, v)       # (B, H, N, d)
+        out   = out.transpose(1, 2).reshape(B, N, H * d)
 
         # Output projection
         out = attn.to_out[0](out)
-        out = attn.to_out[1](out) if len(attn.to_out) > 1 else out
+        if len(attn.to_out) > 1:
+            out = attn.to_out[1](out)
         return out
 
 
