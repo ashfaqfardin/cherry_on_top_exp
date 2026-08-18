@@ -197,16 +197,20 @@ def _patch_prepare_latents(pipe) -> None:
         if isinstance(result, (tuple, list)) and len(result) == 2:
             latents, image_latents = result
             if (
-                image_latents is not None
+                isinstance(latents, torch.Tensor)
                 and isinstance(image_latents, torch.Tensor)
-                and image_latents.dim() == 3
+                and latents.dim() != image_latents.dim()
             ):
-                image_latents = image_latents.unsqueeze(0)
+                # Restore whichever tensor lost its batch dim due to squeeze()
+                if latents.dim() > image_latents.dim():
+                    image_latents = image_latents.unsqueeze(0)
+                else:
+                    latents = latents.unsqueeze(0)
             return latents, image_latents
         return result
 
     pipe.prepare_latents = _patched
-    print("[patch] prepare_latents: image_latents batch-dim preserved (two-image fix)")
+    print("[patch] prepare_latents: dim-mismatch correction active")
 
 
 def load_pipeline(

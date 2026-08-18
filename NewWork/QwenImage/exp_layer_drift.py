@@ -124,6 +124,15 @@ def main() -> None:
 
     # ── Base scene ────────────────────────────────────────────────────────────
     if args.base_img:
+        if not os.path.isfile(args.base_img):
+            raise FileNotFoundError(
+                f"--base_img not found: {args.base_img}\n"
+                "  Generate it first:\n"
+                "    python NewWork/QwenImage/baseline.py \\\n"
+                "        --base_prompt 'empty minimalist living room ...' \\\n"
+                "        --lightning --hf_token $HF_TOKEN\n"
+                "  Then re-run with --base_img results/baseline/base_scene.png"
+            )
         base_img = Image.open(args.base_img).convert("RGB").resize(
             (args.width, args.height), Image.LANCZOS)
     elif args.base_prompt:
