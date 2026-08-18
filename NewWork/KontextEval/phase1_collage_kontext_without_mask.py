@@ -1112,19 +1112,31 @@ def run_two_image_chain(
             )
             obj_img.save(os.path.join(out_dir, f"two_image_obj_{name}.png"))
 
+            # Build vertical composite: obj on top half, scene on bottom half.
+            # FluxKontextPipeline's list API concatenates images width-wise
+            # internally before encoding, producing a 2×-wide latent that
+            # _pack_latents can't reshape.  A single 1024×1024 composite
+            # avoids that entirely while still giving FLUX both images.
+            obj_half   = obj_img.resize((width, height // 2), Image.LANCZOS)
+            scene_half = scene.resize((width, height // 2), Image.LANCZOS)
+            composite  = Image.new("RGB", (width, height))
+            composite.paste(obj_half,   (0, 0))
+            composite.paste(scene_half, (0, height // 2))
+            composite.save(os.path.join(out_dir, f"two_image_composite_{name}.png"))
+
             prompt = (
-                f"The first image shows a {desc} on a white background. "
-                f"The second image shows an empty room. "
-                f"Insert the {desc} from the first image naturally into the room "
-                f"in the second image. Place it on the floor respecting perspective "
-                f"and scale. Add a realistic contact shadow. Keep the rest of the "
-                f"room exactly unchanged."
+                f"The top half of this image shows a {desc} on a white background. "
+                f"The bottom half shows an empty room scene. "
+                f"Insert the {desc} from the top half naturally into the room in "
+                f"the bottom half. Place it on the floor with correct perspective, "
+                f"lighting, and scale. Add a contact shadow. "
+                f"Output the complete room scene with the {desc} naturally integrated."
             )
-            # Pass both images — FLUX decides where to place the object
-            print(f"  [K] pipe(image=[obj_img, scene]) — model decides placement ...")
+            # FLUX sees obj + scene fused in one image and decides placement
+            print(f"  [K] pipe(composite) — model decides placement ...")
             next_scene = pipe(
                 prompt=prompt,
-                image=[obj_img, scene],
+                image=composite,
                 num_inference_steps=num_steps,
                 guidance_scale=scene_guidance,
                 height=height, width=width,
