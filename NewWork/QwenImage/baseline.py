@@ -181,29 +181,45 @@ def assign_depth_order(slots: List[ObjectSlot]) -> List[ObjectSlot]:
 
 @contextlib.contextmanager
 def _fix_cat_dims():
-    """Patch torch.cat to silently unsqueeze a missing batch dim.
+    """Patch torch.cat to fix two-image shape mismatches during pipe().
 
-    Active ONLY during the pipe() call.  Catches the two-image pipeline bug
-    where _pack_latents produces latents=(B,C,H,W)=4D while image_latents
-    ends up 3D because the two-image path never adds the batch dim back after
-    the internal patchification squeeze.  The fix is applied only when:
-      • exactly 2 tensors in the cat list
-      • their dim counts differ by exactly 1  (one is missing a leading dim)
-    All other torch.cat calls are unaffected.
+    Fix 1 — dim-count mismatch: unsqueeze a missing leading batch dim when one
+    tensor has one fewer dimension than the other.
+
+    Fix 2 — channel/seq restack: the installed pipeline's prepare_latents for N
+    conditioning images packs latents as (B, C_pack, N*seq) by concatenating
+    sequences. The denoising loop cats at dim=1 (channel axis), so image_latents
+    must be (B, N*C_pack, seq). Detected when both tensors are 3-D, cat is at
+    dim=1, and the second tensor's last dim is a whole multiple of the first's.
+    Active ONLY inside the pipe() call — all other torch.cat calls are unaffected.
     """
     _orig_cat = torch.cat
 
     def _safe_cat(tensors, dim=0, *args, **kwargs):
         if (len(tensors) == 2
                 and isinstance(tensors[0], torch.Tensor)
-                and isinstance(tensors[1], torch.Tensor)
-                and abs(tensors[0].dim() - tensors[1].dim()) == 1):
+                and isinstance(tensors[1], torch.Tensor)):
             a, b = tensors[0], tensors[1]
-            if a.dim() < b.dim():
-                a = a.unsqueeze(0)
-            else:
-                b = b.unsqueeze(0)
-            tensors = [a, b]
+            # Fix 1: dim-count mismatch (one tensor missing a leading batch dim)
+            if abs(a.dim() - b.dim()) == 1:
+                if a.dim() < b.dim():
+                    a = a.unsqueeze(0)
+                else:
+                    b = b.unsqueeze(0)
+                tensors = [a, b]
+            # Fix 2: installed pipeline emits image_latents as (B, C_pack, N*seq)
+            # but the denoising cat at dim=1 needs (B, N*C_pack, seq).
+            # Detected when both are 3-D, catting at dim=1, and b's last dim is a
+            # whole multiple of a's last dim (and strictly larger).
+            elif (a.dim() == 3 and b.dim() == 3 and dim == 1
+                  and b.shape[-1] > a.shape[-1]
+                  and b.shape[-1] % a.shape[-1] == 0):
+                n   = b.shape[-1] // a.shape[-1]
+                B, C, seq = b.shape[0], b.shape[1], a.shape[-1]
+                b = (b.view(B, C, n, seq)
+                      .permute(0, 2, 1, 3)   # (B, n, C, seq)
+                      .reshape(B, n * C, seq))
+                tensors = [a, b]
         return _orig_cat(tensors, dim, *args, **kwargs)
 
     torch.cat = _safe_cat
