@@ -39,6 +39,7 @@ Usage (Colab)
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import math
@@ -174,6 +175,40 @@ def assign_depth_order(slots: List[ObjectSlot]) -> List[ObjectSlot]:
 
 
 # ── Pipeline loading ──────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def _fix_cat_dims():
+    """Patch torch.cat to silently unsqueeze a missing batch dim.
+
+    Active ONLY during the pipe() call.  Catches the two-image pipeline bug
+    where _pack_latents produces latents=(B,C,H,W)=4D while image_latents
+    ends up 3D because the two-image path never adds the batch dim back after
+    the internal patchification squeeze.  The fix is applied only when:
+      • exactly 2 tensors in the cat list
+      • their dim counts differ by exactly 1  (one is missing a leading dim)
+    All other torch.cat calls are unaffected.
+    """
+    _orig_cat = torch.cat
+
+    def _safe_cat(tensors, dim=0, *args, **kwargs):
+        if (len(tensors) == 2
+                and isinstance(tensors[0], torch.Tensor)
+                and isinstance(tensors[1], torch.Tensor)
+                and abs(tensors[0].dim() - tensors[1].dim()) == 1):
+            a, b = tensors[0], tensors[1]
+            if a.dim() < b.dim():
+                a = a.unsqueeze(0)
+            else:
+                b = b.unsqueeze(0)
+            tensors = [a, b]
+        return _orig_cat(tensors, dim, *args, **kwargs)
+
+    torch.cat = _safe_cat
+    try:
+        yield
+    finally:
+        torch.cat = _orig_cat
+
 
 def _patch_prepare_latents(pipe) -> None:
     """Fix batch-dim being stripped from image_latents in two-image mode.
@@ -393,12 +428,13 @@ def run_qwen(pipe, image, prompt: str, seed: int, num_steps: int, guidance: floa
     if callback is not None:
         extra["callback_on_step_end"]               = callback
         extra["callback_on_step_end_tensor_inputs"] = ["latents"]
-    return pipe(
-        prompt=prompt, negative_prompt=negative_prompt,
-        image=image, num_inference_steps=num_steps,
-        true_cfg_scale=guidance, height=height, width=width,
-        generator=gen, **extra,
-    ).images[0]
+    with _fix_cat_dims():
+        return pipe(
+            prompt=prompt, negative_prompt=negative_prompt,
+            image=image, num_inference_steps=num_steps,
+            true_cfg_scale=guidance, height=height, width=width,
+            generator=gen, **extra,
+        ).images[0]
 
 
 # ── Object synthesis (sketch → photorealistic object) ─────────────────────────

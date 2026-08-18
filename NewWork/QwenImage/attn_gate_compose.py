@@ -63,7 +63,7 @@ from baseline import (
     WriteOnceState, WriteOnceCallback, make_band_weight,
     mask_to_latent, _img_metrics, _make_room_prior_mask,
     slots_from_sketches, assign_depth_order, ObjectSlot,
-    save_grid, _tight_crop,
+    save_grid, _tight_crop, _fix_cat_dims,
 )
 from exp_attention_gate import (
     AttentionGate, GatedAttnProcessor,
@@ -246,17 +246,18 @@ class GatedSceneComposer:
 
             print(f"  [K] Inserting at centroid ({cy:.2f}, {cx:.2f}) ...")
             gen = torch.Generator(device=self.pipe.device).manual_seed(self.seed)
-            result = self.pipe(
-                prompt=prompt,
-                negative_prompt="blurry, distorted, low quality, watermark, artifacts",
-                image=[scene_guided, obj_img.convert("RGB")],
-                num_inference_steps=self.num_steps,
-                true_cfg_scale=self.guidance,
-                height=H, width=W,
-                generator=gen,
-                callback_on_step_end=composite_cb,
-                callback_on_step_end_tensor_inputs=["latents"],
-            ).images[0]
+            with _fix_cat_dims():
+                result = self.pipe(
+                    prompt=prompt,
+                    negative_prompt="blurry, distorted, low quality, watermark, artifacts",
+                    image=[scene_guided, obj_img.convert("RGB")],
+                    num_inference_steps=self.num_steps,
+                    true_cfg_scale=self.guidance,
+                    height=H, width=W,
+                    generator=gen,
+                    callback_on_step_end=composite_cb,
+                    callback_on_step_end_tensor_inputs=["latents"],
+                ).images[0]
 
             if gate is not None:
                 gate.remove()

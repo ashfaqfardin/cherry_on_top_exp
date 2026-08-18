@@ -59,7 +59,7 @@ from PIL import Image
 
 from baseline import (
     load_pipeline, run_qwen, encode_latent, _make_room_prior_mask,
-    _img_metrics,
+    _img_metrics, _fix_cat_dims,
 )
 from probe import QwenProbe, probe_run, _find_blocks, _find_attn
 
@@ -286,17 +286,18 @@ def run_gate_sweep(
             gate.install()
             sc  = gate.step_callback()
             gen = torch.Generator(device=pipe.device).manual_seed(seed)
-            result = pipe(
-                prompt=prompt,
-                negative_prompt="blurry, distorted, low quality, watermark",
-                image=[scene_img, obj_img],
-                num_inference_steps=num_steps,
-                true_cfg_scale=guidance,
-                height=height, width=width,
-                generator=gen,
-                callback_on_step_end=sc,
-                callback_on_step_end_tensor_inputs=["latents"],
-            ).images[0]
+            with _fix_cat_dims():
+                result = pipe(
+                    prompt=prompt,
+                    negative_prompt="blurry, distorted, low quality, watermark",
+                    image=[scene_img, obj_img],
+                    num_inference_steps=num_steps,
+                    true_cfg_scale=guidance,
+                    height=height, width=width,
+                    generator=gen,
+                    callback_on_step_end=sc,
+                    callback_on_step_end_tensor_inputs=["latents"],
+                ).images[0]
             gate.remove()
 
             if out_dir:
@@ -417,12 +418,13 @@ def main() -> None:
         f"Do not change any other part of the room."
     )
     gen  = torch.Generator(device=pipe.device).manual_seed(args.seed)
-    baseline = pipe(
-        prompt=prompt, image=[base_img, obj_img.convert("RGB")],
-        num_inference_steps=num_steps, true_cfg_scale=guidance,
-        height=args.height, width=args.width, generator=gen,
-        negative_prompt="blurry, distorted, low quality, watermark",
-    ).images[0]
+    with _fix_cat_dims():
+        baseline = pipe(
+            prompt=prompt, image=[base_img, obj_img.convert("RGB")],
+            num_inference_steps=num_steps, true_cfg_scale=guidance,
+            height=args.height, width=args.width, generator=gen,
+            negative_prompt="blurry, distorted, low quality, watermark",
+        ).images[0]
     baseline.save(os.path.join(args.out_dir, "baseline_no_gate.png"))
     baseline_metrics = _img_metrics(base_img, baseline, args.height, args.width)
     print(f"  Baseline SSIM={baseline_metrics.get('ssim','n/a')}  "

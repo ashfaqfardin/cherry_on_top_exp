@@ -374,19 +374,20 @@ def probe_run(
     label:     str   = "probe",
 ) -> Tuple[Dict[int, Dict[int, FeatureFrame]], "Image.Image"]:
     """Run a single generation with full feature capture. Returns (data, image)."""
-    from PIL import Image as PILImage
+    from baseline import _fix_cat_dims
     probe = QwenProbe(pipe)
     probe.attach()
     sc    = probe.step_callback()
     gen   = torch.Generator(device=pipe.device).manual_seed(seed)
-    img   = pipe(
-        prompt=prompt, negative_prompt=neg,
-        image=image, num_inference_steps=num_steps,
-        true_cfg_scale=guidance, height=height, width=width,
-        generator=gen,
-        callback_on_step_end=sc,
-        callback_on_step_end_tensor_inputs=["latents"],
-    ).images[0]
+    with _fix_cat_dims():
+        img = pipe(
+            prompt=prompt, negative_prompt=neg,
+            image=image, num_inference_steps=num_steps,
+            true_cfg_scale=guidance, height=height, width=width,
+            generator=gen,
+            callback_on_step_end=sc,
+            callback_on_step_end_tensor_inputs=["latents"],
+        ).images[0]
     data = probe.detach()
     print(f"[Probe] {label}: {len(data)} blocks × {num_steps} steps captured.")
     return data, img
