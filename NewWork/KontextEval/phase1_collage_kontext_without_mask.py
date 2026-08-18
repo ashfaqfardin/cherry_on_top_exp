@@ -1053,6 +1053,118 @@ def run_collage_chain(
     return results
 
 
+# ── Two-image chain: let FLUX decide placement ────────────────────────────────
+
+def run_two_image_chain(
+    pipe,
+    base:          Image.Image,
+    edits:         List[dict],
+    sketch_dir:    str,
+    lora_id:       str,
+    seed:          int,
+    num_steps:     int,
+    lora_guidance: float,
+    scene_guidance:float,
+    height:        int,
+    width:         int,
+    out_dir:       str,
+    device:        str,
+) -> List[Image.Image]:
+    """
+    Pure two-image Kontext chain — no depth, no collage, no mask.
+
+    For insertion: pipe(image=[obj_img, scene], prompt=...)
+    For removal:   pipe(image=[scene],          prompt=...)
+
+    FLUX decides entirely where and how to integrate the object.
+    Use this to observe the model's inherent spatial reasoning.
+    Outputs are saved as two_image_step{N}_{name}.png for comparison.
+    """
+    results = [base]
+    scene   = base
+
+    for i, edit in enumerate(edits):
+        name   = edit["name"]
+        desc   = edit["description"]
+        action = edit.get("action", "insert")
+
+        print(f"\n{'─'*60}")
+        print(f"  [TWO-IMAGE] Step {i+1}/{len(edits)}  —  {name}  [{action}]")
+        print(f"{'─'*60}")
+
+        generator = torch.Generator(device=pipe.device).manual_seed(seed)
+
+        if action == "insert":
+            # Stage A: sketch → object image
+            sketch_path = os.path.join(sketch_dir, f"{name}.png")
+            if not os.path.isfile(sketch_path):
+                sketch_path = os.path.join(sketch_dir, f"sketch_{name}.png")
+            if not os.path.isfile(sketch_path):
+                raise FileNotFoundError(
+                    f"Sketch not found: expected '{name}.png' or 'sketch_{name}.png' "
+                    f"in {sketch_dir!r}"
+                )
+            print(f"  [A] Generating '{desc}' from sketch ...")
+            obj_img = generate_from_sketch(
+                pipe=pipe, sketch_path=sketch_path, description=desc,
+                seed=seed, num_steps=num_steps, guidance=lora_guidance,
+                height=height, width=width, lora_id=lora_id, device=device,
+            )
+            obj_img.save(os.path.join(out_dir, f"two_image_obj_{name}.png"))
+
+            prompt = (
+                f"The first image shows a {desc} on a white background. "
+                f"The second image shows an empty room. "
+                f"Insert the {desc} from the first image naturally into the room "
+                f"in the second image. Place it on the floor respecting perspective "
+                f"and scale. Add a realistic contact shadow. Keep the rest of the "
+                f"room exactly unchanged."
+            )
+            # Pass both images — FLUX decides where to place the object
+            print(f"  [K] pipe(image=[obj_img, scene]) — model decides placement ...")
+            next_scene = pipe(
+                prompt=prompt,
+                image=[obj_img, scene],
+                num_inference_steps=num_steps,
+                guidance_scale=scene_guidance,
+                height=height, width=width,
+                generator=generator,
+            ).images[0]
+
+        else:  # remove
+            prompt = (
+                f"{BASE_PROMPT} "
+                f"Remove the {desc} completely. "
+                f"Fill the area with seamless wooden floor and white walls. "
+                f"No object, clean empty room."
+            )
+            print(f"  [K] pipe(image=[scene]) — removal via prompt only ...")
+            next_scene = pipe(
+                prompt=prompt,
+                image=scene,
+                num_inference_steps=num_steps,
+                guidance_scale=scene_guidance,
+                height=height, width=width,
+                generator=generator,
+            ).images[0]
+
+        step_tag = f"{'remove' if action == 'remove' else 'step'}{i+1}_{name}"
+        out_path = os.path.join(out_dir, f"two_image_{step_tag}.png")
+        next_scene.save(out_path)
+        print(f"      Saved: {out_path}")
+
+        with open(os.path.join(out_dir, f"prompt_two_image_{step_tag}.txt"), "w") as f:
+            f.write(prompt)
+
+        scene = next_scene
+        results.append(scene)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return results
+
+
 # ── Arguments ─────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -1063,6 +1175,11 @@ def parse_args():
     p.add_argument("--hf_token",      required=True)
     p.add_argument("--cache_dir",     default="./models")
     p.add_argument("--out_dir",       default="results/phase1_collage_nomask")
+    p.add_argument("--mode",          default="collage",
+                   choices=["collage", "two_image"],
+                   help="'collage': depth-guided paste then Kontext (default). "
+                        "'two_image': pass [obj_img, scene] directly to FLUX and "
+                        "observe where the model places the object.")
     p.add_argument("--depth_model",
                    default="depth-anything/Depth-Anything-V2-Small-hf",
                    help="HF model id for monocular depth estimation. "
@@ -1098,23 +1215,30 @@ def main():
             edits = json.load(f)
 
     print(f"\n{_SEP}")
-    print(f"  phase1_collage_kontext_without_mask  —  mask-free (depth-guided)")
+    print(f"  phase1_collage_kontext_without_mask  —  mode={args.mode}")
     print(f"{_SEP}")
     print(f"  Objects      : {[e['name'] for e in edits]}")
     print(f"  Sketch dir   : {args.sketch_dir}")
-    print(f"  Depth model  : {args.depth_model}")
-    print(f"  Collage mode : {args.collage_mode}")
+    print(f"  Mode         : {args.mode}")
+    if args.mode == "collage":
+        print(f"  Depth model  : {args.depth_model}")
+        print(f"  Collage mode : {args.collage_mode}")
+        print(f"  KV injection : {args.kv_injection}"
+              + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
+                 if args.kv_injection else ""))
     print(f"  Guidance     : {args.guidance}")
-    print(f"  KV injection : {args.kv_injection}"
-          + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
-             if args.kv_injection else ""))
     print(f"  Output       : {args.out_dir}")
     print(f"{_SEP}\n")
 
-    print("Loading depth model ...")
-    depth_model, depth_processor, _ = load_depth_model(
-        model_id=args.depth_model, cache_dir=args.cache_dir,
-    )
+    # Depth model only needed for collage mode
+    if args.mode == "collage":
+        print("Loading depth model ...")
+        depth_model, depth_processor, _ = load_depth_model(
+            model_id=args.depth_model, cache_dir=args.cache_dir,
+        )
+    else:
+        depth_model = depth_processor = None
+        print("[two_image mode] Skipping depth model — FLUX decides placement.")
 
     print("\nLoading FLUX.1-Kontext-dev ...")
     pipe = load_kontext_pipeline(
@@ -1134,20 +1258,31 @@ def main():
     _cf = [float(x) for x in args.cutoff_frac.split(",")]
     cutoff_frac: Tuple[float, float] = (_cf[0], _cf[1])
 
-    results = run_collage_chain(
-        pipe=pipe, base=base, edits=edits,
-        sketch_dir=args.sketch_dir, lora_id=args.lora_id,
-        depth_model=depth_model, depth_processor=depth_processor,
-        seed=args.seed, num_steps=args.num_steps,
-        lora_guidance=args.lora_guidance,
-        scene_guidance=args.guidance,
-        collage_mode=args.collage_mode,
-        height=args.height, width=args.width,
-        out_dir=args.out_dir, device=args.device,
-        use_kv=args.kv_injection,
-        obj_strength=args.obj_strength,
-        cutoff_frac=cutoff_frac,
-    )
+    if args.mode == "two_image":
+        results = run_two_image_chain(
+            pipe=pipe, base=base, edits=edits,
+            sketch_dir=args.sketch_dir, lora_id=args.lora_id,
+            seed=args.seed, num_steps=args.num_steps,
+            lora_guidance=args.lora_guidance,
+            scene_guidance=args.guidance,
+            height=args.height, width=args.width,
+            out_dir=args.out_dir, device=args.device,
+        )
+    else:
+        results = run_collage_chain(
+            pipe=pipe, base=base, edits=edits,
+            sketch_dir=args.sketch_dir, lora_id=args.lora_id,
+            depth_model=depth_model, depth_processor=depth_processor,
+            seed=args.seed, num_steps=args.num_steps,
+            lora_guidance=args.lora_guidance,
+            scene_guidance=args.guidance,
+            collage_mode=args.collage_mode,
+            height=args.height, width=args.width,
+            out_dir=args.out_dir, device=args.device,
+            use_kv=args.kv_injection,
+            obj_strength=args.obj_strength,
+            cutoff_frac=cutoff_frac,
+        )
 
     all_imgs = results
     all_lbls = ["base"] + [f"{e['name']} ({e.get('action','insert')})" for e in edits]
