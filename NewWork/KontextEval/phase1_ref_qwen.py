@@ -139,8 +139,55 @@ def load_pipeline(
         pipe.load_lora_weights(lora_path)
         print(f"  [Lightning] LoRA loaded — {lightning_steps}-step distillation active")
 
+    _patch_vae_for_pipeline(pipe)
     pipe.set_progress_bar_config(disable=True)
     return pipe
+
+
+# ── VAE patch (video VAE → 4-D I/O for pipeline compatibility) ────────────────
+
+def _patch_vae_for_pipeline(pipe) -> None:
+    """Patch the video VAE so encode/decode accept and return 4-D (B,C,H,W) tensors.
+
+    The pipeline's internal squeeze() on a (1,C,1,H,W) output drops BOTH the
+    batch dim AND T dim when batch_size=1, producing a 3-D tensor that cannot be
+    cat'd with the 4-D denoising latent at line 811 of the pipeline __call__.
+
+    After this patch the VAE behaves as a standard image VAE.
+    _encode_latent() and _decode_latent() are updated to match (no manual T dim).
+    """
+    try:
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+    except ImportError:
+        try:
+            from diffusers.models.autoencoder_kl import DiagonalGaussianDistribution
+        except ImportError:
+            DiagonalGaussianDistribution = None
+
+    _orig_encode = pipe.vae.encode
+    _orig_decode = pipe.vae.decode
+
+    def _encode_4d(x, *a, **kw):
+        if x.dim() == 4:
+            x = x.unsqueeze(2)          # (B,C,H,W) → (B,C,1,H,W)
+        out = _orig_encode(x, *a, **kw)
+        if DiagonalGaussianDistribution is not None and hasattr(out, "latent_dist"):
+            p = out.latent_dist.parameters
+            if p.dim() == 5:            # (B,C,1,H,W) → (B,C,H,W)
+                out.latent_dist = DiagonalGaussianDistribution(p.squeeze(2))
+        return out
+
+    def _decode_4d(z, *a, **kw):
+        if z.dim() == 4:
+            z = z.unsqueeze(2)          # (B,C,H,W) → (B,C,1,H,W)
+        out = _orig_decode(z, *a, **kw)
+        if hasattr(out, "sample") and out.sample.dim() == 5:
+            out.sample = out.sample.squeeze(2)   # (B,3,1,H,W) → (B,3,H,W)
+        return out
+
+    pipe.vae.encode = _encode_4d
+    pipe.vae.decode = _decode_4d
+    print("[patch] VAE encode/decode patched: T-dim managed automatically (4-D I/O)")
 
 
 # ── Qwen call ─────────────────────────────────────────────────────────────────
@@ -185,10 +232,10 @@ def _encode_latent(
         vae_dtyp = next(pipe.vae.parameters()).dtype
     except StopIteration:
         vae_dev, vae_dtyp = torch.device("cpu"), torch.float32
-    t = t.unsqueeze(2).to(vae_dev, vae_dtyp)   # (1, 3, 1, H, W) — video VAE needs T dim
+    t = t.to(vae_dev, vae_dtyp)                 # (1, 3, H, W) — patch adds T=1 internally
     with torch.no_grad():
-        z = pipe.vae.encode(t).latent_dist.mean  # (1, C, 1, H/8, W/8)
-    return z[:, :, 0].cpu().float()              # squeeze T → (1, C, H/8, W/8)
+        z = pipe.vae.encode(t).latent_dist.mean  # (1, C, H/8, W/8) after patch
+    return z.cpu().float()
 
 
 def _decode_latent(
@@ -204,10 +251,9 @@ def _decode_latent(
         vae_dtyp = next(pipe.vae.parameters()).dtype
     except StopIteration:
         vae_dev, vae_dtyp = torch.device("cpu"), torch.float32
-    z = z.unsqueeze(2).to(vae_dev, vae_dtyp)    # (1, C, H/8, W/8) → (1, C, 1, H/8, W/8)
+    z = z.to(vae_dev, vae_dtyp)                  # (1, C, H/8, W/8) — patch adds T=1 internally
     with torch.no_grad():
-        dec = pipe.vae.decode(z).sample          # (1, 3, 1, H, W)
-    dec = dec[:, :, 0]                           # squeeze T → (1, 3, H, W)
+        dec = pipe.vae.decode(z).sample          # (1, 3, H, W) after patch
     dec = (dec.float().clamp(-1, 1) / 2 + 0.5)  # → [0, 1]
     arr = (dec[0].cpu().permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
     return Image.fromarray(arr)
