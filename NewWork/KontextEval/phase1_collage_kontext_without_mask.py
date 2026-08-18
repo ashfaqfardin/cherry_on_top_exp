@@ -1057,28 +1057,35 @@ def run_collage_chain(
 
 def run_two_image_chain(
     pipe,
-    base:          Image.Image,
-    edits:         List[dict],
-    sketch_dir:    str,
-    lora_id:       str,
-    seed:          int,
-    num_steps:     int,
-    lora_guidance: float,
-    scene_guidance:float,
-    height:        int,
-    width:         int,
-    out_dir:       str,
-    device:        str,
+    base:           Image.Image,
+    edits:          List[dict],
+    sketch_dir:     str,
+    lora_id:        str,
+    seed:           int,
+    num_steps:      int,
+    lora_guidance:  float,
+    scene_guidance: float,
+    height:         int,
+    width:          int,
+    out_dir:        str,
+    device:         str,
+    use_kv:         bool  = False,
+    obj_strength:   float = 0.7,
+    cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
 ) -> List[Image.Image]:
     """
-    Pure two-image Kontext chain — no depth, no collage, no mask.
+    Two-image Kontext chain — no depth, no collage, no mask.
 
-    For insertion: pipe(image=[obj_img, scene], prompt=...)
-    For removal:   pipe(image=[scene],          prompt=...)
+    Reference = vertical composite: obj (top, full res) + scene (bottom, full res).
+    FLUX decides entirely where to place the object.
 
-    FLUX decides entirely where and how to integrate the object.
-    Use this to observe the model's inherent spatial reasoning.
-    Outputs are saved as two_image_step{N}_{name}.png for comparison.
+    With --kv_injection:
+      A 1-step capture pass records K/V from obj_img at TIER_A layers.
+      During composite denoising those K/V are injected into ALL gen tokens
+      (full-field, no zone restriction) so FLUX retains obj appearance wherever
+      it decides to place it.
+
+    Outputs saved as two_image_step{N}_{name}.png for comparison.
     """
     results = [base]
     scene   = base
@@ -1112,36 +1119,52 @@ def run_two_image_chain(
             )
             obj_img.save(os.path.join(out_dir, f"two_image_obj_{name}.png"))
 
-            # Build vertical composite: obj on top half, scene on bottom half.
-            # FluxKontextPipeline's list API concatenates images width-wise
-            # internally before encoding, producing a 2×-wide latent that
-            # _pack_latents can't reshape.  A single 1024×1024 composite
-            # avoids that entirely while still giving FLUX both images.
-            obj_half   = obj_img.resize((width, height // 2), Image.LANCZOS)
-            scene_half = scene.resize((width, height // 2), Image.LANCZOS)
-            composite  = Image.new("RGB", (width, height))
-            composite.paste(obj_half,   (0, 0))
-            composite.paste(scene_half, (0, height // 2))
+            # Stack obj on top of scene at full resolution — no squeezing.
+            # height/width in the pipe() call set the OUTPUT size; the reference
+            # image is just encoded to latents independently so any size works.
+            obj_full  = obj_img.resize((width, height), Image.LANCZOS)
+            composite = Image.new("RGB", (width, height * 2))
+            composite.paste(obj_full, (0, 0))
+            composite.paste(scene,    (0, height))
             composite.save(os.path.join(out_dir, f"two_image_composite_{name}.png"))
 
             prompt = (
-                f"The top half of this image shows a {desc} on a white background. "
-                f"The bottom half shows an empty room scene. "
-                f"Insert the {desc} from the top half naturally into the room in "
-                f"the bottom half. Place it on the floor with correct perspective, "
-                f"lighting, and scale. Add a contact shadow. "
-                f"Output the complete room scene with the {desc} naturally integrated."
+                f"The top image shows a {desc} on a white background. "
+                f"The bottom image shows an empty room scene. "
+                f"Insert the {desc} from the top image naturally into the room. "
+                f"Place it on the floor with correct perspective, lighting, and scale. "
+                f"Add a contact shadow. Output the complete room scene."
             )
-            # FLUX sees obj + scene fused in one image and decides placement
-            print(f"  [K] pipe(composite) — model decides placement ...")
-            next_scene = pipe(
-                prompt=prompt,
-                image=composite,
-                num_inference_steps=num_steps,
-                guidance_scale=scene_guidance,
-                height=height, width=width,
-                generator=generator,
-            ).images[0]
+
+            if use_kv:
+                # Full-field K/V injection: target_zone = all gen tokens.
+                # No placement mask exists, so we reinforce obj appearance
+                # everywhere and let FLUX decide the location.
+                vae_sf  = getattr(pipe, "vae_scale_factor", 8)
+                h_lat   = height // (vae_sf * 2)
+                w_lat   = width  // (vae_sf * 2)
+                n_gen   = h_lat * w_lat
+                full_zone    = np.ones(n_gen, dtype=bool)
+                obj_mask_tok = _obj_token_mask(obj_img, h_lat, w_lat)
+                print(f"  [K] KV-injection (full-field) + composite reference ...")
+                next_scene = run_with_kv_injection(
+                    pipe=pipe, canvas=composite, prompt=prompt,
+                    obj_img=obj_img, obj_mask_np=obj_mask_tok,
+                    target_zone=full_zone,
+                    seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                    height=height, width=width,
+                    obj_strength=obj_strength, cutoff_frac=cutoff_frac,
+                )
+            else:
+                print(f"  [K] pipe(composite) — model decides placement ...")
+                next_scene = pipe(
+                    prompt=prompt,
+                    image=composite,
+                    num_inference_steps=num_steps,
+                    guidance_scale=scene_guidance,
+                    height=height, width=width,
+                    generator=generator,
+                ).images[0]
 
         else:  # remove
             prompt = (
@@ -1279,6 +1302,9 @@ def main():
             scene_guidance=args.guidance,
             height=args.height, width=args.width,
             out_dir=args.out_dir, device=args.device,
+            use_kv=args.kv_injection,
+            obj_strength=args.obj_strength,
+            cutoff_frac=cutoff_frac,
         )
     else:
         results = run_collage_chain(
