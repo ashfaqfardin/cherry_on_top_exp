@@ -200,26 +200,40 @@ def _fix_cat_dims():
                 and isinstance(tensors[0], torch.Tensor)
                 and isinstance(tensors[1], torch.Tensor)):
             a, b = tensors[0], tensors[1]
-            # Fix 1: dim-count mismatch (one tensor missing a leading batch dim)
+            # Fix 1: dim-count mismatch — unsqueeze the smaller tensor
             if abs(a.dim() - b.dim()) == 1:
                 if a.dim() < b.dim():
                     a = a.unsqueeze(0)
                 else:
                     b = b.unsqueeze(0)
                 tensors = [a, b]
-            # Fix 2: installed pipeline emits image_latents as (B, C_pack, N*seq)
-            # but the denoising cat at dim=1 needs (B, N*C_pack, seq).
-            # Detected when both are 3-D, catting at dim=1, and b's last dim is a
-            # whole multiple of a's last dim (and strictly larger).
-            elif (a.dim() == 3 and b.dim() == 3 and dim == 1
-                  and b.shape[-1] > a.shape[-1]
-                  and b.shape[-1] % a.shape[-1] == 0):
-                n   = b.shape[-1] // a.shape[-1]
-                B, C, seq = b.shape[0], b.shape[1], a.shape[-1]
-                b = (b.view(B, C, n, seq)
-                      .permute(0, 2, 1, 3)   # (B, n, C, seq)
-                      .reshape(B, n * C, seq))
-                tensors = [a, b]
+            # Fix 2: same rank, exactly one non-cat dim where b is a whole multiple
+            # of a.  Folds that factor into the cat dim so the cat succeeds.
+            # Handles any tensor format: (B,seq,C), (B,C,seq), (seq,C), etc.
+            elif a.dim() == b.dim():
+                mismatches = [
+                    (d, a.shape[d], b.shape[d])
+                    for d in range(a.dim())
+                    if d != dim and a.shape[d] != b.shape[d]
+                ]
+                if len(mismatches) == 1:
+                    md, a_sz, b_sz = mismatches[0]
+                    if b_sz > a_sz and b_sz % a_sz == 0:
+                        n = b_sz // a_sz
+                        # Split b's dim md → (n, a_sz), then move n to cat dim
+                        new_shape = list(b.shape)
+                        new_shape[md:md + 1] = [n, a_sz]
+                        b_split = b.reshape(new_shape)
+                        # Permute: remove n from position md, insert at dim
+                        perm = list(range(b_split.dim()))
+                        perm.pop(md)
+                        perm.insert(dim, md)
+                        b_perm = b_split.permute(perm)
+                        # Merge dim and dim+1 to produce n× larger cat axis
+                        fs = list(b_perm.shape)
+                        fs[dim:dim + 2] = [fs[dim] * fs[dim + 1]]
+                        b = b_perm.contiguous().reshape(fs)
+                        tensors = [a, b]
         return _orig_cat(tensors, dim, *args, **kwargs)
 
     torch.cat = _safe_cat
