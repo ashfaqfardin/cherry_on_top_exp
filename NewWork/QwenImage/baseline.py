@@ -214,11 +214,18 @@ def _fix_cat_dims():
 
 
 def _patch_prepare_latents(pipe) -> None:
-    """Safety net: fix dim-count mismatch between latents and image_latents.
+    """Fix prepare_latents for multi-image conditioning.
 
-    The updated diffusers pipeline packs each conditioning image separately and
-    concatenates sequences, so both tensors come out 3-D and this is a no-op.
-    Retained as a fallback for older installed versions.
+    The installed pipeline packs each conditioning image into (B, C_pack, seq) and
+    concatenates them along seq-dim → (B, C_pack, N*seq). But the denoising loop
+    cats [noisy, image_latents] at dim=1 (channel dim), so image_latents must be
+    (B, N*C_pack, seq) — N images channel-stacked at the SAME seq length.
+
+    Fix: when image_latents.shape[-1] is an integer multiple of latents.shape[-1],
+    reshape (B, C, N*seq) → (B, N*C, seq).
+
+    For pipelines that already return the correct shape (same last-dim for both),
+    this is a no-op.  Dim-count mismatch is also fixed as a fallback.
     """
     _orig = pipe.prepare_latents
 
@@ -226,21 +233,30 @@ def _patch_prepare_latents(pipe) -> None:
         result = _orig(*args, **kwargs)
         if isinstance(result, (tuple, list)) and len(result) == 2:
             latents, image_latents = result
-            if (
-                isinstance(latents, torch.Tensor)
-                and isinstance(image_latents, torch.Tensor)
-                and latents.dim() != image_latents.dim()
-            ):
-                # Restore whichever tensor lost its batch dim due to squeeze()
-                if latents.dim() > image_latents.dim():
-                    image_latents = image_latents.unsqueeze(0)
-                else:
-                    latents = latents.unsqueeze(0)
+            if isinstance(latents, torch.Tensor) and isinstance(image_latents, torch.Tensor):
+                if latents.dim() == 3 and image_latents.dim() == 3:
+                    lat_last = latents.shape[-1]
+                    img_last = image_latents.shape[-1]
+                    if img_last > lat_last and img_last % lat_last == 0:
+                        # (B, C_pack, N*seq) → (B, N*C_pack, seq)
+                        n = img_last // lat_last
+                        B, C, _ = image_latents.shape
+                        image_latents = (
+                            image_latents
+                            .view(B, C, n, lat_last)
+                            .permute(0, 2, 1, 3)   # (B, n, C, seq)
+                            .reshape(B, n * C, lat_last)
+                        )
+                elif latents.dim() != image_latents.dim():
+                    if latents.dim() > image_latents.dim():
+                        image_latents = image_latents.unsqueeze(0)
+                    else:
+                        latents = latents.unsqueeze(0)
             return latents, image_latents
         return result
 
     pipe.prepare_latents = _patched
-    print("[patch] prepare_latents: dim-mismatch correction active")
+    print("[patch] prepare_latents: multi-image channel-restack active")
 
 
 def load_pipeline(
