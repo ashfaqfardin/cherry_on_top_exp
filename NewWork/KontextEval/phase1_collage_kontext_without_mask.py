@@ -9,17 +9,6 @@ Differences from phase1_collage_kontext.py
      — no VLM, no annotation.
   3. A rectangle mask is auto-generated from the depth-predicted bbox.
 
-Two-image concept
------------------
-The user originally asked: "can we pass [obj_img, scene] and let the model
-decide placement?"  Here this is realised at two levels:
-
-  • Placement level: a depth model analyses the scene and selects the floor
-    region where the object should go (flat surface, correct perspective).
-  • Diffusion level: FLUX Kontext receives a COLLAGE image as reference —
-    scene with obj_img already pasted at the depth-selected position —
-    so the diffusion model literally sees both images fused into one prior.
-
 Placement strategy (no VLM)
 -----------------------------
   Insert : Depth map of scene → find flat floor region → bbox
@@ -36,12 +25,12 @@ Depth model
 Pipeline
 --------
   Stage A    : Sketch → LoRA FLUX → obj_img
-  Stage DEPTH: Depth Anything estimates scene depth → floor bbox
-  Stage MASK : Threshold obj_img → ref_mask (silhouette)
-  Stage COL  : Paste obj_img at floor bbox → collage_scene
-               (FLUX sees obj + scene together in one reference image)
-  Stage K    : FLUX Kontext(reference=collage_scene, prompt) → result
-  Stage BCG  : BLD latent background conservation
+  Stage DEPTH: Depth Anything estimates scene depth → floor bbox → mask_np
+  Stage K    : Dual K/V injection — clean scene as Kontext reference
+                 • Mask zone tokens   ← obj_img K/V  (appearance)
+                 • Background tokens  ← scene context K/V  (KV-Edit-style preservation)
+               No pixel-space collage. No BLD latent callback.
+  Stage BCG  : Pixel-space restore from result-vs-scene diff mask
   Loop       : result → next scene
 
 Usage
@@ -56,7 +45,9 @@ Key flags
 ----------
   --depth_model   HF model id for depth estimation.
                   Default: depth-anything/Depth-Anything-V2-Small-hf
-  --collage_mode  full | sobel | blend   Default: full
+  --kv_injection  Enable dual K/V processor (recommended; off by default for baseline).
+  --obj_strength  K/V strength for mask zone tokens. Default: 0.5
+  --bg_strength   K/V strength for background tokens (KV-Edit). Default: 0.8
   --guidance      float  Kontext CFG scale. Default 2.5.
 """
 
@@ -536,6 +527,144 @@ class _KVInject:
         self._layer += 1; return out
 
 
+class _DualKVInject:
+    """
+    Dual K/V injection processor for no-collage object insertion.
+
+      • Background tokens (~target_zone): scene context K/V injected at ALL TIER_A steps.
+        Source: reference token slice [r_lo:r_hi] from the live Kontext sequence.
+        This is KV-Edit-style background preservation — position-for-position
+        replacement keeps the background spatially coherent without BLD latent blending.
+
+      • Object zone tokens (target_zone): obj_img K/V injected during early steps only
+        (governed by cutoff_frac). Source: pre-captured via _KVCapture on obj_img.
+
+    No collage, no BLD callback required. Both concerns are handled at attention level.
+    """
+    def __init__(self, n_gen, obj_kv, obj_mask_np, target_zone,
+                 obj_strength, bg_strength, n_steps, cutoff_frac):
+        self.n_gen = n_gen; self.obj_kv = obj_kv; self.obj_mask_np = obj_mask_np
+        self.target_zone = target_zone
+        self.obj_strength = obj_strength; self.bg_strength = bg_strength
+        self.n_steps = n_steps; self.cutoff_frac = cutoff_frac
+        self._layer = 0; self._step = 0
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None):
+        is_double = encoder_hidden_states is not None
+        B = hidden_states.shape[0]
+        q = attn.to_q(hidden_states); k = attn.to_k(hidden_states); v = attn.to_v(hidden_states)
+        hd = k.shape[-1] // attn.heads
+        q = q.view(B,-1,attn.heads,hd).transpose(1,2)
+        k = k.view(B,-1,attn.heads,hd).transpose(1,2)
+        v = v.view(B,-1,attn.heads,hd).transpose(1,2)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+        txt_len = 0
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            ek = attn.add_k_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            ev = attn.add_v_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            txt_len = eq.shape[2]
+            q = torch.cat([eq,q],dim=2); k = torch.cat([ek,k],dim=2); v = torch.cat([ev,v],dim=2)
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q,image_rotary_emb); k = apply_rotary_emb(k,image_rotary_emb)
+        if self._layer in _TIER_A:
+            img_off = txt_len if is_double else _SINGLE_TXT_LEN
+            g_lo, g_hi = img_off,              img_off + self.n_gen
+            r_lo, r_hi = img_off + self.n_gen, img_off + 2 * self.n_gen
+            if k.shape[2] >= r_hi:
+                k_gen = k[:,:,g_lo:g_hi,:].clone(); v_gen = v[:,:,g_lo:g_hi,:].clone()
+                tgt = torch.from_numpy(self.target_zone).to(k.device)
+                # Background: position-for-position scene K/V at every step
+                if self.bg_strength > 0:
+                    k_ref = k[:,:,r_lo:r_hi,:]; v_ref = v[:,:,r_lo:r_hi,:]
+                    bg_t  = (~tgt).view(1,1,-1,1); s_bg = self.bg_strength
+                    k_gen = torch.where(bg_t, (1-s_bg)*k_gen + s_bg*k_ref, k_gen)
+                    v_gen = torch.where(bg_t, (1-s_bg)*v_gen + s_bg*v_ref, v_gen)
+                # Object zone: obj_img K/V during early steps (cutoff_frac gated)
+                lo = int(self.cutoff_frac[0]*self.n_steps)
+                hi = int(self.cutoff_frac[1]*self.n_steps)
+                if lo <= self._step < hi and self._layer in self.obj_kv and self.obj_strength > 0:
+                    k_r, v_r = self.obj_kv[self._layer]
+                    k_r = k_r.to(k.device, k.dtype); v_r = v_r.to(v.device, v.dtype)
+                    obj_idx = torch.from_numpy(np.where(self.obj_mask_np)[0]).to(k.device)
+                    if obj_idx.numel() > 0:
+                        k_obj = k_r[:,:,obj_idx,:].mean(dim=2,keepdim=True).expand_as(k_gen)
+                        v_obj = v_r[:,:,obj_idx,:].mean(dim=2,keepdim=True).expand_as(v_gen)
+                    else:
+                        k_obj = k_r.mean(dim=2,keepdim=True).expand_as(k_gen)
+                        v_obj = v_r.mean(dim=2,keepdim=True).expand_as(v_gen)
+                    tgt_t = tgt.view(1,1,-1,1); s_obj = self.obj_strength
+                    k_gen = torch.where(tgt_t, (1-s_obj)*k_gen + s_obj*k_obj, k_gen)
+                    v_gen = torch.where(tgt_t, (1-s_obj)*v_gen + s_obj*v_obj, v_gen)
+                k = k.clone(); v = v.clone()
+                k[:,:,g_lo:g_hi,:] = k_gen; v[:,:,g_lo:g_hi,:] = v_gen
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1,2).reshape(B,-1,attn.heads*hd).to(q.dtype)
+        if is_double:
+            enc_out = out[:,:encoder_hidden_states.shape[1]]
+            out = out[:,encoder_hidden_states.shape[1]:]
+            out = attn.to_out[1](attn.to_out[0](out)); enc_out = attn.to_add_out(enc_out)
+            self._layer += 1; return out, enc_out
+        self._layer += 1; return out
+
+
+@torch.no_grad()
+def run_with_dual_kv_injection(
+    pipe, scene, prompt, obj_img, obj_mask_np, target_zone,
+    seed, num_steps, guidance, height, width,
+    obj_strength=0.5, bg_strength=0.8, cutoff_frac=(0.0, 0.6),
+) -> Image.Image:
+    """
+    No-collage object insertion via dual K/V injection.
+
+    Clean scene is passed as the Kontext reference (unmodified).
+    Background preservation and object appearance are both handled
+    at the attention level — no pixel-space collage, no BLD latent callback.
+    """
+    vae_sf = getattr(pipe, "vae_scale_factor", 8)
+    n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+    orig_procs   = pipe.transformer.attn_processors
+    # 1-step pass on obj_img to capture K/V at TIER_A layers
+    capture_proc = _KVCapture(n_gen=n_gen)
+    pipe.transformer.set_attn_processor(capture_proc)
+    gen0 = torch.Generator(device=pipe.device).manual_seed(seed)
+    pipe(image=_neutralize_white_bg(obj_img),
+         prompt="photorealistic object, studio lighting",
+         num_inference_steps=1, guidance_scale=1.0,
+         height=height, width=width, max_sequence_length=512,
+         generator=gen0, output_type="latent")
+    obj_kv = dict(capture_proc.kv)
+    print(f"    [KV] Captured at {len(obj_kv)}/{len(_TIER_A)} TIER_A layers")
+    # Main denoising with dual injection — clean scene as Kontext reference
+    inject_proc = _DualKVInject(
+        n_gen=n_gen, obj_kv=obj_kv, obj_mask_np=obj_mask_np,
+        target_zone=target_zone,
+        obj_strength=obj_strength, bg_strength=bg_strength,
+        n_steps=num_steps, cutoff_frac=cutoff_frac,
+    )
+    pipe.transformer.set_attn_processor(inject_proc)
+
+    def _step_cb(pr, si, ts, ck):
+        inject_proc._step = si + 1; inject_proc._layer = 0
+        return ck
+
+    gen1 = torch.Generator(device=pipe.device).manual_seed(seed)
+    result = pipe(
+        image=scene, prompt=prompt,
+        num_inference_steps=num_steps, guidance_scale=guidance,
+        height=height, width=width, max_sequence_length=512,
+        generator=gen1, output_type="pil",
+        callback_on_step_end=_step_cb,
+        callback_on_step_end_tensor_inputs=[],
+    ).images[0]
+    pipe.transformer.set_attn_processor(orig_procs)
+    return result
+
+
 @torch.no_grad()
 def run_with_kv_injection(
     pipe, canvas, prompt, obj_img, obj_mask_np, target_zone,
@@ -846,13 +975,13 @@ def run_collage_chain(
     num_steps:      int,
     lora_guidance:  float,
     scene_guidance: float,
-    collage_mode:   str,
     height:         int,
     width:          int,
     out_dir:        str,
     device:         str,
-    use_kv:         bool  = False,
-    obj_strength:   float = 0.7,
+    use_kv:         bool  = True,
+    obj_strength:   float = 0.5,
+    bg_strength:    float = 0.8,
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
 ) -> List[Image.Image]:
     """
@@ -860,16 +989,16 @@ def run_collage_chain(
 
     Per insert:
       Stage A    : Sketch → LoRA FLUX → obj_img
-      Stage DEPTH: estimate_depth(scene) → find_floor_bbox() → mask_np
-      Stage MASK : obj silhouette from obj_img
-      Stage COL  : paste obj_img at floor bbox → collage_scene   (two-image fusion)
-      Stage K    : FLUX Kontext(collage_scene, prompt) + BLD BCG → result
+      Stage DEPTH: estimate_depth(scene) → find_floor_bbox() → mask_np, target_zone
+      Stage K    : FLUX Kontext(scene, prompt) with _DualKVInject
+                   — no collage, no BLD callback.
+      Stage BCG  : pixel-space restore from result-vs-scene diff mask
 
     Per remove:
       Stage DEPTH: use tracked insertion bbox if available,
                    else detect_object_on_floor(scene depth) → mask_np
-      Stage COL  : Telea inpaint the mask region → removal collage
-      Stage K    : FLUX Kontext(removal_collage, prompt) + BLD BCG → result
+      Stage COL  : Telea inpaint → removal collage
+      Stage K    : FLUX Kontext(removal_collage, prompt) + BLD BCG
 
     Insertion bboxes are tracked in _placed dict so removal can reuse them
     without needing a second detection step.
@@ -927,24 +1056,6 @@ def run_collage_chain(
             with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
                 f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
-            # Stage MASK: object silhouette from obj_img
-            ref_mask = _compute_obj_mask(obj_img)
-            n_px = ref_mask.sum()
-            print(f"  [MASK] Object pixels: {n_px} ({100*n_px/(height*width):.1f}%)")
-            if n_px < 50:
-                print("         Fallback: using centre 50% crop")
-                ref_mask = np.zeros((height, width), dtype=np.uint8)
-                ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
-
-            # Stage COL: paste obj into scene → FLUX sees both images merged
-            print(f"  [COL] Building collage scene (mode={collage_mode}) ...")
-            collage_scene, _ = build_collage_scene(
-                scene=scene, obj_img=obj_img, ref_mask=ref_mask,
-                target_bbox=(bx1, by1, bx2, by2), collage_mode=collage_mode,
-            )
-            collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
-
-            obj_mask_har = _collage_obj_mask(collage_scene, scene)
             blend_p = f"A photorealistic room with a {desc} placed naturally."
 
         else:  # remove
@@ -981,36 +1092,47 @@ def run_collage_chain(
             # Remove from tracking once erased
             _placed.pop(name, None)
 
-        # ── Stage K: Kontext integration + BLD background conservation ───────
+        # ── Stage K: Kontext integration ─────────────────────────────────────
         step_tag = f"{'remove' if action == 'remove' else 'step'}{i+1}_{name}"
-        print(f"  [K] Kontext integration pass  kv={use_kv} ...")
+        print(f"  [K] Kontext integration pass  kv={use_kv}  action={action} ...")
         with open(os.path.join(out_dir, f"prompt_{step_tag}.txt"), "w") as f:
             f.write(blend_p)
 
-        pipe_dtype = next(pipe.transformer.parameters()).dtype
-        bcg_cb = _make_bcg_latent_callback(
-            scene=scene, mask_np=mask_np, pipe=pipe,
-            height=height, width=width, device=device, dtype=pipe_dtype,
-        )
-
-        if use_kv:
-            target_zone = _token_zone_from_mask_np(mask_np, height, width, pipe)
-            if action == "insert":
-                vae_sf = getattr(pipe, "vae_scale_factor", 8)
-                obj_mask_tok = _obj_token_mask(
-                    obj_img,
-                    height // (vae_sf * 2), width // (vae_sf * 2),
-                )
-                next_scene = run_with_kv_injection(
-                    pipe=pipe, canvas=collage_scene, prompt=blend_p,
+        if action == "insert":
+            # Dual K/V: scene context K/V → background tokens (all steps, KV-Edit style)
+            #           obj_img K/V   → mask zone tokens (early steps, cutoff_frac gated)
+            # No pixel-space collage. No BLD latent callback.
+            if use_kv:
+                target_zone  = _token_zone_from_mask_np(mask_np, height, width, pipe)
+                vae_sf       = getattr(pipe, "vae_scale_factor", 8)
+                obj_mask_tok = _obj_token_mask(obj_img,
+                                               height // (vae_sf * 2), width // (vae_sf * 2))
+                next_scene = run_with_dual_kv_injection(
+                    pipe=pipe, scene=scene, prompt=blend_p,
                     obj_img=obj_img, obj_mask_np=obj_mask_tok,
                     target_zone=target_zone,
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
-                    obj_strength=obj_strength, cutoff_frac=cutoff_frac,
-                    bcg_callback=bcg_cb,
+                    obj_strength=obj_strength, bg_strength=bg_strength,
+                    cutoff_frac=cutoff_frac,
                 )
             else:
+                next_scene = run_standard(
+                    pipe=pipe, canvas=scene, prompt=blend_p,
+                    seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                    height=height, width=width,
+                )
+            # Compute changed-pixel mask from result diff (replaces collage diff)
+            obj_mask_har = _collage_obj_mask(next_scene, scene)
+
+        else:  # remove — keep Telea collage + BLD
+            pipe_dtype = next(pipe.transformer.parameters()).dtype
+            bcg_cb = _make_bcg_latent_callback(
+                scene=scene, mask_np=mask_np, pipe=pipe,
+                height=height, width=width, device=device, dtype=pipe_dtype,
+            )
+            if use_kv:
+                target_zone = _token_zone_from_mask_np(mask_np, height, width, pipe)
                 next_scene = run_with_collage_kv_injection(
                     pipe=pipe, canvas=collage_scene, prompt=blend_p,
                     target_zone=target_zone,
@@ -1019,13 +1141,13 @@ def run_collage_chain(
                     obj_strength=obj_strength, cutoff_frac=cutoff_frac,
                     bcg_callback=bcg_cb,
                 )
-        else:
-            next_scene = run_standard(
-                pipe=pipe, canvas=collage_scene, prompt=blend_p,
-                seed=seed, num_steps=num_steps, guidance=scene_guidance,
-                height=height, width=width,
-                bcg_callback=bcg_cb,
-            )
+            else:
+                next_scene = run_standard(
+                    pipe=pipe, canvas=collage_scene, prompt=blend_p,
+                    seed=seed, num_steps=num_steps, guidance=scene_guidance,
+                    height=height, width=width,
+                    bcg_callback=bcg_cb,
+                )
 
         result_path = os.path.join(out_dir, f"result_{step_tag}.png")
         next_scene.save(result_path)
@@ -1053,154 +1175,6 @@ def run_collage_chain(
     return results
 
 
-# ── Two-image chain: let FLUX decide placement ────────────────────────────────
-
-def run_two_image_chain(
-    pipe,
-    base:           Image.Image,
-    edits:          List[dict],
-    sketch_dir:     str,
-    lora_id:        str,
-    seed:           int,
-    num_steps:      int,
-    lora_guidance:  float,
-    scene_guidance: float,
-    height:         int,
-    width:          int,
-    out_dir:        str,
-    device:         str,
-    use_kv:         bool  = False,
-    obj_strength:   float = 0.7,
-    cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
-) -> List[Image.Image]:
-    """
-    Two-image Kontext chain — no depth, no collage, no mask.
-
-    Reference = horizontal composite: scene (left, full res) + obj (right, full res).
-    Scene goes left because the left position dominates FLUX Kontext token ordering.
-    FLUX decides entirely where to place the object.
-
-    With --kv_injection:
-      A 1-step capture pass records K/V from obj_img at TIER_A layers.
-      During composite denoising those K/V are injected into ALL gen tokens
-      (full-field, no zone restriction) so FLUX retains obj appearance wherever
-      it decides to place it.
-
-    Outputs saved as two_image_step{N}_{name}.png for comparison.
-    """
-    results = [base]
-    scene   = base
-
-    for i, edit in enumerate(edits):
-        name   = edit["name"]
-        desc   = edit["description"]
-        action = edit.get("action", "insert")
-
-        print(f"\n{'─'*60}")
-        print(f"  [TWO-IMAGE] Step {i+1}/{len(edits)}  —  {name}  [{action}]")
-        print(f"{'─'*60}")
-
-        generator = torch.Generator(device=pipe.device).manual_seed(seed)
-
-        if action == "insert":
-            # Stage A: sketch → object image
-            sketch_path = os.path.join(sketch_dir, f"{name}.png")
-            if not os.path.isfile(sketch_path):
-                sketch_path = os.path.join(sketch_dir, f"sketch_{name}.png")
-            if not os.path.isfile(sketch_path):
-                raise FileNotFoundError(
-                    f"Sketch not found: expected '{name}.png' or 'sketch_{name}.png' "
-                    f"in {sketch_dir!r}"
-                )
-            print(f"  [A] Generating '{desc}' from sketch ...")
-            obj_img = generate_from_sketch(
-                pipe=pipe, sketch_path=sketch_path, description=desc,
-                seed=seed, num_steps=num_steps, guidance=lora_guidance,
-                height=height, width=width, lora_id=lora_id, device=device,
-            )
-            obj_img.save(os.path.join(out_dir, f"two_image_obj_{name}.png"))
-
-            # Horizontal composite: scene LEFT (dominant), obj RIGHT (reference).
-            # height/width in pipe() set OUTPUT size; reference can be any aspect ratio.
-            # Left position dominates in FLUX Kontext token ordering, so scene goes first.
-            obj_full  = obj_img.resize((width, height), Image.LANCZOS)
-            composite = Image.new("RGB", (width * 2, height))
-            composite.paste(scene,    (0, 0))
-            composite.paste(obj_full, (width, 0))
-            composite.save(os.path.join(out_dir, f"two_image_composite_{name}.png"))
-
-            prompt = (
-                f"The left image shows an empty room scene. "
-                f"The right image shows a {desc} on a white background. "
-                f"Insert the {desc} from the right image naturally into the room. "
-                f"Place it on the floor with correct perspective, lighting, and scale. "
-                f"Add a contact shadow. Output only the complete room scene."
-            )
-
-            if use_kv:
-                # Full-field K/V injection: target_zone = all gen tokens.
-                # No placement mask exists, so we reinforce obj appearance
-                # everywhere and let FLUX decide the location.
-                vae_sf  = getattr(pipe, "vae_scale_factor", 8)
-                h_lat   = height // (vae_sf * 2)
-                w_lat   = width  // (vae_sf * 2)
-                n_gen   = h_lat * w_lat
-                full_zone    = np.ones(n_gen, dtype=bool)
-                obj_mask_tok = _obj_token_mask(obj_img, h_lat, w_lat)
-                print(f"  [K] KV-injection (full-field) + composite reference ...")
-                next_scene = run_with_kv_injection(
-                    pipe=pipe, canvas=composite, prompt=prompt,
-                    obj_img=obj_img, obj_mask_np=obj_mask_tok,
-                    target_zone=full_zone,
-                    seed=seed, num_steps=num_steps, guidance=scene_guidance,
-                    height=height, width=width,
-                    obj_strength=obj_strength, cutoff_frac=cutoff_frac,
-                )
-            else:
-                print(f"  [K] pipe(composite) — model decides placement ...")
-                next_scene = pipe(
-                    prompt=prompt,
-                    image=composite,
-                    num_inference_steps=num_steps,
-                    guidance_scale=scene_guidance,
-                    height=height, width=width,
-                    generator=generator,
-                ).images[0]
-
-        else:  # remove
-            prompt = (
-                f"{BASE_PROMPT} "
-                f"Remove the {desc} completely. "
-                f"Fill the area with seamless wooden floor and white walls. "
-                f"No object, clean empty room."
-            )
-            print(f"  [K] pipe(image=[scene]) — removal via prompt only ...")
-            next_scene = pipe(
-                prompt=prompt,
-                image=scene,
-                num_inference_steps=num_steps,
-                guidance_scale=scene_guidance,
-                height=height, width=width,
-                generator=generator,
-            ).images[0]
-
-        step_tag = f"{'remove' if action == 'remove' else 'step'}{i+1}_{name}"
-        out_path = os.path.join(out_dir, f"two_image_{step_tag}.png")
-        next_scene.save(out_path)
-        print(f"      Saved: {out_path}")
-
-        with open(os.path.join(out_dir, f"prompt_two_image_{step_tag}.txt"), "w") as f:
-            f.write(prompt)
-
-        scene = next_scene
-        results.append(scene)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return results
-
-
 # ── Arguments ─────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -1211,11 +1185,6 @@ def parse_args():
     p.add_argument("--hf_token",      required=True)
     p.add_argument("--cache_dir",     default="./models")
     p.add_argument("--out_dir",       default="results/phase1_collage_nomask")
-    p.add_argument("--mode",          default="collage",
-                   choices=["collage", "two_image"],
-                   help="'collage': depth-guided paste then Kontext (default). "
-                        "'two_image': pass [obj_img, scene] directly to FLUX and "
-                        "observe where the model places the object.")
     p.add_argument("--depth_model",
                    default="depth-anything/Depth-Anything-V2-Small-hf",
                    help="HF model id for monocular depth estimation. "
@@ -1226,10 +1195,12 @@ def parse_args():
     p.add_argument("--lora_id",       default=LORA_ID)
     p.add_argument("--lora_guidance", type=float, default=4.0)
     p.add_argument("--guidance",      type=float, default=2.5)
-    p.add_argument("--collage_mode",  default="full",
-                   choices=["full", "sobel", "blend"])
-    p.add_argument("--kv_injection",  action="store_true")
-    p.add_argument("--obj_strength",  type=float, default=0.7)
+    p.add_argument("--kv_injection",  action="store_true",
+                   help="Use dual K/V injection for insertion (default: off for baseline test).")
+    p.add_argument("--obj_strength",  type=float, default=0.5,
+                   help="K/V injection strength for object zone tokens. Default: 0.5")
+    p.add_argument("--bg_strength",   type=float, default=0.8,
+                   help="K/V injection strength for background tokens (KV-Edit). Default: 0.8")
     p.add_argument("--cutoff_frac",   default="0.0,0.6")
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--num_steps",     type=int,   default=28)
@@ -1251,30 +1222,22 @@ def main():
             edits = json.load(f)
 
     print(f"\n{_SEP}")
-    print(f"  phase1_collage_kontext_without_mask  —  mode={args.mode}")
+    print(f"  phase1_collage_kontext_without_mask")
     print(f"{_SEP}")
     print(f"  Objects      : {[e['name'] for e in edits]}")
     print(f"  Sketch dir   : {args.sketch_dir}")
-    print(f"  Mode         : {args.mode}")
-    if args.mode == "collage":
-        print(f"  Depth model  : {args.depth_model}")
-        print(f"  Collage mode : {args.collage_mode}")
-        print(f"  KV injection : {args.kv_injection}"
-              + (f"  strength={args.obj_strength}  cutoff={args.cutoff_frac}"
-                 if args.kv_injection else ""))
+    print(f"  Depth model  : {args.depth_model}")
+    print(f"  KV injection : {args.kv_injection}"
+          + (f"  obj={args.obj_strength}  bg={args.bg_strength}  cutoff={args.cutoff_frac}"
+             if args.kv_injection else ""))
     print(f"  Guidance     : {args.guidance}")
     print(f"  Output       : {args.out_dir}")
     print(f"{_SEP}\n")
 
-    # Depth model only needed for collage mode
-    if args.mode == "collage":
-        print("Loading depth model ...")
-        depth_model, depth_processor, _ = load_depth_model(
-            model_id=args.depth_model, cache_dir=args.cache_dir,
-        )
-    else:
-        depth_model = depth_processor = None
-        print("[two_image mode] Skipping depth model — FLUX decides placement.")
+    print("Loading depth model ...")
+    depth_model, depth_processor, _ = load_depth_model(
+        model_id=args.depth_model, cache_dir=args.cache_dir,
+    )
 
     print("\nLoading FLUX.1-Kontext-dev ...")
     pipe = load_kontext_pipeline(
@@ -1294,34 +1257,20 @@ def main():
     _cf = [float(x) for x in args.cutoff_frac.split(",")]
     cutoff_frac: Tuple[float, float] = (_cf[0], _cf[1])
 
-    if args.mode == "two_image":
-        results = run_two_image_chain(
-            pipe=pipe, base=base, edits=edits,
-            sketch_dir=args.sketch_dir, lora_id=args.lora_id,
-            seed=args.seed, num_steps=args.num_steps,
-            lora_guidance=args.lora_guidance,
-            scene_guidance=args.guidance,
-            height=args.height, width=args.width,
-            out_dir=args.out_dir, device=args.device,
-            use_kv=args.kv_injection,
-            obj_strength=args.obj_strength,
-            cutoff_frac=cutoff_frac,
-        )
-    else:
-        results = run_collage_chain(
-            pipe=pipe, base=base, edits=edits,
-            sketch_dir=args.sketch_dir, lora_id=args.lora_id,
-            depth_model=depth_model, depth_processor=depth_processor,
-            seed=args.seed, num_steps=args.num_steps,
-            lora_guidance=args.lora_guidance,
-            scene_guidance=args.guidance,
-            collage_mode=args.collage_mode,
-            height=args.height, width=args.width,
-            out_dir=args.out_dir, device=args.device,
-            use_kv=args.kv_injection,
-            obj_strength=args.obj_strength,
-            cutoff_frac=cutoff_frac,
-        )
+    results = run_collage_chain(
+        pipe=pipe, base=base, edits=edits,
+        sketch_dir=args.sketch_dir, lora_id=args.lora_id,
+        depth_model=depth_model, depth_processor=depth_processor,
+        seed=args.seed, num_steps=args.num_steps,
+        lora_guidance=args.lora_guidance,
+        scene_guidance=args.guidance,
+        height=args.height, width=args.width,
+        out_dir=args.out_dir, device=args.device,
+        use_kv=args.kv_injection,
+        obj_strength=args.obj_strength,
+        bg_strength=args.bg_strength,
+        cutoff_frac=cutoff_frac,
+    )
 
     all_imgs = results
     all_lbls = ["base"] + [f"{e['name']} ({e.get('action','insert')})" for e in edits]
