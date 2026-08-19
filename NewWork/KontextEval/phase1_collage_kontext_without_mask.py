@@ -55,8 +55,11 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -91,6 +94,86 @@ def load_kontext_pipeline(
         pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
     return pipe
+
+
+def load_vlm(model_id: str, cache_dir: str, device: str = "cpu"):
+    """
+    Load a vision-language model for placement anchor prediction.
+
+    device='cpu'  — bfloat16 on CPU. Safe alongside FLUX on any GPU.
+    device='cuda' — tries 4-bit NF4 (bitsandbytes) first, falls back to bf16.
+    """
+    from transformers import AutoProcessor
+
+    print(f"  Loading VLM '{model_id}' on {device} ...")
+
+    def _try_load(load_kwargs, to_device):
+        is_q25 = "Qwen2.5" in model_id or "Qwen2_5" in model_id
+        classes = []
+        if is_q25:
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                classes.append(Qwen2_5_VLForConditionalGeneration)
+            except ImportError:
+                pass
+        try:
+            from transformers import Qwen2VLForConditionalGeneration
+            classes.append(Qwen2VLForConditionalGeneration)
+        except ImportError:
+            pass
+        if not is_q25:
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                classes.append(Qwen2_5_VLForConditionalGeneration)
+            except ImportError:
+                pass
+        last_err = None
+        for cls in classes:
+            try:
+                m = cls.from_pretrained(model_id, **load_kwargs)
+                return (m.to(device) if to_device else m).eval()
+            except Exception as e:
+                last_err = e
+        try:
+            from transformers import AutoModel
+            m = AutoModel.from_pretrained(model_id, trust_remote_code=True, **load_kwargs)
+            return (m.to(device) if to_device else m).eval()
+        except Exception as e:
+            last_err = e
+        raise RuntimeError(f"Could not load VLM '{model_id}'. Last error: {last_err}")
+
+    model = None
+    if device == "cuda":
+        try:
+            from transformers import BitsAndBytesConfig
+            quant = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
+            )
+            model = _try_load(
+                dict(quantization_config=quant, device_map="auto", cache_dir=cache_dir),
+                to_device=False,
+            )
+            print("  VLM loaded (4-bit NF4 GPU)")
+        except Exception as e:
+            print(f"    [VLM] 4-bit load failed ({e!s:.80}) — falling back to bf16")
+        if model is None:
+            model = _try_load(
+                dict(torch_dtype=torch.bfloat16, device_map="auto", cache_dir=cache_dir),
+                to_device=False,
+            )
+            print("  VLM loaded (bf16 GPU)")
+    else:
+        model = _try_load(
+            dict(torch_dtype=torch.bfloat16, cache_dir=cache_dir),
+            to_device=True,
+        )
+        print("  VLM loaded (bf16 CPU)")
+
+    processor = AutoProcessor.from_pretrained(
+        model_id, cache_dir=cache_dir, trust_remote_code=True,
+    )
+    return model, processor
 
 
 # ── Kontext inference ─────────────────────────────────────────────────────────
@@ -524,29 +607,110 @@ class _HeatmapCapture:
         self._layer += 1; return out
 
 
+def _vlm_predict_placement(
+    vlm_model, vlm_processor,
+    scene: Image.Image, description: str,
+) -> Optional[str]:
+    """
+    Ask the VLM where the object naturally belongs in this scene.
+    Returns a short placement phrase like 'on the kitchen counter' or
+    'on the grass', ready to be appended to the heatmap prompt.
+    Returns None if the VLM output cannot be parsed.
+    """
+    device = next(vlm_model.parameters()).device
+
+    w, h = scene.size
+    if max(w, h) > 768:
+        s = 768 / max(w, h)
+        scene_q = scene.resize((int(w * s), int(h * s)), Image.LANCZOS).convert("RGB")
+    else:
+        scene_q = scene.convert("RGB")
+
+    query = (
+        f"Where in this scene would a {description} naturally be placed? "
+        f"Reply with ONLY a short phrase (2-6 words) starting with 'on', 'against', or 'near'. "
+        f"Examples: 'on the floor', 'on the wooden table', 'against the brick wall', "
+        f"'on the stone path', 'on the kitchen counter'. "
+        f"Give ONLY the phrase — no explanation, no punctuation."
+    )
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image", "image": scene_q},
+            {"type": "text",  "text": query},
+        ],
+    }]
+
+    try:
+        text   = vlm_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = vlm_processor(
+            text=[text], images=[scene_q], padding=True, return_tensors="pt"
+        ).to(device)
+        with torch.no_grad():
+            out_ids = vlm_model.generate(**inputs, max_new_tokens=24, do_sample=False)
+        answer = vlm_processor.decode(
+            out_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
+        ).strip().lower().rstrip(".,!?")
+
+        print(f"    [VLM PLACE] '{answer}'")
+
+        # Accept if it already starts with a valid spatial preposition
+        for prefix in ("on ", "against ", "near ", "beside ", "under ", "above "):
+            if answer.startswith(prefix):
+                # Trim to at most 6 words so we don't append an essay
+                return " ".join(answer.split()[:6])
+
+        # VLM gave a full sentence — try to extract the first valid sub-phrase
+        for marker in ("on the", "on a", "against the", "near the", "beside the",
+                       "under the", "above the"):
+            idx = answer.find(marker)
+            if idx >= 0:
+                fragment = " ".join(answer[idx:].split()[:6]).rstrip(".,!?")
+                print(f"    [VLM PLACE] Extracted: '{fragment}'")
+                return fragment
+
+        print(f"    [VLM PLACE] Unparseable ('{answer}') — no anchor used")
+        return None
+    except Exception as e:
+        print(f"    [VLM PLACE] Error: {e} — no anchor used")
+        return None
+
+
 @torch.no_grad()
 def run_heatmap_pass(
-    pipe, scene: Image.Image, description: str,
+    pipe, scene: Image.Image, prompt: str, description: str,
     seed: int, height: int, width: int,
     n_steps: int = 6,
     occupied_mask: Optional[np.ndarray] = None,
+    anchor: Optional[str] = None,
 ) -> np.ndarray:
     """
     Short n_steps Kontext forward pass → DAAM attention heatmap.
 
-    Uses a floor-biased internal prompt so attention anchors to the floor
-    rather than walls or ceiling.  Averages heatmaps for ALL content-word
-    tokens in description.  Returns (h_lat, w_lat) float32 in [0, 1].
+    prompt     : the generation prompt (blend_p).
+    description: full object description for content-word token discovery.
+    anchor     : optional placement phrase from VLM (e.g. 'on the kitchen
+                 counter').  Appended to prompt for the heatmap pass so the
+                 T5 contextual encoding of the object tokens is spatially
+                 biased toward the predicted surface.  When None the prompt
+                 is used as-is — the multi-token description averaging
+                 provides the spatial signal.
+    Returns (h_lat, w_lat) float32 in [0, 1].
     """
     vae_sf = getattr(pipe, "vae_scale_factor", 8)
     n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
     h_lat  = height // (vae_sf * 2)
     w_lat  = width  // (vae_sf * 2)
 
-    # Floor-biased prompt gives stronger floor-region attention signal
-    hm_prompt = (f"A photorealistic room with {description} "
-                 f"resting on the wooden floor.")
-    orig_procs       = pipe.transformer.attn_processors
+    if anchor:
+        hm_prompt = prompt.rstrip(".! ") + f", {anchor}."
+        print(f"    [HEATMAP] Anchor: '{anchor}'")
+    else:
+        hm_prompt = prompt
+        print(f"    [HEATMAP] No anchor — using description tokens only")
+    orig_procs        = pipe.transformer.attn_processors
     obj_token_indices = _find_desc_token_indices(pipe, hm_prompt, description)
 
     cap = _HeatmapCapture(n_gen=n_gen, obj_token_indices=obj_token_indices)
@@ -1217,6 +1381,8 @@ def run_collage_chain(
     bg_strength:    float = 0.8,
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
     heatmap_steps:  int   = 6,
+    vlm_model                          = None,
+    vlm_processor                      = None,
 ) -> List[Image.Image]:
     """
     Mask-free incremental object insertion / removal.
@@ -1281,12 +1447,20 @@ def run_collage_chain(
 
             blend_p = f"A photorealistic room with a {desc} placed naturally."
 
-            # Heatmap-guided placement (DAAM) — no depth model needed for insert
+            # VLM predicts scene-aware placement anchor (e.g. 'on the kitchen counter')
+            placement_anchor: Optional[str] = None
+            if vlm_model is not None:
+                print(f"  [VLM] Predicting placement for '{desc}' ...")
+                placement_anchor = _vlm_predict_placement(
+                    vlm_model, vlm_processor, scene, desc
+                )
+
+            # Heatmap-guided placement (DAAM)
             print(f"  [PLACE] Attention heatmap for '{desc}' ...")
             heatmap = run_heatmap_pass(
-                pipe=pipe, scene=scene, description=desc,
+                pipe=pipe, scene=scene, prompt=blend_p, description=desc,
                 seed=seed, height=height, width=width, n_steps=heatmap_steps,
-                occupied_mask=occupied_mask,
+                occupied_mask=occupied_mask, anchor=placement_anchor,
             )
             hm_vis = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
             Image.fromarray(cv2.cvtColor(hm_vis, cv2.COLOR_BGR2RGB)).save(
@@ -1310,6 +1484,23 @@ def run_collage_chain(
             ).astype(np.uint8)
             with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
                 f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
+
+            # Stage MASK: obj silhouette to crop the paste region
+            ref_mask = _compute_obj_mask(obj_img)
+            if ref_mask.sum() < 50:
+                print("         Fallback: centre-crop silhouette")
+                ref_mask = np.zeros((height, width), dtype=np.uint8)
+                ref_mask[height//4:3*height//4, width//4:3*width//4] = 1
+
+            # Stage COL: paste obj at heatmap-guided bbox → Kontext reference
+            print(f"  [COL] Building collage (heatmap-guided) ...")
+            collage_scene, _ = build_collage_scene(
+                scene=scene, obj_img=obj_img, ref_mask=ref_mask,
+                target_bbox=(bx1, by1, bx2, by2), collage_mode="full",
+            )
+            collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
+            # Collage diff gives obj mask BEFORE generation — more accurate than result diff
+            obj_mask_har = _collage_obj_mask(collage_scene, scene)
 
         else:  # remove
             # Use tracked insertion bbox if available (most reliable)
@@ -1352,31 +1543,28 @@ def run_collage_chain(
             f.write(blend_p)
 
         if action == "insert":
-            # Dual K/V: scene context K/V → background tokens (all steps, KV-Edit style)
-            #           obj_img K/V   → mask zone tokens (early steps, cutoff_frac gated)
-            # No pixel-space collage. No BLD latent callback.
+            # Heatmap-guided collage + _CollageKVInject:
+            # The collage shows the object in context (WHERE it goes, at the right scale).
+            # _CollageKVInject reads K/V from the collage reference tokens and injects
+            # into the target zone, so the model refines the paste (lighting, perspective,
+            # blending) rather than inventing placement from scratch.
+            # Background tokens naturally attend to the collage reference which matches
+            # the scene outside the paste — no BLD callback needed.
             if use_kv:
-                target_zone  = _token_zone_from_mask_np(mask_np, height, width, pipe)
-                vae_sf       = getattr(pipe, "vae_scale_factor", 8)
-                obj_mask_tok = _obj_token_mask(obj_img,
-                                               height // (vae_sf * 2), width // (vae_sf * 2))
-                next_scene = run_with_dual_kv_injection(
-                    pipe=pipe, scene=scene, prompt=blend_p,
-                    obj_img=obj_img, obj_mask_np=obj_mask_tok,
+                target_zone = _token_zone_from_mask_np(mask_np, height, width, pipe)
+                next_scene  = run_with_collage_kv_injection(
+                    pipe=pipe, canvas=collage_scene, prompt=blend_p,
                     target_zone=target_zone,
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
-                    obj_strength=obj_strength, bg_strength=bg_strength,
-                    cutoff_frac=cutoff_frac,
+                    obj_strength=obj_strength, cutoff_frac=cutoff_frac,
                 )
             else:
                 next_scene = run_standard(
-                    pipe=pipe, canvas=scene, prompt=blend_p,
+                    pipe=pipe, canvas=collage_scene, prompt=blend_p,
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
                 )
-            # Compute changed-pixel mask from result diff (replaces collage diff)
-            obj_mask_har = _collage_obj_mask(next_scene, scene)
 
         else:  # remove — keep Telea collage + BLD
             pipe_dtype = next(pipe.transformer.parameters()).dtype
@@ -1462,6 +1650,13 @@ def parse_args():
     p.add_argument("--height",        type=int,   default=1024)
     p.add_argument("--width",         type=int,   default=1024)
     p.add_argument("--device",        default="cuda")
+    p.add_argument("--vlm_model",     default=None,
+                   help="HF model id for VLM-based placement prediction. "
+                        "Optional — if omitted, description tokens alone guide the heatmap. "
+                        "Tested: Qwen/Qwen2-VL-2B-Instruct (CPU, ~4 GB RAM), "
+                        "Qwen/Qwen2-VL-7B-Instruct (GPU, better reasoning).")
+    p.add_argument("--vlm_device",    default="cpu",
+                   help="Device for VLM inference. Default: cpu (runs alongside FLUX on GPU).")
     return p.parse_args()
 
 
@@ -1482,6 +1677,7 @@ def main():
     print(f"  Objects      : {[e['name'] for e in edits]}")
     print(f"  Sketch dir   : {args.sketch_dir}")
     print(f"  Depth model  : {args.depth_model}")
+    print(f"  VLM model    : {args.vlm_model or 'none (description tokens only)'}")
     print(f"  KV injection : {args.kv_injection}"
           + (f"  obj={args.obj_strength}  bg={args.bg_strength}  cutoff={args.cutoff_frac}"
              if args.kv_injection else ""))
@@ -1493,6 +1689,12 @@ def main():
     depth_model, depth_processor, _ = load_depth_model(
         model_id=args.depth_model, cache_dir=args.cache_dir,
     )
+
+    vlm_model = vlm_processor = None
+    if args.vlm_model:
+        vlm_model, vlm_processor = load_vlm(
+            args.vlm_model, cache_dir=args.cache_dir, device=args.vlm_device,
+        )
 
     print("\nLoading FLUX.1-Kontext-dev ...")
     pipe = load_kontext_pipeline(
@@ -1526,6 +1728,8 @@ def main():
         bg_strength=args.bg_strength,
         cutoff_frac=cutoff_frac,
         heatmap_steps=args.heatmap_steps,
+        vlm_model=vlm_model,
+        vlm_processor=vlm_processor,
     )
 
     all_imgs = results
