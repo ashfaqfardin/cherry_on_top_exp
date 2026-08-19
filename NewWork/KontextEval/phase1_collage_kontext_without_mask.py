@@ -1543,13 +1543,15 @@ def run_collage_chain(
             f.write(blend_p)
 
         if action == "insert":
-            # Heatmap-guided collage + _CollageKVInject:
-            # The collage shows the object in context (WHERE it goes, at the right scale).
-            # _CollageKVInject reads K/V from the collage reference tokens and injects
-            # into the target zone, so the model refines the paste (lighting, perspective,
-            # blending) rather than inventing placement from scratch.
-            # Background tokens naturally attend to the collage reference which matches
-            # the scene outside the paste — no BLD callback needed.
+            # BLD callback: at every denoising step, pixels OUTSIDE the placement
+            # mask are overwritten with the original scene latents (noised to the
+            # current timestep).  This guarantees pixel-perfect background
+            # preservation by construction — no separate pixel-space BCG restore needed.
+            pipe_dtype = next(pipe.transformer.parameters()).dtype
+            bcg_cb = _make_bcg_latent_callback(
+                scene=scene, mask_np=mask_np, pipe=pipe,
+                height=height, width=width, device=device, dtype=pipe_dtype,
+            )
             if use_kv:
                 target_zone = _token_zone_from_mask_np(mask_np, height, width, pipe)
                 next_scene  = run_with_collage_kv_injection(
@@ -1558,12 +1560,14 @@ def run_collage_chain(
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
                     obj_strength=obj_strength, cutoff_frac=cutoff_frac,
+                    bcg_callback=bcg_cb,
                 )
             else:
                 next_scene = run_standard(
                     pipe=pipe, canvas=collage_scene, prompt=blend_p,
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
+                    bcg_callback=bcg_cb,
                 )
 
         else:  # remove — keep Telea collage + BLD
@@ -1594,18 +1598,23 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
-        # ── Stage BCG: pixel-space background restoration ────────────────────
-        print(f"  [BCG] Background restore ...")
-        bcg_mask = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=3)
-        bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (41, 41), 15)
-        result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
-        scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
-        m3        = bcg_mask[:, :, None]
-        bcg_np    = np.clip(result_np * m3 + scene_np * (1.0 - m3), 0, 255).astype(np.uint8)
-        next_scene = Image.fromarray(bcg_np)
-        bcg_path   = os.path.join(out_dir, f"result_bcg_{step_tag}.png")
-        next_scene.save(bcg_path)
-        print(f"      Saved: {bcg_path}")
+        # ── Stage BCG: pixel-space background restoration (removal only) ────────
+        # Insertion: BLD callback already preserved the background during denoising
+        #            — no pixel-space restore needed.
+        # Removal  : BLD runs inside the mask region; pixel-space restore cleans up
+        #            any boundary bleed from the Telea inpaint collage.
+        if action == "remove":
+            print(f"  [BCG] Background restore (removal) ...")
+            bcg_mask = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=3)
+            bcg_mask = cv2.GaussianBlur(bcg_mask.astype(np.float32), (41, 41), 15)
+            result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
+            scene_np  = np.array(scene.convert("RGB"),      dtype=np.float32)
+            m3        = bcg_mask[:, :, None]
+            bcg_np    = np.clip(result_np * m3 + scene_np * (1.0 - m3), 0, 255).astype(np.uint8)
+            next_scene = Image.fromarray(bcg_np)
+            bcg_path   = os.path.join(out_dir, f"result_bcg_{step_tag}.png")
+            next_scene.save(bcg_path)
+            print(f"      Saved: {bcg_path}")
 
         scene = next_scene
         results.append(scene)
