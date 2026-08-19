@@ -422,47 +422,53 @@ def _token_zone_from_mask_np(
 
 # ── DAAM attention heatmap — automatic placement mask ────────────────────────
 
-def _find_obj_token_idx(pipe, prompt: str, obj_word: str) -> int:
+_HEATMAP_STOP = {"a", "an", "the", "with", "on", "in", "of", "and", "or",
+                 "no", "not", "very", "some", "this", "that", "is", "are",
+                 "for", "to", "at", "its", "into", "from"}
+
+
+def _find_desc_token_indices(pipe, prompt: str, description: str) -> List[int]:
     """
-    Return the T5 token index of obj_word inside prompt.
-    Tries exact and substring matches; falls back to 0.
+    Return T5 token indices for every content word in description.
+    Averaging heatmaps across multiple tokens (e.g. 'yellow', 'rubber', 'ball')
+    gives a much stronger and more specific placement signal than a single word.
     """
-    tokenizer = pipe.tokenizer_2          # T5 SentencePiece
-    ids = tokenizer.encode(prompt, add_special_tokens=False)
-    obj_lower = obj_word.lower().strip()
+    tokenizer   = pipe.tokenizer_2          # T5 SentencePiece
+    ids         = tokenizer.encode(prompt, add_special_tokens=False)
+    content     = [w.lower().strip(".,!?") for w in description.split()
+                   if w.lower().strip(".,!?") not in _HEATMAP_STOP and len(w) >= 3]
+
+    found: List[int] = []
     for i, tid in enumerate(ids):
         tok = tokenizer.decode([tid]).strip().lower()
-        if tok == obj_lower or (len(tok) >= 3 and tok in obj_lower) or (len(obj_lower) >= 3 and obj_lower in tok):
-            print(f"    [HEATMAP] '{obj_word}' → token '{tok}' at idx {i}")
-            return i
-    # Sliding-window fallback for multi-subword words
-    decoded = [tokenizer.decode([tid]).strip().lower() for tid in ids]
-    buf = ""
-    for i, tok in enumerate(decoded):
-        buf = (buf + tok)[-len(obj_lower) - 4:]
-        if obj_lower in buf:
-            print(f"    [HEATMAP] '{obj_word}' matched via window at idx {i}")
-            return i
-    print(f"    [HEATMAP] '{obj_word}' not found in T5 tokens — using idx 0")
-    return 0
+        for word in content:
+            if (tok == word
+                    or (len(tok) >= 3 and tok in word)
+                    or (len(word) >= 3 and word in tok)):
+                if i not in found:
+                    found.append(i)
+                break
+
+    if not found:
+        print(f"    [HEATMAP] No content tokens for '{description}' — using idx 0")
+        return [0]
+    print(f"    [HEATMAP] Content-word tokens for '{description}': indices {found[:10]}")
+    return found
 
 
 class _HeatmapCapture:
     """
     DAAM-style attention heatmap capture.
 
-    At each TIER_A double-stream layer computes the RAW dot-product
-    Q_gen · K_obj_token  (no softmax, no full attention matrix)
-    and accumulates the per-gen-token score.
-
-    Result: heatmap[i] = ∑_{l,s} Q_gen[i] · K_text[obj_token] / √d
-    Reshape to (h_lat, w_lat) → normalise → placement heatmap.
+    Computes raw Q_gen · K_text[obj_indices] / √d at each TIER_A double-stream
+    layer and accumulates the per-gen-token score.  Averaging over multiple
+    description content tokens (e.g. 'yellow', 'rubber', 'ball') is far more
+    robust than a single ambiguous word.
     """
-    def __init__(self, n_gen: int, obj_token_idx: int):
-        self.n_gen = n_gen
-        self.obj_token_idx = obj_token_idx
-        self._layer = 0
-        self._step  = 0
+    def __init__(self, n_gen: int, obj_token_indices: List[int]):
+        self.n_gen             = n_gen
+        self.obj_token_indices = obj_token_indices
+        self._layer = 0; self._step = 0
         self.heatmap: Optional[np.ndarray] = None
         self._count  = 0
 
@@ -488,20 +494,26 @@ class _HeatmapCapture:
             q = torch.cat([eq,q],dim=2); k = torch.cat([ek,k],dim=2); v = torch.cat([ev,v],dim=2)
         if image_rotary_emb is not None:
             q = apply_rotary_emb(q,image_rotary_emb); k = apply_rotary_emb(k,image_rotary_emb)
-        # DAAM: raw Q_gen · K_obj (cheap — no full attention matrix)
+        # Average raw Q_gen · K_text across all content-word token keys
         if is_double and self._layer in _TIER_A:
             g_lo = txt_len; g_hi = txt_len + self.n_gen
-            obj_idx = self.obj_token_idx
-            if obj_idx < txt_len and q.shape[2] >= g_hi:
+            if q.shape[2] >= g_hi:
                 scale = hd ** -0.5
-                # (B, H, n_gen) raw dot-product with the object text token key
-                score = (q[:,:,g_lo:g_hi,:] @
-                         k[:,:,obj_idx:obj_idx+1,:].transpose(-1,-2)).squeeze(-1) * scale
-                score_np = score.float().mean(dim=(0,1)).detach().cpu().numpy()
-                if self.heatmap is None:
-                    self.heatmap = np.zeros(self.n_gen, dtype=np.float32)
-                self.heatmap += score_np
-                self._count  += 1
+                q_gen = q[:,:,g_lo:g_hi,:]          # (B, H, n_gen, hd)
+                acc   = None
+                n_hit = 0
+                for obj_idx in self.obj_token_indices:
+                    if obj_idx < txt_len:
+                        score = (q_gen @ k[:,:,obj_idx:obj_idx+1,:].transpose(-1,-2)
+                                 ).squeeze(-1) * scale  # (B, H, n_gen)
+                        s_np  = score.float().mean(dim=(0,1)).detach().cpu().numpy()
+                        acc   = s_np if acc is None else acc + s_np
+                        n_hit += 1
+                if acc is not None and n_hit > 0:
+                    if self.heatmap is None:
+                        self.heatmap = np.zeros(self.n_gen, dtype=np.float32)
+                    self.heatmap += acc / n_hit
+                    self._count  += 1
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         out = out.transpose(1,2).reshape(B,-1,attn.heads*hd).to(q.dtype)
         if is_double:
@@ -514,24 +526,30 @@ class _HeatmapCapture:
 
 @torch.no_grad()
 def run_heatmap_pass(
-    pipe, scene: Image.Image, prompt: str, obj_word: str,
-    seed: int, height: int, width: int, n_steps: int = 6,
+    pipe, scene: Image.Image, description: str,
+    seed: int, height: int, width: int,
+    n_steps: int = 6,
+    occupied_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Short n_steps forward pass → DAAM attention heatmap.
+    Short n_steps Kontext forward pass → DAAM attention heatmap.
 
-    Returns a (h_lat, w_lat) float32 array in [0, 1] where bright = likely
-    placement region for obj_word as determined by the model's own attention.
+    Uses a floor-biased internal prompt so attention anchors to the floor
+    rather than walls or ceiling.  Averages heatmaps for ALL content-word
+    tokens in description.  Returns (h_lat, w_lat) float32 in [0, 1].
     """
     vae_sf = getattr(pipe, "vae_scale_factor", 8)
     n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
     h_lat  = height // (vae_sf * 2)
     w_lat  = width  // (vae_sf * 2)
 
-    orig_procs    = pipe.transformer.attn_processors
-    obj_token_idx = _find_obj_token_idx(pipe, prompt, obj_word)
+    # Floor-biased prompt gives stronger floor-region attention signal
+    hm_prompt = (f"A photorealistic room with {description} "
+                 f"resting on the wooden floor.")
+    orig_procs       = pipe.transformer.attn_processors
+    obj_token_indices = _find_desc_token_indices(pipe, hm_prompt, description)
 
-    cap = _HeatmapCapture(n_gen=n_gen, obj_token_idx=obj_token_idx)
+    cap = _HeatmapCapture(n_gen=n_gen, obj_token_indices=obj_token_indices)
     pipe.transformer.set_attn_processor(cap)
 
     def _step_cb(pr, si, ts, ck):
@@ -539,7 +557,7 @@ def run_heatmap_pass(
         return ck
 
     gen = torch.Generator(device=pipe.device).manual_seed(seed)
-    pipe(image=scene, prompt=prompt,
+    pipe(image=scene, prompt=hm_prompt,
          num_inference_steps=n_steps, guidance_scale=2.5,
          height=height, width=width, max_sequence_length=512,
          generator=gen, output_type="latent",
@@ -552,12 +570,20 @@ def run_heatmap_pass(
         return np.ones((h_lat, w_lat), dtype=np.float32)
 
     hm = (cap.heatmap / cap._count).reshape(h_lat, w_lat)
+
+    # Suppress already-occupied regions so successive objects don't overlap
+    if occupied_mask is not None:
+        occ = cv2.resize((occupied_mask > 127).astype(np.uint8),
+                         (w_lat, h_lat), interpolation=cv2.INTER_NEAREST)
+        occ = cv2.dilate(occ, np.ones((5, 5), np.uint8), iterations=2)
+        hm  = hm * (1.0 - occ.astype(np.float32))
+
     lo, hi = hm.min(), hm.max()
     if hi - lo > 1e-6:
         hm = (hm - lo) / (hi - lo)
-    print(f"    [HEATMAP] Captured {cap._count} maps  peak at "
-          f"({int(np.unravel_index(hm.argmax(), hm.shape)[1])}, "
-          f"{int(np.unravel_index(hm.argmax(), hm.shape)[0])})")
+    peak = np.unravel_index(hm.argmax(), hm.shape)
+    print(f"    [HEATMAP] {cap._count} maps, {len(obj_token_indices)} tokens  "
+          f"peak=({peak[1]},{peak[0]})")
     return hm.astype(np.float32)
 
 
@@ -574,42 +600,56 @@ def heatmap_to_mask(
     """
     (h_lat, w_lat) float heatmap → uint8 pixel mask (H, W).
 
-    1. Gaussian blur to suppress noise.
-    2. Threshold at `percentile` → binary latent-resolution mask.
-    3. Keep largest connected component (the main placement zone).
-    4. Clamp size: if too small fall back to bright-peak neighbourhood;
-       if too large re-threshold at a higher percentile.
-    5. Upsample to (H, W) pixel resolution.
+    1. Gaussian blur.
+    2. Threshold at percentile → binary latent-res mask.
+    3. Keep largest connected component.
+    4. Size clamp (min/max fraction).
+    5. Fit minimum-area rotated rectangle (cv2.minAreaRect) → tight
+       four-point placement zone that follows floor perspective.
+    6. Upsample to (H, W).
     """
+    h_lat, w_lat = heatmap.shape
     blurred = cv2.GaussianBlur(heatmap, (blur_ksize, blur_ksize), blur_sigma)
     binary  = (blurred >= np.percentile(blurred, percentile)).astype(np.uint8)
-    binary  = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
-    binary  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  np.ones((2,2), np.uint8))
+    binary  = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    binary  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  np.ones((2, 2), np.uint8))
 
-    # Keep largest connected component
+    # Largest connected component
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
     if n_labels > 1:
         largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         binary  = (labels == largest).astype(np.uint8)
 
     frac = binary.mean()
-    h_lat, w_lat = heatmap.shape
     if frac < min_frac:
-        # Fall back to small region around the peak
         cy, cx = np.unravel_index(blurred.argmax(), blurred.shape)
         r = max(3, int(min(h_lat, w_lat) * 0.15))
         binary = np.zeros_like(binary)
         binary[max(0,cy-r):min(h_lat,cy+r), max(0,cx-r):min(w_lat,cx+r)] = 1
-        print(f"    [HEATMAP] Mask too small ({frac*100:.1f}%) — using peak neighbourhood")
+        print(f"    [HEATMAP] Mask too small ({frac*100:.1f}%) — peak neighbourhood")
     elif frac > max_frac:
-        p2 = percentile + (100 - percentile) * 0.5
+        p2     = percentile + (100 - percentile) * 0.5
         binary = (blurred >= np.percentile(blurred, p2)).astype(np.uint8)
-        print(f"    [HEATMAP] Mask too large ({frac*100:.1f}%) — re-thresholding at p={p2:.0f}")
+        print(f"    [HEATMAP] Mask too large ({frac*100:.1f}%) — re-threshold p={p2:.0f}")
+
+    # Fit minimum-area rotated rectangle → tight four-corner placement zone
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        all_pts = np.vstack(contours)
+        if len(all_pts) >= 4:
+            rect    = cv2.minAreaRect(all_pts)
+            box     = cv2.boxPoints(rect).astype(np.int32)
+            filled  = np.zeros_like(binary)
+            cv2.fillPoly(filled, [box], 1)
+            binary  = filled
+            cx, cy  = rect[0]
+            print(f"    [HEATMAP] Rotated rect: centre=({cx:.0f},{cy:.0f})  "
+                  f"size=({rect[1][0]:.0f}×{rect[1][1]:.0f})  angle={rect[2]:.1f}°")
 
     mask_np = np.array(
         Image.fromarray(binary * 255).resize((width, height), Image.NEAREST)
     ).astype(np.uint8)
-    print(f"    [HEATMAP] Mask: {int((mask_np>127).mean()*100)}% of pixels")
+    print(f"    [HEATMAP] Final mask: {int((mask_np>127).mean()*100)}% of pixels")
     return mask_np
 
 
@@ -1200,6 +1240,7 @@ def run_collage_chain(
     results = [base]
     scene   = base
     _placed: Dict[str, Tuple[int, int, int, int]] = {}   # track insertion bboxes
+    occupied_mask = np.zeros((height, width), dtype=np.uint8)  # union of placed masks
 
     for i, edit in enumerate(edits):
         name   = edit["name"]
@@ -1240,11 +1281,12 @@ def run_collage_chain(
 
             blend_p = f"A photorealistic room with a {desc} placed naturally."
 
-            # Heatmap-guided placement: model attention tells us where the object goes
-            print(f"  [PLACE] Attention heatmap for '{name}' ...")
+            # Heatmap-guided placement (DAAM) — no depth model needed for insert
+            print(f"  [PLACE] Attention heatmap for '{desc}' ...")
             heatmap = run_heatmap_pass(
-                pipe=pipe, scene=scene, prompt=blend_p, obj_word=name,
+                pipe=pipe, scene=scene, description=desc,
                 seed=seed, height=height, width=width, n_steps=heatmap_steps,
+                occupied_mask=occupied_mask,
             )
             hm_vis = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
             Image.fromarray(cv2.cvtColor(hm_vis, cv2.COLOR_BGR2RGB)).save(
@@ -1261,6 +1303,11 @@ def run_collage_chain(
                 bx1, by1 = 0, height // 4
                 bx2, by2 = width, 3 * height // 4
             _placed[name] = (bx1, by1, bx2, by2)
+            # Mark this zone as occupied so subsequent objects don't overlap
+            occupied_mask = np.clip(
+                occupied_mask.astype(np.int32) + (mask_np > 127).astype(np.int32) * 255,
+                0, 255,
+            ).astype(np.uint8)
             with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
                 f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
