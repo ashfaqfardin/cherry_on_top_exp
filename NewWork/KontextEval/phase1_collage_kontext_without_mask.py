@@ -420,7 +420,200 @@ def _token_zone_from_mask_np(
     return zone
 
 
-# ── K/V injection (identical to original) ────────────────────────────────────
+# ── DAAM attention heatmap — automatic placement mask ────────────────────────
+
+def _find_obj_token_idx(pipe, prompt: str, obj_word: str) -> int:
+    """
+    Return the T5 token index of obj_word inside prompt.
+    Tries exact and substring matches; falls back to 0.
+    """
+    tokenizer = pipe.tokenizer_2          # T5 SentencePiece
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    obj_lower = obj_word.lower().strip()
+    for i, tid in enumerate(ids):
+        tok = tokenizer.decode([tid]).strip().lower()
+        if tok == obj_lower or (len(tok) >= 3 and tok in obj_lower) or (len(obj_lower) >= 3 and obj_lower in tok):
+            print(f"    [HEATMAP] '{obj_word}' → token '{tok}' at idx {i}")
+            return i
+    # Sliding-window fallback for multi-subword words
+    decoded = [tokenizer.decode([tid]).strip().lower() for tid in ids]
+    buf = ""
+    for i, tok in enumerate(decoded):
+        buf = (buf + tok)[-len(obj_lower) - 4:]
+        if obj_lower in buf:
+            print(f"    [HEATMAP] '{obj_word}' matched via window at idx {i}")
+            return i
+    print(f"    [HEATMAP] '{obj_word}' not found in T5 tokens — using idx 0")
+    return 0
+
+
+class _HeatmapCapture:
+    """
+    DAAM-style attention heatmap capture.
+
+    At each TIER_A double-stream layer computes the RAW dot-product
+    Q_gen · K_obj_token  (no softmax, no full attention matrix)
+    and accumulates the per-gen-token score.
+
+    Result: heatmap[i] = ∑_{l,s} Q_gen[i] · K_text[obj_token] / √d
+    Reshape to (h_lat, w_lat) → normalise → placement heatmap.
+    """
+    def __init__(self, n_gen: int, obj_token_idx: int):
+        self.n_gen = n_gen
+        self.obj_token_idx = obj_token_idx
+        self._layer = 0
+        self._step  = 0
+        self.heatmap: Optional[np.ndarray] = None
+        self._count  = 0
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None):
+        is_double = encoder_hidden_states is not None
+        B = hidden_states.shape[0]
+        q = attn.to_q(hidden_states); k = attn.to_k(hidden_states); v = attn.to_v(hidden_states)
+        hd = k.shape[-1] // attn.heads
+        q = q.view(B,-1,attn.heads,hd).transpose(1,2)
+        k = k.view(B,-1,attn.heads,hd).transpose(1,2)
+        v = v.view(B,-1,attn.heads,hd).transpose(1,2)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+        txt_len = 0
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            ek = attn.add_k_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            ev = attn.add_v_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            txt_len = eq.shape[2]
+            q = torch.cat([eq,q],dim=2); k = torch.cat([ek,k],dim=2); v = torch.cat([ev,v],dim=2)
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q,image_rotary_emb); k = apply_rotary_emb(k,image_rotary_emb)
+        # DAAM: raw Q_gen · K_obj (cheap — no full attention matrix)
+        if is_double and self._layer in _TIER_A:
+            g_lo = txt_len; g_hi = txt_len + self.n_gen
+            obj_idx = self.obj_token_idx
+            if obj_idx < txt_len and q.shape[2] >= g_hi:
+                scale = hd ** -0.5
+                # (B, H, n_gen) raw dot-product with the object text token key
+                score = (q[:,:,g_lo:g_hi,:] @
+                         k[:,:,obj_idx:obj_idx+1,:].transpose(-1,-2)).squeeze(-1) * scale
+                score_np = score.float().mean(dim=(0,1)).detach().cpu().numpy()
+                if self.heatmap is None:
+                    self.heatmap = np.zeros(self.n_gen, dtype=np.float32)
+                self.heatmap += score_np
+                self._count  += 1
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1,2).reshape(B,-1,attn.heads*hd).to(q.dtype)
+        if is_double:
+            enc_out = out[:,:encoder_hidden_states.shape[1]]
+            out     = out[:,encoder_hidden_states.shape[1]:]
+            out = attn.to_out[1](attn.to_out[0](out)); enc_out = attn.to_add_out(enc_out)
+            self._layer += 1; return out, enc_out
+        self._layer += 1; return out
+
+
+@torch.no_grad()
+def run_heatmap_pass(
+    pipe, scene: Image.Image, prompt: str, obj_word: str,
+    seed: int, height: int, width: int, n_steps: int = 6,
+) -> np.ndarray:
+    """
+    Short n_steps forward pass → DAAM attention heatmap.
+
+    Returns a (h_lat, w_lat) float32 array in [0, 1] where bright = likely
+    placement region for obj_word as determined by the model's own attention.
+    """
+    vae_sf = getattr(pipe, "vae_scale_factor", 8)
+    n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+    h_lat  = height // (vae_sf * 2)
+    w_lat  = width  // (vae_sf * 2)
+
+    orig_procs    = pipe.transformer.attn_processors
+    obj_token_idx = _find_obj_token_idx(pipe, prompt, obj_word)
+
+    cap = _HeatmapCapture(n_gen=n_gen, obj_token_idx=obj_token_idx)
+    pipe.transformer.set_attn_processor(cap)
+
+    def _step_cb(pr, si, ts, ck):
+        cap._step = si + 1; cap._layer = 0
+        return ck
+
+    gen = torch.Generator(device=pipe.device).manual_seed(seed)
+    pipe(image=scene, prompt=prompt,
+         num_inference_steps=n_steps, guidance_scale=2.5,
+         height=height, width=width, max_sequence_length=512,
+         generator=gen, output_type="latent",
+         callback_on_step_end=_step_cb,
+         callback_on_step_end_tensor_inputs=[])
+    pipe.transformer.set_attn_processor(orig_procs)
+
+    if cap.heatmap is None or cap._count == 0:
+        print("    [HEATMAP] No maps captured — returning uniform heatmap")
+        return np.ones((h_lat, w_lat), dtype=np.float32)
+
+    hm = (cap.heatmap / cap._count).reshape(h_lat, w_lat)
+    lo, hi = hm.min(), hm.max()
+    if hi - lo > 1e-6:
+        hm = (hm - lo) / (hi - lo)
+    print(f"    [HEATMAP] Captured {cap._count} maps  peak at "
+          f"({int(np.unravel_index(hm.argmax(), hm.shape)[1])}, "
+          f"{int(np.unravel_index(hm.argmax(), hm.shape)[0])})")
+    return hm.astype(np.float32)
+
+
+def heatmap_to_mask(
+    heatmap:    np.ndarray,
+    height:     int,
+    width:      int,
+    percentile: float = 72,
+    blur_ksize: int   = 11,
+    blur_sigma: float = 4.0,
+    min_frac:   float = 0.04,
+    max_frac:   float = 0.45,
+) -> np.ndarray:
+    """
+    (h_lat, w_lat) float heatmap → uint8 pixel mask (H, W).
+
+    1. Gaussian blur to suppress noise.
+    2. Threshold at `percentile` → binary latent-resolution mask.
+    3. Keep largest connected component (the main placement zone).
+    4. Clamp size: if too small fall back to bright-peak neighbourhood;
+       if too large re-threshold at a higher percentile.
+    5. Upsample to (H, W) pixel resolution.
+    """
+    blurred = cv2.GaussianBlur(heatmap, (blur_ksize, blur_ksize), blur_sigma)
+    binary  = (blurred >= np.percentile(blurred, percentile)).astype(np.uint8)
+    binary  = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
+    binary  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  np.ones((2,2), np.uint8))
+
+    # Keep largest connected component
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+    if n_labels > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        binary  = (labels == largest).astype(np.uint8)
+
+    frac = binary.mean()
+    h_lat, w_lat = heatmap.shape
+    if frac < min_frac:
+        # Fall back to small region around the peak
+        cy, cx = np.unravel_index(blurred.argmax(), blurred.shape)
+        r = max(3, int(min(h_lat, w_lat) * 0.15))
+        binary = np.zeros_like(binary)
+        binary[max(0,cy-r):min(h_lat,cy+r), max(0,cx-r):min(w_lat,cx+r)] = 1
+        print(f"    [HEATMAP] Mask too small ({frac*100:.1f}%) — using peak neighbourhood")
+    elif frac > max_frac:
+        p2 = percentile + (100 - percentile) * 0.5
+        binary = (blurred >= np.percentile(blurred, p2)).astype(np.uint8)
+        print(f"    [HEATMAP] Mask too large ({frac*100:.1f}%) — re-thresholding at p={p2:.0f}")
+
+    mask_np = np.array(
+        Image.fromarray(binary * 255).resize((width, height), Image.NEAREST)
+    ).astype(np.uint8)
+    print(f"    [HEATMAP] Mask: {int((mask_np>127).mean()*100)}% of pixels")
+    return mask_np
+
+
+# ── K/V injection ─────────────────────────────────────────────────────────────
 
 _TIER_A         = {0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56}
 _SINGLE_TXT_LEN = 512
@@ -983,6 +1176,7 @@ def run_collage_chain(
     obj_strength:   float = 0.5,
     bg_strength:    float = 0.8,
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
+    heatmap_steps:  int   = 6,
 ) -> List[Image.Image]:
     """
     Mask-free incremental object insertion / removal.
@@ -1044,19 +1238,31 @@ def run_collage_chain(
             )
             obj_img.save(os.path.join(out_dir, f"obj_gen_{name}.png"))
 
-            # Depth-guided floor placement (no user mask needed)
-            print(f"  [PLACE] Finding floor placement ...")
-            bx1, by1, bx2, by2 = find_floor_bbox(depth_np, height, width)
-            _placed[name] = (bx1, by1, bx2, by2)    # track for potential removal
+            blend_p = f"A photorealistic room with a {desc} placed naturally."
 
-            mask_np = _rect_mask_from_bbox(bx1, by1, bx2, by2, height, width)
-            Image.fromarray(mask_np).save(
-                os.path.join(out_dir, f"mask_pred_{name}.png")
+            # Heatmap-guided placement: model attention tells us where the object goes
+            print(f"  [PLACE] Attention heatmap for '{name}' ...")
+            heatmap = run_heatmap_pass(
+                pipe=pipe, scene=scene, prompt=blend_p, obj_word=name,
+                seed=seed, height=height, width=width, n_steps=heatmap_steps,
             )
+            hm_vis = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            Image.fromarray(cv2.cvtColor(hm_vis, cv2.COLOR_BGR2RGB)).save(
+                os.path.join(out_dir, f"heatmap_{name}.png")
+            )
+            mask_np = heatmap_to_mask(heatmap, height, width)
+            Image.fromarray(mask_np).save(os.path.join(out_dir, f"mask_pred_{name}.png"))
+
+            # Derive bbox from mask for removal tracking
+            ys, xs = np.where(mask_np > 127)
+            if len(ys) > 0:
+                bx1, by1, bx2, by2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+            else:
+                bx1, by1 = 0, height // 4
+                bx2, by2 = width, 3 * height // 4
+            _placed[name] = (bx1, by1, bx2, by2)
             with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
                 f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
-
-            blend_p = f"A photorealistic room with a {desc} placed naturally."
 
         else:  # remove
             # Use tracked insertion bbox if available (most reliable)
@@ -1195,6 +1401,8 @@ def parse_args():
     p.add_argument("--lora_id",       default=LORA_ID)
     p.add_argument("--lora_guidance", type=float, default=4.0)
     p.add_argument("--guidance",      type=float, default=2.5)
+    p.add_argument("--heatmap_steps", type=int, default=6,
+                   help="Steps for the DAAM attention heatmap pre-pass. Default: 6")
     p.add_argument("--kv_injection",  action="store_true",
                    help="Use dual K/V injection for insertion (default: off for baseline test).")
     p.add_argument("--obj_strength",  type=float, default=0.5,
@@ -1270,6 +1478,7 @@ def main():
         obj_strength=args.obj_strength,
         bg_strength=args.bg_strength,
         cutoff_frac=cutoff_frac,
+        heatmap_steps=args.heatmap_steps,
     )
 
     all_imgs = results
