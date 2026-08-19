@@ -164,6 +164,50 @@ def _compute_obj_token_mask(
         mask[h0:h1, w0:w1] = True
     return mask.reshape(-1)  # (h_lat * w_lat,) bool
 
+def _spatial_align_k(
+    k_obj: torch.Tensor,       # (1, H, n_gen, d) — RoPE-stripped
+    obj_mask: np.ndarray,      # (n_gen,) bool — non-background tokens in obj_img
+    target_mask: torch.Tensor, # (n_gen,) bool — target zone in scene
+    h_lat: int,
+    w_lat: int,
+) -> torch.Tensor:
+    """
+    Returns (1, H, n_gen, d): for each scene position the K from the
+    spatially corresponding position in obj_img (bbox-to-bbox mapping).
+
+    Instead of mean(K_obj) → same vector everywhere, each target token gets
+    the K from the geometrically aligned obj_img token, so handlebar area
+    sees handlebar K, wheel area sees wheel K, etc.
+    """
+    obj_2d = obj_mask.reshape(h_lat, w_lat)
+    tgt_2d = target_mask.cpu().numpy().reshape(h_lat, w_lat)
+
+    def _bbox(m):
+        rows = np.where(m.any(axis=1))[0]
+        cols = np.where(m.any(axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return 0, h_lat - 1, 0, w_lat - 1
+        return int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1])
+
+    r0_o, r1_o, c0_o, c1_o = _bbox(obj_2d)
+    r0_t, r1_t, c0_t, c1_t = _bbox(tgt_2d)
+
+    RR, CC = np.meshgrid(np.arange(h_lat, dtype=np.float32),
+                         np.arange(w_lat, dtype=np.float32), indexing='ij')
+
+    def _map(pos, p0_t, p1_t, p0_o, p1_o):
+        if p1_t == p0_t:
+            return np.full_like(pos, (p0_o + p1_o) * 0.5)
+        ratio = (pos - p0_t) / float(p1_t - p0_t)
+        return np.clip(p0_o + ratio * (p1_o - p0_o), p0_o, p1_o)
+
+    R_idx = np.clip(np.round(_map(RR, r0_t, r1_t, r0_o, r1_o)).astype(int), 0, h_lat - 1)
+    C_idx = np.clip(np.round(_map(CC, c0_t, c1_t, c0_o, c1_o)).astype(int), 0, w_lat - 1)
+
+    flat = torch.from_numpy((R_idx * w_lat + C_idx).reshape(-1)).to(k_obj.device)
+    return k_obj[:, :, flat, :]   # (1, H, n_gen, d)
+
+
 class _ObjKVCapture:
     """
     Minimal attention processor that performs standard attention AND captures
@@ -228,15 +272,26 @@ class _ObjKVCapture:
             q = apply_rotary_emb(q, image_rotary_emb)
             k = apply_rotary_emb(k, image_rotary_emb)
 
-        # Capture K/V from ref-token slice at TIER_A layers
+        # Capture K/V + RoPE from ref-token slice at TIER_A layers
         if self._layer in self.tier_a:
             img_offset = txt_len if is_double else self.single_txt_len
             ref_lo = img_offset + self.n_gen
             ref_hi = ref_lo + self.n_gen  # n_ref == n_gen (same resolution canvas)
             if k.shape[2] >= ref_hi:
+                # Save ref-token RoPE so injection can unapply it (position-agnostic K)
+                rope_ref = None
+                if image_rotary_emb is not None:
+                    cos_all, sin_all = image_rotary_emb
+                    if cos_all.dim() == 2:
+                        rope_ref = (cos_all[ref_lo:ref_hi].detach().cpu(),
+                                    sin_all[ref_lo:ref_hi].detach().cpu())
+                    else:  # (B, T, D) or (1, T, D)
+                        rope_ref = (cos_all[:, ref_lo:ref_hi].detach().cpu(),
+                                    sin_all[:, ref_lo:ref_hi].detach().cpu())
                 self.kv[self._layer] = (
                     k[:, :, ref_lo:ref_hi, :].detach().cpu(),
                     v[:, :, ref_lo:ref_hi, :].detach().cpu(),
+                    rope_ref,
                 )
 
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False,
@@ -275,8 +330,11 @@ def capture_obj_kv(
     very strongly in the K/V — the noisy gen latents have not yet established
     any structure, so the reference dominates.  One step is enough.
 
-    Returns: ({layer_idx: (K_cpu, V_cpu)}, obj_mask_np) where obj_mask_np is a
-    bool array (n_gen,) marking which token positions are non-background in obj_img.
+    Returns: ({layer_idx: (K_cpu, V_cpu, rope_ref)}, obj_mask_np) where:
+      - K_cpu, V_cpu  : captured with RoPE already applied (obj_img positions)
+      - rope_ref      : (cos, sin) for the ref-token slice — used by ObjKVInject
+                        to unapply source RoPE and make K position-agnostic
+      - obj_mask_np   : bool (n_gen,) marking non-background token positions
     """
     vae_sf  = getattr(pipe, "vae_scale_factor", 8)
     # Kontext packs 2×2 latent patches into one token — divide by vae_sf then by 2.
@@ -322,7 +380,8 @@ class ObjKVInject(KontextInjectionProcessor):
       background zone  →  scene ref K/V  (locks room background; same as
                           KontextInjectionProcessor's standard behaviour)
       shell zone       →  scene ref K only (silhouette edge)
-      target zone      →  mean-pooled obj K/V  [NEW — locks object appearance]
+      target zone      →  RoPE-stripped obj K only  [K-only — shapes attention
+                          without rigid feature copy; V left to generation]
 
     In "reasoning" mode (steps 0 → derive_step), DAAM saliency is accumulated
     to discover the object placement area — same as the parent class.
@@ -375,29 +434,32 @@ class ObjKVInject(KontextInjectionProcessor):
             sh    = zones.shell.view(1, 1, -1, 1)
             k_gen = torch.where(sh, (1 - s_bg) * k_gen + s_bg * k_ref, k_gen)
 
-        # ── Target: inject obj K/V (object appearance lock) ──────────────────
+        # ── Target: K-only injection with RoPE strip (object appearance lock) ──
         if (zones is not None and zones.target.any() and layer in self.obj_kv):
-            k_obj_raw, v_obj_raw = self.obj_kv[layer]
+            k_obj_raw, _v_obj_raw, rope_ref = self.obj_kv[layer]
             k_obj_raw = k_obj_raw.to(k.device, k.dtype)
-            v_obj_raw = v_obj_raw.to(v.device, v.dtype)
 
-            # Filter to object-region tokens only (non-background in obj_img).
-            # Mean-pooling the full spatial sequence dilutes the appearance signal
-            # with grey-background tokens — filter first, then pool.
+            # Unapply source-image RoPE: inverse rotation via (cos, -sin).
+            # Makes K position-agnostic so target-zone gen tokens get appearance
+            # signal without spatial collision from obj_img's token positions.
+            if rope_ref is not None:
+                cos_ref = rope_ref[0].to(k.device, k.dtype)
+                sin_ref = rope_ref[1].to(k.device, k.dtype)
+                k_obj_raw = apply_rotary_emb(k_obj_raw, (cos_ref, -sin_ref))
+
+            # Filter to object-region tokens (non-background in obj_img), then pool.
             obj_idx = torch.from_numpy(np.where(self.obj_mask_np)[0]).to(k.device)
             if obj_idx.numel() > 0:
-                k_obj_filt = k_obj_raw[:, :, obj_idx, :]   # (1, H, n_obj, d)
-                v_obj_filt = v_obj_raw[:, :, obj_idx, :]
+                k_obj_filt = k_obj_raw[:, :, obj_idx, :]
             else:
-                k_obj_filt = k_obj_raw  # fallback: use all tokens
-                v_obj_filt = v_obj_raw
+                k_obj_filt = k_obj_raw
             k_obj = k_obj_filt.mean(dim=2, keepdim=True).expand_as(k_gen)
-            v_obj = v_obj_filt.mean(dim=2, keepdim=True).expand_as(v_gen)
 
             tgt   = zones.target.view(1, 1, -1, 1)
             s_obj = self.obj_strength
+            # K-only: shapes attention distribution toward obj appearance without
+            # directly copying V features (avoids rigid paste).
             k_gen = torch.where(tgt, (1 - s_obj) * k_gen + s_obj * k_obj, k_gen)
-            v_gen = torch.where(tgt, (1 - s_obj) * v_gen + s_obj * v_obj, v_gen)
 
         k = k.clone()
         v = v.clone()

@@ -823,6 +823,47 @@ _TIER_A         = {0, 7, 8, 9, 10, 18, 25, 28, 37, 42, 45, 50, 56}
 _SINGLE_TXT_LEN = 512
 
 
+def _spatial_align_k_from_obj(
+    k_obj: torch.Tensor,      # (1, H, n_gen, d) — K from obj_img capture pass
+    obj_mask: np.ndarray,     # (n_gen,) bool — non-background tokens in obj_img
+    target_zone: np.ndarray,  # (n_gen,) bool — target zone in scene
+    h_lat: int,
+    w_lat: int,
+) -> torch.Tensor:
+    """
+    Returns (1, H, n_gen, d): for each scene position, the K from the
+    geometrically corresponding position in obj_img (bbox-to-bbox mapping).
+
+    Fixes the mean-pool collapse: instead of every target token seeing the
+    same average K, handlebar area gets handlebar K, wheel area gets wheel K.
+    """
+    obj_2d = obj_mask.reshape(h_lat, w_lat)
+    tgt_2d = target_zone.reshape(h_lat, w_lat)
+
+    def _bbox(m):
+        rows = np.where(m.any(axis=1))[0]
+        cols = np.where(m.any(axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return 0, h_lat - 1, 0, w_lat - 1
+        return int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1])
+
+    r0_o, r1_o, c0_o, c1_o = _bbox(obj_2d)
+    r0_t, r1_t, c0_t, c1_t = _bbox(tgt_2d)
+
+    RR, CC = np.meshgrid(np.arange(h_lat, dtype=np.float32),
+                         np.arange(w_lat, dtype=np.float32), indexing='ij')
+
+    def _map(pos, p0t, p1t, p0o, p1o):
+        if p1t == p0t:
+            return np.full_like(pos, (p0o + p1o) * 0.5)
+        return np.clip(p0o + (pos - p0t) / float(p1t - p0t) * (p1o - p0o), p0o, p1o)
+
+    R_idx = np.clip(np.round(_map(RR, r0_t, r1_t, r0_o, r1_o)).astype(int), 0, h_lat - 1)
+    C_idx = np.clip(np.round(_map(CC, c0_t, c1_t, c0_o, c1_o)).astype(int), 0, w_lat - 1)
+    flat  = torch.from_numpy((R_idx * w_lat + C_idx).reshape(-1)).to(k_obj.device)
+    return k_obj[:, :, flat, :]  # (1, H, n_gen, d)
+
+
 class _KVCapture:
     def __init__(self, n_gen: int):
         self.n_gen = n_gen
@@ -939,11 +980,13 @@ class _DualKVInject:
     No collage, no BLD callback required. Both concerns are handled at attention level.
     """
     def __init__(self, n_gen, obj_kv, obj_mask_np, target_zone,
-                 obj_strength, bg_strength, n_steps, cutoff_frac):
+                 obj_strength, bg_strength, n_steps, cutoff_frac,
+                 h_lat: int = 0, w_lat: int = 0):
         self.n_gen = n_gen; self.obj_kv = obj_kv; self.obj_mask_np = obj_mask_np
         self.target_zone = target_zone
         self.obj_strength = obj_strength; self.bg_strength = bg_strength
         self.n_steps = n_steps; self.cutoff_frac = cutoff_frac
+        self.h_lat = h_lat; self.w_lat = w_lat
         self._layer = 0; self._step = 0
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
@@ -987,13 +1030,25 @@ class _DualKVInject:
                 if lo <= self._step < hi and self._layer in self.obj_kv and self.obj_strength > 0:
                     k_r, v_r = self.obj_kv[self._layer]
                     k_r = k_r.to(k.device, k.dtype); v_r = v_r.to(v.device, v.dtype)
-                    obj_idx = torch.from_numpy(np.where(self.obj_mask_np)[0]).to(k.device)
-                    if obj_idx.numel() > 0:
-                        k_obj = k_r[:,:,obj_idx,:].mean(dim=2,keepdim=True).expand_as(k_gen)
-                        v_obj = v_r[:,:,obj_idx,:].mean(dim=2,keepdim=True).expand_as(v_gen)
-                    else:
-                        k_obj = k_r.mean(dim=2,keepdim=True).expand_as(k_gen)
-                        v_obj = v_r.mean(dim=2,keepdim=True).expand_as(v_gen)
+                    # Spatially aligned: each target token gets its geometrically
+                    # corresponding obj K/V (bbox-to-bbox), not the mean over all tokens.
+                    if self.h_lat > 0 and self.w_lat > 0:
+                        k_obj = _spatial_align_k_from_obj(k_r, self.obj_mask_np,
+                                                          self.target_zone, self.h_lat, self.w_lat)
+                        obj_idx = torch.from_numpy(np.where(self.obj_mask_np)[0]).to(k.device)
+                        if obj_idx.numel() > 0:
+                            v_obj = _spatial_align_k_from_obj(v_r, self.obj_mask_np,
+                                                              self.target_zone, self.h_lat, self.w_lat)
+                        else:
+                            v_obj = v_r.mean(dim=2, keepdim=True).expand_as(v_gen)
+                    else:  # fallback: mean-pool
+                        obj_idx = torch.from_numpy(np.where(self.obj_mask_np)[0]).to(k.device)
+                        if obj_idx.numel() > 0:
+                            k_obj = k_r[:,:,obj_idx,:].mean(dim=2,keepdim=True).expand_as(k_gen)
+                            v_obj = v_r[:,:,obj_idx,:].mean(dim=2,keepdim=True).expand_as(v_gen)
+                        else:
+                            k_obj = k_r.mean(dim=2,keepdim=True).expand_as(k_gen)
+                            v_obj = v_r.mean(dim=2,keepdim=True).expand_as(v_gen)
                     tgt_t = tgt.view(1,1,-1,1); s_obj = self.obj_strength
                     k_gen = torch.where(tgt_t, (1-s_obj)*k_gen + s_obj*k_obj, k_gen)
                     v_gen = torch.where(tgt_t, (1-s_obj)*v_gen + s_obj*v_obj, v_gen)
@@ -1023,7 +1078,9 @@ def run_with_dual_kv_injection(
     at the attention level — no pixel-space collage, no BLD latent callback.
     """
     vae_sf = getattr(pipe, "vae_scale_factor", 8)
-    n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+    h_lat  = height // (vae_sf * 2)
+    w_lat  = width  // (vae_sf * 2)
+    n_gen  = h_lat * w_lat
     orig_procs   = pipe.transformer.attn_processors
     # 1-step pass on obj_img to capture K/V at TIER_A layers
     capture_proc = _KVCapture(n_gen=n_gen)
@@ -1042,6 +1099,7 @@ def run_with_dual_kv_injection(
         target_zone=target_zone,
         obj_strength=obj_strength, bg_strength=bg_strength,
         n_steps=num_steps, cutoff_frac=cutoff_frac,
+        h_lat=h_lat, w_lat=w_lat,
     )
     pipe.transformer.set_attn_processor(inject_proc)
 
@@ -1102,9 +1160,15 @@ def run_with_kv_injection(
 
 
 class _CollageKVInject:
-    def __init__(self, n_gen, target_zone, obj_strength, n_steps, cutoff_frac):
+    def __init__(self, n_gen, target_zone, obj_strength, n_steps, cutoff_frac,
+                 target_weights: Optional[np.ndarray] = None):
         self.n_gen = n_gen; self.target_zone = target_zone
         self.obj_strength = obj_strength; self.n_steps = n_steps; self.cutoff_frac = cutoff_frac
+        # target_weights: float (n_gen,) in [0,1] from DAAM heatmap — per-token strength.
+        # When provided, replaces binary target_zone with a gradient: tokens at the
+        # DAAM saliency peak get full obj_strength; tokens at the heatmap periphery
+        # get proportionally less, giving a soft spatial transition instead of a hard boundary.
+        self.target_weights = target_weights
         self._layer = 0; self._step = 0
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
@@ -1135,10 +1199,19 @@ class _CollageKVInject:
             if k.shape[2] >= r_hi:
                 k_gen = k[:,:,g_lo:g_hi,:].clone(); v_gen = v[:,:,g_lo:g_hi,:].clone()
                 k_ref = k[:,:,r_lo:r_hi,:];         v_ref = v[:,:,r_lo:r_hi,:]
-                tgt = torch.from_numpy(self.target_zone).to(k.device).view(1,1,-1,1)
-                s = self.obj_strength
-                k_gen = torch.where(tgt,(1.0-s)*k_gen+s*k_ref,k_gen)
-                v_gen = torch.where(tgt,(1.0-s)*v_gen+s*v_ref,v_gen)
+                if self.target_weights is not None:
+                    # Soft injection: per-token strength = obj_strength × DAAM saliency weight.
+                    # High-saliency tokens (heatmap peak) see full obj_strength;
+                    # periphery tokens get proportionally less, no hard edge artifact.
+                    w = torch.from_numpy(self.target_weights).to(k.device, k.dtype)
+                    s_tok = (self.obj_strength * w).view(1, 1, -1, 1)
+                    k_gen = k_gen + s_tok * (k_ref - k_gen)
+                    v_gen = v_gen + s_tok * (v_ref - v_gen)
+                else:
+                    tgt = torch.from_numpy(self.target_zone).to(k.device).view(1,1,-1,1)
+                    s = self.obj_strength
+                    k_gen = torch.where(tgt,(1.0-s)*k_gen+s*k_ref,k_gen)
+                    v_gen = torch.where(tgt,(1.0-s)*v_gen+s*v_ref,v_gen)
                 k = k.clone(); v = v.clone()
                 k[:,:,g_lo:g_hi,:] = k_gen; v[:,:,g_lo:g_hi,:] = v_gen
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
@@ -1156,13 +1229,14 @@ def run_with_collage_kv_injection(
     pipe, canvas, prompt, target_zone,
     seed, num_steps, guidance, height, width,
     obj_strength=0.5, cutoff_frac=(0.0, 0.6), bcg_callback=None,
+    target_weights: Optional[np.ndarray] = None,
 ) -> Image.Image:
     vae_sf = getattr(pipe, "vae_scale_factor", 8)
     n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
     orig_procs  = pipe.transformer.attn_processors
     inject_proc = _CollageKVInject(n_gen=n_gen, target_zone=target_zone,
                                    obj_strength=obj_strength, n_steps=num_steps,
-                                   cutoff_frac=cutoff_frac)
+                                   cutoff_frac=cutoff_frac, target_weights=target_weights)
     pipe.transformer.set_attn_processor(inject_proc)
 
     def _step_cb(pr, si, ts, ck):
@@ -1477,7 +1551,11 @@ def run_collage_chain(
             Image.fromarray(cv2.cvtColor(hm_vis, cv2.COLOR_BGR2RGB)).save(
                 os.path.join(out_dir, f"heatmap_{name}.png")
             )
-            mask_np = heatmap_to_mask(heatmap, height, width)
+            # Soft per-token K/V weights directly from DAAM heatmap (already [0,1]).
+            # Bypasses the binary rotated-rectangle step for K/V injection — the
+            # saliency gradient is used as-is so periphery tokens blend gently.
+            _heatmap_weights = heatmap.reshape(-1).astype(np.float32)
+            mask_np = heatmap_to_mask(heatmap, height, width)  # still needed for BLD + bbox
             Image.fromarray(mask_np).save(os.path.join(out_dir, f"mask_pred_{name}.png"))
 
             # Derive bbox from mask for removal fallback tracking
@@ -1573,6 +1651,7 @@ def run_collage_chain(
                     height=height, width=width,
                     obj_strength=obj_strength, cutoff_frac=cutoff_frac,
                     bcg_callback=bcg_cb,
+                    target_weights=_heatmap_weights,
                 )
             else:
                 next_scene = run_standard(
