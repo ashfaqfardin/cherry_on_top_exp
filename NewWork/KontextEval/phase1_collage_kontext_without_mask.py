@@ -1405,8 +1405,8 @@ def run_collage_chain(
     """
     results = [base]
     scene   = base
-    _placed: Dict[str, Tuple[int, int, int, int]] = {}   # track insertion bboxes
-    occupied_mask = np.zeros((height, width), dtype=np.uint8)  # union of placed masks
+    _placed: Dict[str, Tuple[int, int, int, int]] = {}
+    per_object_masks: Dict[str, np.ndarray] = {}   # pixel-wise mask per inserted object
 
     for i, edit in enumerate(edits):
         name   = edit["name"]
@@ -1455,12 +1455,23 @@ def run_collage_chain(
                     vlm_model, vlm_processor, scene, desc
                 )
 
+            # Build pixel-wise occupied map from all previously placed object masks.
+            # Each object's exact pixel footprint is suppressed, so the new object's
+            # heatmap is free to overlap objects at different depths (e.g. vase in
+            # front of bicycle) while still avoiding placing two objects at the exact
+            # same location.
+            _occ = np.zeros((height, width), dtype=np.uint8)
+            for _m in per_object_masks.values():
+                _occ = np.clip(
+                    _occ.astype(np.int32) + _m.astype(np.int32) * 255, 0, 255
+                ).astype(np.uint8)
+
             # Heatmap-guided placement (DAAM)
             print(f"  [PLACE] Attention heatmap for '{desc}' ...")
             heatmap = run_heatmap_pass(
                 pipe=pipe, scene=scene, prompt=blend_p, description=desc,
                 seed=seed, height=height, width=width, n_steps=heatmap_steps,
-                occupied_mask=occupied_mask, anchor=placement_anchor,
+                occupied_mask=_occ, anchor=placement_anchor,
             )
             hm_vis = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
             Image.fromarray(cv2.cvtColor(hm_vis, cv2.COLOR_BGR2RGB)).save(
@@ -1469,7 +1480,7 @@ def run_collage_chain(
             mask_np = heatmap_to_mask(heatmap, height, width)
             Image.fromarray(mask_np).save(os.path.join(out_dir, f"mask_pred_{name}.png"))
 
-            # Derive bbox from mask for removal tracking
+            # Derive bbox from mask for removal fallback tracking
             ys, xs = np.where(mask_np > 127)
             if len(ys) > 0:
                 bx1, by1, bx2, by2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
@@ -1477,11 +1488,6 @@ def run_collage_chain(
                 bx1, by1 = 0, height // 4
                 bx2, by2 = width, 3 * height // 4
             _placed[name] = (bx1, by1, bx2, by2)
-            # Mark this zone as occupied so subsequent objects don't overlap
-            occupied_mask = np.clip(
-                occupied_mask.astype(np.int32) + (mask_np > 127).astype(np.int32) * 255,
-                0, 255,
-            ).astype(np.uint8)
             with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
                 f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
 
@@ -1513,7 +1519,12 @@ def run_collage_chain(
                 print(f"  [DETECT] Depth-anomaly object detection ...")
                 bx1, by1, bx2, by2 = detect_object_on_floor(depth_np, height, width)
 
-            mask_np = _rect_mask_from_bbox(bx1, by1, bx2, by2, height, width)
+            # Prefer pixel-wise tracked mask over bbox rectangle
+            if name in per_object_masks:
+                mask_np = (per_object_masks[name] * 255).astype(np.uint8)
+                print(f"  [PLACE] Using pixel-wise mask for removal of '{name}'")
+            else:
+                mask_np = _rect_mask_from_bbox(bx1, by1, bx2, by2, height, width)
             Image.fromarray(mask_np).save(
                 os.path.join(out_dir, f"mask_pred_remove_{name}.png")
             )
@@ -1535,6 +1546,7 @@ def run_collage_chain(
             )
             # Remove from tracking once erased
             _placed.pop(name, None)
+            per_object_masks.pop(name, None)
 
         # ── Stage K: Kontext integration ─────────────────────────────────────
         step_tag = f"{'remove' if action == 'remove' else 'step'}{i+1}_{name}"
@@ -1597,6 +1609,30 @@ def run_collage_chain(
         result_path = os.path.join(out_dir, f"result_{step_tag}.png")
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
+
+        # ── Pixel-wise object mask (insertion only) ───────────────────────────
+        # BLD kept the background pixel-identical to the pre-insertion scene, so
+        # a simple diff cleanly isolates the generated object pixels.
+        if action == "insert":
+            _r   = np.array(next_scene.convert("RGB"), dtype=np.int32)
+            _s   = np.array(scene.convert("RGB"),      dtype=np.int32)
+            _diff = np.abs(_r - _s).max(axis=2)
+            _px  = (_diff > 15).astype(np.uint8)
+            _px  = cv2.morphologyEx(_px, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            _px  = cv2.morphologyEx(_px, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+            per_object_masks[name] = _px
+            print(f"    [MASK] '{name}' pixel mask: {int(_px.sum())} px "
+                  f"({_px.mean()*100:.1f}% of frame)")
+
+        # Save color-coded instance mask overlay on top of the current result
+        _COLORS = [(0,220,0),(0,80,255),(255,60,0),(255,200,0),(0,220,220),(200,0,255)]
+        _overlay = np.array(next_scene.convert("RGB"), dtype=np.float32)
+        for _ci, (_nm, _m) in enumerate(per_object_masks.items()):
+            _c = np.array(_COLORS[_ci % len(_COLORS)], dtype=np.float32)
+            _overlay[_m > 0] = 0.45 * _overlay[_m > 0] + 0.55 * _c
+        Image.fromarray(np.clip(_overlay, 0, 255).astype(np.uint8)).save(
+            os.path.join(out_dir, f"masks_overlay_{step_tag}.png")
+        )
 
         # ── Stage BCG: pixel-space background restoration (removal only) ────────
         # Insertion: BLD callback already preserved the background during denoising
