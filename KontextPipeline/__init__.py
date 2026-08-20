@@ -18,6 +18,7 @@ from .grounding     import VLMGrounder
 from .segmentation  import SAM2Segmenter
 from .collage       import paste_object, build_removal_reference
 from .flow_inject   import run_flow_guided_injection, run_flow_removal
+from .kv_inject     import capture_obj_kv, run_kv_guided_insertion
 from .sketch        import generate_from_sketch
 from .utils         import run_standard, save_grid
 from .orchestrator  import EditNode, EditGraph, build_graph, EDITS

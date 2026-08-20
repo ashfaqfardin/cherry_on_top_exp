@@ -30,7 +30,8 @@ from .utils    import run_standard, save_grid
 from .grounding   import VLMGrounder
 from .segmentation import SAM2Segmenter
 from .collage  import paste_object, build_removal_reference
-from .flow_inject import run_flow_guided_injection, run_flow_removal
+from .flow_inject  import run_flow_guided_injection, run_flow_removal
+from .kv_inject    import capture_obj_kv, run_kv_guided_insertion
 
 
 # ── Edit definitions ──────────────────────────────────────────────────────────
@@ -150,6 +151,8 @@ class EditGraph:
         out_dir: str,
         device: str,
         use_flow: bool = True,
+        alpha_k: float = 0.85,
+        alpha_v: float = 0.50,
     ) -> List[Image.Image]:
         results = [base]
 
@@ -168,7 +171,7 @@ class EditGraph:
                         node, scene, pipe, sketch_dir, lora_id,
                         grounder, segmenter, seed, num_steps,
                         lora_guidance, scene_guidance, height, width,
-                        out_dir, device, use_flow,
+                        out_dir, device, use_flow, alpha_k, alpha_v,
                     )
                 else:
                     result = self._run_remove(
@@ -198,7 +201,7 @@ class EditGraph:
         self, node, scene, pipe, sketch_dir, lora_id,
         grounder, segmenter, seed, num_steps,
         lora_guidance, scene_guidance, height, width,
-        out_dir, device, use_flow,
+        out_dir, device, use_flow, alpha_k, alpha_v,
     ) -> Image.Image:
         # A: Generate object from sketch
         sketch_path = self._find_sketch(sketch_dir, node.name)
@@ -210,56 +213,24 @@ class EditGraph:
         )
         obj_img.save(os.path.join(out_dir, f"obj_{node.name}.png"))
 
-        # B: VLM spatial grounding
-        if grounder is not None:
-            print(f"  [GND] Predicting placement for '{node.description}' ...")
-            bbox_norm = grounder.predict_bbox(scene, node.description)
-            bbox_px   = grounder.to_pixels(bbox_norm, width, height)
-        else:
-            # Fallback: lower-centre third of image
-            bbox_px = (width // 4, height // 2, 3 * width // 4, 7 * height // 8)
-            print(f"  [GND] No grounder — using fallback bbox {bbox_px}")
-        node.bbox_pixels = bbox_px
-        print(f"    bbox (pixels): {bbox_px}")
-        with open(os.path.join(out_dir, f"bbox_{node.node_id}.txt"), "w") as f:
-            f.write(f"x1={bbox_px[0]} y1={bbox_px[1]} x2={bbox_px[2]} y2={bbox_px[3]}\n")
+        # B: Capture K/V from obj_img for appearance injection
+        print(f"  [KV] Capturing appearance K/V from obj_img ...")
+        kv_store, n_tok = capture_obj_kv(pipe, obj_img, height, width)
 
-        # C: Build collage for Pass B of flow injection
-        print(f"  [COL] Building collage ...")
-        collage = paste_object(scene, obj_img, bbox_px)
-        collage.save(os.path.join(out_dir, f"collage_{node.name}.png"))
-
-        # D: SAM2 segmentation on collage (segment the pasted object)
-        if segmenter is not None:
-            print(f"  [SAM2] Segmenting pasted object in collage ...")
-            sam2_mask = segmenter.segment(collage, bbox_px)
-        else:
-            # Fallback: rectangular mask from bbox
-            sam2_mask = np.zeros((height, width), dtype=np.uint8)
-            x1, y1, x2, y2 = bbox_px
-            sam2_mask[y1:y2, x1:x2] = 1
-            print(f"  [SAM2] No segmenter — using rect mask {bbox_px}")
-        node.sam2_mask = sam2_mask
-        Image.fromarray(sam2_mask * 255).save(
-            os.path.join(out_dir, f"mask_{node.node_id}.png")
+        # C: Kontext scene pass with K/V injection (placement via prompt)
+        insert_prompt = (
+            f"Place a {node.description} naturally on the floor of this room. "
+            f"Preserve the room exactly as-is; only add the object."
         )
-
-        # E: Flow-guided injection
-        blend_prompt = f"A photorealistic room with a {node.description} placed naturally."
-        print(f"  [FLOW] Running flow-guided injection ...")
-        if use_flow:
-            result = run_flow_guided_injection(
-                pipe=pipe, scene=scene, prompt=blend_prompt,
-                obj_collage=collage, sam2_mask=sam2_mask,
-                seed=seed, num_steps=num_steps,
-                guidance=scene_guidance, height=height, width=width,
-            )
-        else:
-            result = run_standard(
-                pipe=pipe, canvas=collage, prompt=blend_prompt,
-                seed=seed, num_steps=num_steps, guidance=scene_guidance,
-                height=height, width=width,
-            )
+        print(f"  [KV] Running K/V-guided insertion  α_K={alpha_k}  α_V={alpha_v} ...")
+        result = run_kv_guided_insertion(
+            pipe=pipe, scene=scene, prompt=insert_prompt,
+            obj_name=node.name,
+            kv_store=kv_store, n_tok=n_tok,
+            seed=seed, num_steps=num_steps,
+            guidance=scene_guidance, height=height, width=width,
+            alpha_k=alpha_k, alpha_v=alpha_v,
+        )
         return result
 
     # ── Remove ────────────────────────────────────────────────────────────
@@ -399,6 +370,10 @@ def parse_args():
                    help="Skip SAM2. Use rectangular bounding-box masks.")
     p.add_argument("--no_flow",       action="store_true",
                    help="Skip flow injection. Use standard pipe(collage) fallback.")
+    p.add_argument("--alpha_k",       type=float, default=0.85,
+                   help="K injection strength (0–1). Higher = more obj appearance in attention routing.")
+    p.add_argument("--alpha_v",       type=float, default=0.50,
+                   help="V injection strength (0–1). Higher = more obj content; keep below 0.6.")
     return p.parse_args()
 
 
@@ -417,7 +392,7 @@ def main():
     print(f"  Objects    : {[e['name'] for e in edits]}")
     print(f"  VLM        : {args.vlm_model or 'none (fallback bbox)'}")
     print(f"  SAM2       : {'disabled' if args.no_sam2 else args.sam2_model}")
-    print(f"  Flow inject: {'disabled (standard pipe)' if args.no_flow else 'enabled (dual-pass ODE)'}")
+    print(f"  Injection  : K/V appearance  α_K={args.alpha_k}  α_V={args.alpha_v}")
     print(f"  Output     : {args.out_dir}")
     print(f"{_SEP}\n")
 
@@ -468,6 +443,8 @@ def main():
         height=args.height, width=args.width,
         out_dir=args.out_dir, device=args.device,
         use_flow=not args.no_flow,
+        alpha_k=args.alpha_k,
+        alpha_v=args.alpha_v,
     )
 
     # ── Save grid ─────────────────────────────────────────────────────────
