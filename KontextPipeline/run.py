@@ -36,12 +36,11 @@ from PIL import Image
 from .loader   import load_kontext_pipeline, load_vlm
 from .utils    import run_standard, save_grid
 from .sketch   import generate_from_sketch, LORA_ID
-from .mask_ops import (_compute_obj_mask, _rect_mask_from_bbox,
-                       _token_zone_from_mask_np)
+from .mask_ops import (_compute_obj_mask, _rect_mask_from_bbox)
 from .depth    import (load_depth_model, estimate_depth,
                        find_floor_bbox, detect_object_on_floor)
-from .heatmap  import run_heatmap_pass, heatmap_to_mask, _vlm_predict_placement
-from .kv_inject import (run_with_collage_kv_injection, _make_bcg_latent_callback,
+from .heatmap  import run_heatmap_pass, _vlm_predict_placement
+from .kv_inject import (run_with_collage_kv_injection,
                         run_with_feature_delta_injection)
 from .collage  import (build_collage_scene, build_removal_collage, _collage_obj_mask)
 
@@ -157,17 +156,23 @@ def run_collage_chain(
             )
 
             # Soft per-token injection weights from DAAM heatmap (already [0,1]).
-            # Binary rotated-rectangle mask is still used for BLD and bbox tracking.
             _heatmap_weights = heatmap.reshape(-1).astype(np.float32)
-            mask_np = heatmap_to_mask(heatmap, height, width)
-            Image.fromarray(mask_np).save(os.path.join(out_dir, f"mask_pred_{name}.png"))
 
-            ys, xs = np.where(mask_np > 127)
-            if len(ys) > 0:
-                bx1, by1, bx2, by2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-            else:
-                bx1, by1 = 0, height // 4
-                bx2, by2 = width, 3 * height // 4
+            # Placement: weighted centroid of heatmap → tight fixed-size bbox.
+            # Avoids the large-bbox problem from using the full heatmap mask region.
+            _hw = heatmap + 1e-8
+            _rr = np.arange(heatmap.shape[0])[:, None]
+            _cc = np.arange(heatmap.shape[1])[None, :]
+            cy_px = int((_hw * _rr).sum() / _hw.sum() / heatmap.shape[0] * height)
+            cx_px = int((_hw * _cc).sum() / _hw.sum() / heatmap.shape[1] * width)
+            box_h = height // 3
+            box_w = width  // 3
+            bx1 = max(0,      cx_px - box_w // 2)
+            by1 = max(0,      cy_px - box_h // 2)
+            bx2 = min(width,  bx1 + box_w)
+            by2 = min(height, by1 + box_h)
+            print(f"    [PLACE] Centroid: ({cx_px}, {cy_px})  "
+                  f"bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
             _placed[name] = (bx1, by1, bx2, by2)
             with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
                 f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
@@ -228,15 +233,13 @@ def run_collage_chain(
         with open(os.path.join(out_dir, f"prompt_{step_tag}.txt"), "w") as f:
             f.write(blend_p)
 
-        pipe_dtype = next(pipe.transformer.parameters()).dtype
-        bcg_cb = _make_bcg_latent_callback(
-            scene=scene, mask_np=mask_np, pipe=pipe,
-            height=height, width=width, device=device, dtype=pipe_dtype,
-        )
+        vae_sf      = getattr(pipe, "vae_scale_factor", 8)
+        n_gen       = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+        # All tokens are candidates; spatial gating is handled by soft heatmap weights.
+        target_zone = np.ones(n_gen, dtype=bool)
+        _tw = _heatmap_weights if action == "insert" else None
 
         if use_kv:
-            target_zone = _token_zone_from_mask_np(mask_np, height, width, pipe)
-            _tw = _heatmap_weights if action == "insert" else None
             if kv_mode == "delta" and action == "insert":
                 next_scene = run_with_feature_delta_injection(
                     pipe=pipe, scene=scene, prompt=blend_p,
@@ -245,7 +248,7 @@ def run_collage_chain(
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
                     obj_strength=obj_strength, cutoff_frac=cutoff_frac,
-                    bcg_callback=bcg_cb, target_weights=_tw,
+                    bcg_callback=None, target_weights=_tw,
                 )
             else:
                 next_scene = run_with_collage_kv_injection(
@@ -254,13 +257,13 @@ def run_collage_chain(
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
                     obj_strength=obj_strength, cutoff_frac=cutoff_frac,
-                    bcg_callback=bcg_cb, target_weights=_tw,
+                    bcg_callback=None, target_weights=_tw,
                 )
         else:
             next_scene = run_standard(
                 pipe=pipe, canvas=collage_scene, prompt=blend_p,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
-                height=height, width=width, bcg_callback=bcg_cb,
+                height=height, width=width,
             )
 
         result_path = os.path.join(out_dir, f"result_{step_tag}.png")
