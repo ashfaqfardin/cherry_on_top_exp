@@ -587,14 +587,50 @@ class _FeatureDeltaInject:
                  obj_strength, n_steps, cutoff_frac,
                  target_weights: Optional[np.ndarray] = None):
         self.n_gen          = n_gen
-        self.feature_delta  = feature_delta          # {layer: (1, n_gen, d)}
-        self.target_zone    = target_zone            # (n_gen,) bool
+        self.feature_delta  = feature_delta
+        self.target_zone    = target_zone
         self.obj_strength   = obj_strength
         self.n_steps        = n_steps
         self.cutoff_frac    = cutoff_frac
-        self.target_weights = target_weights         # (n_gen,) float [0,1] or None
+        self.target_weights = target_weights
         self._layer = 0
         self._step  = 0
+        # Diagnostics: one row per step (averaged across TIER_A layers)
+        # row = [step, delta_norm, hs_norm, ratio, cosine_sim, inj_frac]
+        self._diag: Dict[int, list] = {}   # step → accumulated [delta_norm, hs_norm, cos_sim, n]
+
+    def _record(self, step, d_tgt, hs_tgt):
+        # d_tgt, hs_tgt: (1, n_tgt, d) float tensors on any device
+        with torch.no_grad():
+            d_n  = d_tgt.float().norm(dim=-1).mean().item()
+            h_n  = hs_tgt.float().norm(dim=-1).mean().item()
+            # cosine similarity between delta and hidden state, averaged across target tokens
+            dot  = (d_tgt.float() * hs_tgt.float()).sum(dim=-1)           # (1, n_tgt)
+            cos  = (dot / (d_tgt.float().norm(dim=-1) * hs_tgt.float().norm(dim=-1) + 1e-8)).mean().item()
+        if step not in self._diag:
+            self._diag[step] = [0.0, 0.0, 0.0, 0]
+        row = self._diag[step]
+        row[0] += d_n; row[1] += h_n; row[2] += cos; row[3] += 1
+
+    def print_diag(self):
+        if not self._diag:
+            return
+        print(f"\n    [FDelta] Injection diagnostics  (obj_strength={self.obj_strength})")
+        print(f"    {'step':>4}  {'δ_norm':>8}  {'h_norm':>8}  {'ratio':>8}  "
+              f"{'cos_sim':>8}  {'inj_frac':>9}")
+        print(f"    {'─'*4}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*9}")
+        for step in sorted(self._diag):
+            dn, hn, cs, n = self._diag[step]
+            dn /= n; hn /= n; cs /= n
+            ratio    = dn / (hn + 1e-8)
+            # inj_frac: what fraction of ||h|| the injection adds
+            # = obj_strength × mean_weight × 1 (d_dir is unit, scale = h_norm)
+            # so inj_frac = obj_strength × mean_weight  — but we can also compute
+            # actual ||injection|| / ||h|| for the peak-weight token (w=1):
+            inj_frac = self.obj_strength  # at w=1.0 (peak heatmap token)
+            print(f"    {step:>4}  {dn:>8.3f}  {hn:>8.3f}  {ratio:>8.3f}  "
+                  f"{cs:>8.3f}  {inj_frac:>9.3f}")
+        print()
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, image_rotary_emb=None):
@@ -606,9 +642,7 @@ class _FeatureDeltaInject:
 
         if is_double and lo <= self._step < hi and self._layer in self.feature_delta:
             delta = self.feature_delta[self._layer].to(hidden_states.device, hidden_states.dtype)
-            # delta: (1, n_gen, d) — from reference token positions of obj-on-grey pass
 
-            # Per-token injection weights
             if self.target_weights is not None:
                 w = torch.from_numpy(self.target_weights).to(hidden_states.device, hidden_states.dtype)
             else:
@@ -619,13 +653,14 @@ class _FeatureDeltaInject:
             if tgt_idx.numel() > 0 and delta.shape[1] >= self.n_gen:
                 hidden_states = hidden_states.clone()
 
-                # Adaptive scale: normalise delta direction, match current hidden-state norm.
-                # This decouples the 1-step capture noise level from the generation noise level.
-                d_tgt = delta[:, tgt_idx, :]                          # (1, n_tgt, d)
-                d_dir = d_tgt / (d_tgt.norm(dim=-1, keepdim=True) + 1e-8)
-                hs_scale = hidden_states[:, tgt_idx, :].norm(dim=-1, keepdim=True).detach()
+                d_tgt    = delta[:, tgt_idx, :]                        # (1, n_tgt, d)
+                hs_tgt   = hidden_states[:, tgt_idx, :].detach()
+                d_dir    = d_tgt / (d_tgt.norm(dim=-1, keepdim=True) + 1e-8)
+                hs_scale = hs_tgt.norm(dim=-1, keepdim=True)
 
-                w_tgt = w[tgt_idx].view(1, -1, 1)                     # (1, n_tgt, 1)
+                self._record(self._step, d_tgt, hs_tgt)
+
+                w_tgt = w[tgt_idx].view(1, -1, 1)
                 hidden_states[:, tgt_idx, :] = (
                     hidden_states[:, tgt_idx, :] +
                     self.obj_strength * w_tgt * hs_scale * d_dir
@@ -771,4 +806,5 @@ def run_with_feature_delta_injection(
     ).images[0]
 
     pipe.transformer.set_attn_processor(orig_procs)
+    inject.print_diag()
     return result
