@@ -16,11 +16,12 @@ from PIL import Image
 
 
 _PROMPT_TMPL = (
-    "Analyze this room scene and output the best natural placement coordinates "
-    "for a {description}. Consider the room layout, floor area, and existing objects. "
-    'Output ONLY valid JSON with exactly these keys: {{"ymin": 0.0, "xmin": 0.0, "ymax": 1.0, "xmax": 1.0}}. '
-    "Coordinates are normalized [0, 1] where (0,0) is top-left. "
-    "The bounding box should cover where the object would sit naturally."
+    "Look at this room image. Where would a {description} be placed naturally on the floor? "
+    "Give a small, tight bounding box (NOT the full image). "
+    "The box should be at most 40% of the image width and 40% of the image height. "
+    "Focus on the visible floor area. "
+    'Output ONLY valid JSON: {{"xmin": float, "ymin": float, "xmax": float, "ymax": float}} '
+    "where 0.0=top-left, 1.0=bottom-right. No explanation."
 )
 
 
@@ -79,16 +80,22 @@ class VLMGrounder:
                 for k in ("xmin", "ymin", "xmax", "ymax"):
                     bbox[k] = max(0.0, min(1.0, bbox[k]))
                 if bbox["xmax"] <= bbox["xmin"]:
-                    bbox["xmax"] = min(1.0, bbox["xmin"] + 0.4)
+                    bbox["xmax"] = min(1.0, bbox["xmin"] + 0.35)
                 if bbox["ymax"] <= bbox["ymin"]:
-                    bbox["ymax"] = min(1.0, bbox["ymin"] + 0.4)
-                print(f"    [GND] Parsed bbox: {bbox}")
-                return bbox
+                    bbox["ymax"] = min(1.0, bbox["ymin"] + 0.35)
+                # Reject degenerate full-image bbox (model not grounding properly)
+                area = (bbox["xmax"] - bbox["xmin"]) * (bbox["ymax"] - bbox["ymin"])
+                if area > 0.50:
+                    print(f"    [GND] Rejected degenerate bbox (area={area:.2f} > 0.50) → fallback")
+                else:
+                    print(f"    [GND] Parsed bbox: {bbox}  area={area:.2f}")
+                    return bbox
             except (json.JSONDecodeError, KeyError, ValueError) as e:
                 print(f"    [GND] JSON parse failed: {e}")
 
-        print(f"    [GND] Fallback: lower-centre region")
-        return {"xmin": 0.25, "ymin": 0.55, "xmax": 0.75, "ymax": 0.90}
+        # Floor-centre: lower-middle third — a safe default for most room objects
+        print(f"    [GND] Fallback: floor-centre region")
+        return {"xmin": 0.30, "ymin": 0.58, "xmax": 0.70, "ymax": 0.88}
 
     def to_pixels(self, bbox: dict, width: int, height: int) -> Tuple[int, int, int, int]:
         """Convert normalized bbox → integer pixel coords (x1, y1, x2, y2)."""

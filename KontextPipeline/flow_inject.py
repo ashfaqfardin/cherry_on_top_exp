@@ -78,6 +78,42 @@ def _encode_image(pipe, img: Image.Image, height: int, width: int, dtype: torch.
     return (z - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
 
 
+# ── Scheduler mu helper ───────────────────────────────────────────────────────
+
+def _compute_scheduler_mu(pipe, n_tok: int):
+    """
+    Compute the dynamic-shifting mu for FlowMatchEulerDiscreteScheduler.
+    FLUX Kontext uses use_dynamic_shifting=True, which requires mu at set_timesteps.
+    mu is a linear interpolation of token count between base and max sequence lengths.
+    Returns None if the scheduler doesn't need it (safe to call set_timesteps without mu).
+    """
+    sched = pipe.scheduler
+    if not getattr(sched.config, "use_dynamic_shifting", False):
+        return None
+
+    # Try diffusers' own helper first
+    try:
+        from diffusers.pipelines.flux.pipeline_flux import calculate_shift
+        return calculate_shift(
+            n_tok,
+            sched.config.base_image_seq_len,
+            sched.config.max_image_seq_len,
+            sched.config.base_shift,
+            sched.config.max_shift,
+        )
+    except (ImportError, AttributeError):
+        pass
+
+    # Fallback: replicate the linear formula directly
+    base_seq   = getattr(sched.config, "base_image_seq_len", 256)
+    max_seq    = getattr(sched.config, "max_image_seq_len",  4096)
+    base_shift = getattr(sched.config, "base_shift",         0.5)
+    max_shift  = getattr(sched.config, "max_shift",          1.16)
+    m  = (max_shift - base_shift) / (max_seq - base_seq)
+    b  = base_shift - m * base_seq
+    return n_tok * m + b
+
+
 # ── Dual-pass flow-guided injection ──────────────────────────────────────────
 
 @torch.no_grad()
@@ -165,7 +201,13 @@ def run_flow_guided_injection(
     guidance_t = torch.tensor([guidance], device=device, dtype=dtype)
 
     # ── 6. Scheduler ──────────────────────────────────────────────────────
-    pipe.scheduler.set_timesteps(num_steps, device=device)
+    # FlowMatchEulerDiscreteScheduler with use_dynamic_shifting=True requires mu.
+    # mu is a linear function of token count (same formula diffusers uses internally).
+    mu = _compute_scheduler_mu(pipe, n_tok)
+    if mu is not None:
+        pipe.scheduler.set_timesteps(num_steps, device=device, mu=mu)
+    else:
+        pipe.scheduler.set_timesteps(num_steps, device=device)
 
     # ── 7. Dual-pass denoising loop ────────────────────────────────────────
     for i, t in enumerate(pipe.scheduler.timesteps):
