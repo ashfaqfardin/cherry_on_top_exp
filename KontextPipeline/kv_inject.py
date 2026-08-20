@@ -553,9 +553,15 @@ class _FeatureDeltaCapture:
             q = torch.cat([eq,q],dim=2); k = torch.cat([ek,k],dim=2); v = torch.cat([ev,v],dim=2)
         if image_rotary_emb is not None:
             q = apply_rotary_emb(q,image_rotary_emb); k = apply_rotary_emb(k,image_rotary_emb)
-        # hidden_states = image tokens only in double-stream (text is encoder_hidden_states)
-        if is_double and self._layer in _TIER_A:
-            self.features[self._layer] = hidden_states.detach().cpu()
+        if self._layer in _TIER_A:
+            if is_double:
+                ref_lo, ref_hi = self.n_gen, 2 * self.n_gen
+            else:
+                # single-stream: hidden_states = [txt(512) | gen | ref]
+                ref_lo = _SINGLE_TXT_LEN + self.n_gen
+                ref_hi = _SINGLE_TXT_LEN + 2 * self.n_gen
+            if hidden_states.shape[1] >= ref_hi:
+                self.features[self._layer] = hidden_states[:, ref_lo:ref_hi, :].detach().cpu()
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         out = out.transpose(1,2).reshape(B,-1,attn.heads*hd).to(q.dtype)
         if is_double:
@@ -642,7 +648,7 @@ class _FeatureDeltaInject:
         lo = int(self.cutoff_frac[0] * self.n_steps)
         hi = int(self.cutoff_frac[1] * self.n_steps)
 
-        if is_double and lo <= self._step < hi and self._layer in self.feature_delta:
+        if lo <= self._step < hi and self._layer in self.feature_delta:
             delta = self.feature_delta[self._layer].to(hidden_states.device, hidden_states.dtype)
 
             if self.target_weights is not None:
@@ -652,11 +658,15 @@ class _FeatureDeltaInject:
                     hidden_states.device, hidden_states.dtype)
 
             tgt_idx = torch.from_numpy(np.where(self.target_zone)[0]).to(hidden_states.device)
+            # gen tokens start at 0 in double-stream, at _SINGLE_TXT_LEN in single-stream
+            gen_offset  = 0 if is_double else _SINGLE_TXT_LEN
+            abs_tgt_idx = tgt_idx + gen_offset
+
             if tgt_idx.numel() > 0 and delta.shape[1] >= self.n_gen:
                 hidden_states = hidden_states.clone()
 
                 d_tgt    = delta[:, tgt_idx, :]                        # (1, n_tgt, d)
-                hs_tgt   = hidden_states[:, tgt_idx, :].detach()
+                hs_tgt   = hidden_states[:, abs_tgt_idx, :].detach()
                 d_dir    = d_tgt / (d_tgt.norm(dim=-1, keepdim=True) + 1e-8)
                 hs_scale = hs_tgt.norm(dim=-1, keepdim=True)
 
@@ -671,8 +681,8 @@ class _FeatureDeltaInject:
                 step_scale   = (1.0 - t) ** 0.6
 
                 w_tgt = w[tgt_idx].view(1, -1, 1)
-                hidden_states[:, tgt_idx, :] = (
-                    hidden_states[:, tgt_idx, :] +
+                hidden_states[:, abs_tgt_idx, :] = (
+                    hidden_states[:, abs_tgt_idx, :] +
                     self.obj_strength * step_scale * w_tgt * hs_scale * d_dir
                 )
 
@@ -773,18 +783,8 @@ def run_with_feature_delta_injection(
     for layer in cap_null.features:
         if layer not in cap_obj.features:
             continue
-        f_null = cap_null.features[layer]   # (1, n_img, d)
-        f_obj  = cap_obj.features[layer]
-        n_img  = f_null.shape[1]
-        if n_img >= 2 * n_gen:
-            # Kontext: image tokens = [gen | ref], ref is second half
-            f_null_ref = f_null[:, n_gen : 2 * n_gen, :]
-            f_obj_ref  = f_obj[:,  n_gen : 2 * n_gen, :]
-        else:
-            # Single-image pass (fallback): use all tokens
-            f_null_ref = f_null
-            f_obj_ref  = f_obj
-        feature_delta[layer] = f_obj_ref - f_null_ref   # (1, n_gen, d)
+        # Both are pre-sliced to ref tokens (shape 1×n_gen×d) for both stream types
+        feature_delta[layer] = cap_obj.features[layer] - cap_null.features[layer]
 
     print(f"    [FDelta] Delta captured at {len(feature_delta)}/{len(_TIER_A)} TIER_A layers")
     if feature_delta:
