@@ -617,19 +617,21 @@ class _FeatureDeltaInject:
             return
         print(f"\n    [FDelta] Injection diagnostics  (obj_strength={self.obj_strength})")
         print(f"    {'step':>4}  {'δ_norm':>8}  {'h_norm':>8}  {'ratio':>8}  "
-              f"{'cos_sim':>8}  {'inj_frac':>9}")
+              f"{'cos_sim':>8}  {'eff_str':>9}")
         print(f"    {'─'*4}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*9}")
+        lo = int(self.cutoff_frac[0] * self.n_steps)
+        hi = int(self.cutoff_frac[1] * self.n_steps)
+        cutoff_step = hi - lo
         for step in sorted(self._diag):
             dn, hn, cs, n = self._diag[step]
             dn /= n; hn /= n; cs /= n
-            ratio    = dn / (hn + 1e-8)
-            # inj_frac: what fraction of ||h|| the injection adds
-            # = obj_strength × mean_weight × 1 (d_dir is unit, scale = h_norm)
-            # so inj_frac = obj_strength × mean_weight  — but we can also compute
-            # actual ||injection|| / ||h|| for the peak-weight token (w=1):
-            inj_frac = self.obj_strength  # at w=1.0 (peak heatmap token)
+            ratio       = dn / (hn + 1e-8)
+            step_in_win = max(0, step - lo)
+            t           = step_in_win / max(1, cutoff_step)
+            step_scale  = (1.0 - t) ** 0.6
+            eff_str     = self.obj_strength * step_scale  # at peak w=1.0
             print(f"    {step:>4}  {dn:>8.3f}  {hn:>8.3f}  {ratio:>8.3f}  "
-                  f"{cs:>8.3f}  {inj_frac:>9.3f}")
+                  f"{cs:>8.3f}  {eff_str:>9.3f}")
         print()
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
@@ -660,10 +662,18 @@ class _FeatureDeltaInject:
 
                 self._record(self._step, d_tgt, hs_tgt)
 
+                # Cosine-guided step decay: full strength early (structure formation),
+                # tapering as the model self-aligns with the delta direction.
+                # Exponent 0.6 keeps strength high for first ~30% of steps then falls fast.
+                cutoff_step  = hi - lo
+                step_in_win  = max(0, self._step - lo)
+                t            = step_in_win / max(1, cutoff_step)
+                step_scale   = (1.0 - t) ** 0.6
+
                 w_tgt = w[tgt_idx].view(1, -1, 1)
                 hidden_states[:, tgt_idx, :] = (
                     hidden_states[:, tgt_idx, :] +
-                    self.obj_strength * w_tgt * hs_scale * d_dir
+                    self.obj_strength * step_scale * w_tgt * hs_scale * d_dir
                 )
 
         q = attn.to_q(hidden_states); k = attn.to_k(hidden_states); v = attn.to_v(hidden_states)
