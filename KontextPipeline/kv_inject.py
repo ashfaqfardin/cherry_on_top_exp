@@ -355,16 +355,16 @@ def run_kv_guided_insertion(
     obj_token_indices = _find_obj_token_indices(pipe, prompt, obj_name)
     print(f"  [DAAM] Object '{obj_name}' → T5 token indices: {obj_token_indices}")
 
-    # Phase 1: DAAM accumulator + injector (global mask = all tokens)
+    # Phase 1: DAAM-only (no injection) — let the model place the object freely
     daam     = _DAAMAccumulator(n_tok, n_heads, d_head)
     injector = _KVInject(kv_store, n_tok, alpha_k, alpha_v)
 
     daam.register(pipe)
-    injector.register(pipe)
+    # injector NOT registered yet — Phase 1 is observation only
     try:
         for i, t in enumerate(pipe.scheduler.timesteps):
 
-            # Phase transition: build spatial mask from DAAM
+            # Phase transition: build mask, remove DAAM hooks, start injection
             if i == warm_steps:
                 mask = daam.compute_mask(obj_token_indices, top_frac)
                 daam.remove()
@@ -372,9 +372,10 @@ def run_kv_guided_insertion(
                     injector.token_mask = mask
                     n_obj = int(mask.sum().item())
                     print(f"  [DAAM] Mask locked at step {i}: "
-                          f"{n_obj}/{n_tok} tokens ({n_obj/n_tok*100:.1f}%) marked as object")
+                          f"{n_obj}/{n_tok} tokens ({n_obj/n_tok*100:.1f}%) — starting injection")
                 else:
-                    print(f"  [DAAM] Mask unavailable — continuing global injection")
+                    print(f"  [DAAM] Mask unavailable — skipping injection")
+                injector.register(pipe)
 
             gen_tok  = _pack(latents)
             combined = torch.cat([gen_tok, scene_tok], dim=1)
@@ -391,8 +392,8 @@ def run_kv_guided_insertion(
             latents = pipe.scheduler.step(v_gen, t, latents, return_dict=False)[0]
 
             if (i + 1) % 5 == 0 or i == 0:
-                phase = "global" if i < warm_steps else "localized"
-                print(f"    [KV-{phase}] Step {i+1}/{num_steps}")
+                phase = "DAAM" if i < warm_steps else "KV-inject"
+                print(f"    [{phase}] Step {i+1}/{num_steps}")
 
     finally:
         injector.remove()
