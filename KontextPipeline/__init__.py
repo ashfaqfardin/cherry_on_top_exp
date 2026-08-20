@@ -9,7 +9,8 @@ from .heatmap   import (run_heatmap_pass, heatmap_to_mask)
 from .kv_inject import (_TIER_A, _spatial_align_k_from_obj,
                         run_with_dual_kv_injection, run_with_kv_injection,
                         run_with_collage_kv_injection, _make_bcg_latent_callback,
-                        run_with_feature_delta_injection)
+                        run_with_feature_delta_injection,
+                        capture_scene_kv, run_with_memory_injection)
 from .collage   import (build_collage_scene, build_removal_collage, _collage_obj_mask)
 from .run       import run_collage_chain, EDITS, BASE_PROMPT
 
@@ -25,6 +26,7 @@ __all__ = [
     "run_with_dual_kv_injection", "run_with_kv_injection",
     "run_with_collage_kv_injection", "_make_bcg_latent_callback",
     "run_with_feature_delta_injection",
+    "capture_scene_kv", "run_with_memory_injection",
     "build_collage_scene", "build_removal_collage", "_collage_obj_mask",
     "run_collage_chain", "EDITS", "BASE_PROMPT",
 ]

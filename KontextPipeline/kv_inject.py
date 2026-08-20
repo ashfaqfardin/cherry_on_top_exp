@@ -818,3 +818,304 @@ def run_with_feature_delta_injection(
     pipe.transformer.set_attn_processor(orig_procs)
     inject.print_diag()
     return result
+
+
+# ── Scene K/V memory capture ──────────────────────────────────────────────────
+
+@torch.no_grad()
+def capture_scene_kv(
+    pipe,
+    scene: Image.Image,
+    seed: int,
+    height: int,
+    width: int,
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    1-step forward pass on scene to capture K/V at all TIER_A layers.
+    Stores ref-token K/V (1, H, n_gen, d) — positionally aligned to gen
+    tokens so they can be injected at preserve-zone positions in the next edit.
+    """
+    vae_sf = getattr(pipe, "vae_scale_factor", 8)
+    n_gen  = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
+    orig_procs = pipe.transformer.attn_processors
+    cap = _KVCapture(n_gen=n_gen)
+    pipe.transformer.set_attn_processor(cap)
+    gen = torch.Generator(device=pipe.device).manual_seed(seed)
+    pipe(image=scene, prompt="",
+         num_inference_steps=1, guidance_scale=1.0,
+         height=height, width=width, max_sequence_length=512,
+         generator=gen, output_type="latent")
+    pipe.transformer.set_attn_processor(orig_procs)
+    kv = dict(cap.kv)
+    print(f"    [MEM] Captured K/V at {len(kv)}/{len(_TIER_A)} TIER_A layers")
+    return kv
+
+
+# ── _MemoryKVInject: delta + K/V memory combined processor ───────────────────
+
+class _MemoryKVInject:
+    """
+    Unified injection processor for incremental editing with persistent object memory.
+
+    PRE-PROJECTION (feature delta, double-stream only, cutoff gated):
+      - delta_low  = Gaussian-blur(delta)  → ALL gen tokens (shifts global composition)
+      - delta_high = delta − delta_low     → EDIT tokens weighted by heatmap (local identity)
+
+    POST-PROJECTION (K/V memory, all TIER_A, always active):
+      For each prior object in obj_memory at preserve-zone positions:
+        K_gen[tok] = (1 − α_K) · K_gen + α_K · K_mem   α_K = 0.85 (tight routing)
+        V_gen[tok] = (1 − α_V) · V_gen + α_V · V_mem   α_V = 0.50 (soft content blend)
+    """
+
+    def __init__(
+        self,
+        n_gen: int,
+        h_lat: int,
+        w_lat: int,
+        feature_delta: Dict[int, torch.Tensor],  # {} for removal (no delta)
+        obj_memory: Dict[str, dict],              # {name: {kv, mask_token}}
+        edit_weights: np.ndarray,                 # (n_gen,) float [0,1]
+        obj_strength: float,
+        k_mem_strength: float,
+        v_mem_strength: float,
+        n_steps: int,
+        cutoff_frac: Tuple[float, float],
+        freq_low_str: float = 0.15,
+        freq_kernel: int = 7,
+    ):
+        self.n_gen         = n_gen
+        self.h_lat         = h_lat
+        self.w_lat         = w_lat
+        self.feature_delta = feature_delta
+        self.obj_memory    = obj_memory
+        self.edit_weights  = edit_weights.astype(np.float32)
+        self.obj_strength  = obj_strength
+        self.k_mem_str     = k_mem_strength
+        self.v_mem_str     = v_mem_strength
+        self.n_steps       = n_steps
+        self.cutoff_frac   = cutoff_frac
+        self.freq_low_str  = freq_low_str
+        self.freq_kernel   = freq_kernel
+        self._layer = 0
+        self._step  = 0
+
+    def _freq_decomp(self, delta: torch.Tensor):
+        """Split delta (1, n_gen, d) into low-freq and high-freq spatial components."""
+        d  = delta.shape[-1]
+        x  = delta.reshape(1, self.h_lat, self.w_lat, d).permute(0, 3, 1, 2)  # (1,d,h,w)
+        ks = self.freq_kernel
+        p  = ks // 2
+        x_low  = F.avg_pool2d(F.pad(x, (p, p, p, p), mode='reflect'), kernel_size=ks, stride=1)
+        x_high = x - x_low
+        low  = x_low.permute(0, 2, 3, 1).reshape(1, self.n_gen, d)
+        high = x_high.permute(0, 2, 3, 1).reshape(1, self.n_gen, d)
+        return low, high
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None):
+        is_double = encoder_hidden_states is not None
+        B = hidden_states.shape[0]
+        lo = int(self.cutoff_frac[0] * self.n_steps)
+        hi = int(self.cutoff_frac[1] * self.n_steps)
+
+        # ── Pre-projection: freq-decomposed feature delta ─────────────────────
+        # Double-stream: gen tokens are hidden_states[:, 0:n_gen, :].
+        # Gated by cutoff window — structure forms in the early steps.
+        if (is_double and lo <= self._step < hi
+                and self._layer in self.feature_delta):
+            delta = self.feature_delta[self._layer].to(hidden_states.device, hidden_states.dtype)
+            delta_low, delta_high = self._freq_decomp(delta)
+
+            t          = max(0, self._step - lo) / max(1, hi - lo)
+            step_scale = (1.0 - t) ** 0.6
+
+            hidden_states = hidden_states.clone()
+
+            # Low-freq: bias ALL gen tokens → global composition
+            d_low_dir = delta_low / (delta_low.norm(dim=-1, keepdim=True) + 1e-8)
+            hs_scale  = hidden_states[:, :self.n_gen, :].detach().norm(dim=-1, keepdim=True)
+            hidden_states[:, :self.n_gen, :] = (
+                hidden_states[:, :self.n_gen, :] +
+                self.freq_low_str * step_scale * hs_scale * d_low_dir
+            )
+
+            # High-freq: heatmap-weighted edit tokens → local identity
+            edit_w     = torch.from_numpy(self.edit_weights).to(
+                hidden_states.device, hidden_states.dtype).view(1, -1, 1)
+            d_high_dir = delta_high / (delta_high.norm(dim=-1, keepdim=True) + 1e-8)
+            hs_scale_e = hidden_states[:, :self.n_gen, :].detach().norm(dim=-1, keepdim=True)
+            hidden_states[:, :self.n_gen, :] = (
+                hidden_states[:, :self.n_gen, :] +
+                self.obj_strength * step_scale * edit_w * hs_scale_e * d_high_dir
+            )
+
+        # ── Q/K/V projections ─────────────────────────────────────────────────
+        q = attn.to_q(hidden_states); k = attn.to_k(hidden_states); v = attn.to_v(hidden_states)
+        hd = k.shape[-1] // attn.heads
+        q = q.view(B, -1, attn.heads, hd).transpose(1, 2)
+        k = k.view(B, -1, attn.heads, hd).transpose(1, 2)
+        v = v.view(B, -1, attn.heads, hd).transpose(1, 2)
+        if attn.norm_q is not None: q = attn.norm_q(q)
+        if attn.norm_k is not None: k = attn.norm_k(k)
+        txt_len = 0
+        if is_double:
+            eq = attn.add_q_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            ek = attn.add_k_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            ev = attn.add_v_proj(encoder_hidden_states).view(B,-1,attn.heads,hd).transpose(1,2)
+            if attn.norm_added_q is not None: eq = attn.norm_added_q(eq)
+            if attn.norm_added_k is not None: ek = attn.norm_added_k(ek)
+            txt_len = eq.shape[2]
+            q = torch.cat([eq, q], dim=2)
+            k = torch.cat([ek, k], dim=2)
+            v = torch.cat([ev, v], dim=2)
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb(q, image_rotary_emb)
+            k = apply_rotary_emb(k, image_rotary_emb)
+
+        # ── Post-projection: K/V memory injection (preserve zone) ─────────────
+        # Active at all TIER_A layers, all steps — preservation must be consistent.
+        if self.obj_memory and self._layer in _TIER_A:
+            img_off = txt_len if is_double else _SINGLE_TXT_LEN
+            g_lo, g_hi = img_off, img_off + self.n_gen
+            if k.shape[2] >= g_hi:
+                k_gen = k[:, :, g_lo:g_hi, :].clone()
+                v_gen = v[:, :, g_lo:g_hi, :].clone()
+                modified = False
+                for mem in self.obj_memory.values():
+                    if self._layer not in mem["kv"]:
+                        continue
+                    K_m, V_m = mem["kv"][self._layer]
+                    K_m = K_m.to(k.device, k.dtype)
+                    V_m = V_m.to(v.device, v.dtype)
+                    tok_mask = mem["mask_token"]           # (n_gen,) bool
+                    if tok_mask.any():
+                        tm = torch.from_numpy(tok_mask).to(k.device)
+                        k_gen[:, :, tm, :] = (
+                            (1 - self.k_mem_str) * k_gen[:, :, tm, :] +
+                            self.k_mem_str * K_m[:, :, tm, :]
+                        )
+                        v_gen[:, :, tm, :] = (
+                            (1 - self.v_mem_str) * v_gen[:, :, tm, :] +
+                            self.v_mem_str * V_m[:, :, tm, :]
+                        )
+                        modified = True
+                if modified:
+                    k = k.clone(); v = v.clone()
+                    k[:, :, g_lo:g_hi, :] = k_gen
+                    v[:, :, g_lo:g_hi, :] = v_gen
+
+        # ── Attention ─────────────────────────────────────────────────────────
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, -1, attn.heads * hd).to(q.dtype)
+        if is_double:
+            enc_out = out[:, :encoder_hidden_states.shape[1]]
+            out     = out[:, encoder_hidden_states.shape[1]:]
+            out = attn.to_out[1](attn.to_out[0](out))
+            enc_out = attn.to_add_out(enc_out)
+            self._layer += 1; return out, enc_out
+        self._layer += 1; return out
+
+
+@torch.no_grad()
+def run_with_memory_injection(
+    pipe,
+    scene: Image.Image,
+    prompt: str,
+    edit_weights: np.ndarray,
+    obj_memory: Dict[str, dict],
+    seed: int,
+    num_steps: int,
+    guidance: float,
+    height: int,
+    width: int,
+    obj_collage: Optional[Image.Image] = None,
+    obj_strength: float = 0.35,
+    cutoff_frac: Tuple[float, float] = (0.0, 0.6),
+    freq_low_str: float = 0.15,
+    freq_kernel: int = 7,
+    k_mem_strength: float = 0.85,
+    v_mem_strength: float = 0.50,
+) -> Image.Image:
+    """
+    Unified insert/remove pass with persistent object memory.
+
+    Insert (obj_collage provided):
+      Pass A: pipe(grey)         → F_null at 13 TIER_A layers
+      Pass B: pipe(obj_collage)  → F_obj  at 13 TIER_A layers
+      delta = F_obj − F_null → freq-decomposed → injected into gen hidden_states
+      K/V memory injection for all prior objects at their preserve-zone tokens.
+
+    Remove (obj_collage=None):
+      No delta injection.  scene = Telea-inpainted collage.
+      K/V memory injection keeps remaining objects stable.
+    """
+    vae_sf = getattr(pipe, "vae_scale_factor", 8)
+    h_lat  = height // (vae_sf * 2)
+    w_lat  = width  // (vae_sf * 2)
+    n_gen  = h_lat * w_lat
+    orig_procs = pipe.transformer.attn_processors
+
+    feature_delta: Dict[int, torch.Tensor] = {}
+
+    if obj_collage is not None:
+        grey        = Image.new("RGB", (width, height), (128, 128, 128))
+        null_prompt = "uniform grey surface, no objects"
+
+        cap_null = _FeatureDeltaCapture(n_gen=n_gen)
+        pipe.transformer.set_attn_processor(cap_null)
+        gen_a = torch.Generator(device=pipe.device).manual_seed(seed)
+        pipe(image=grey, prompt=null_prompt,
+             num_inference_steps=1, guidance_scale=1.0,
+             height=height, width=width, max_sequence_length=512,
+             generator=gen_a, output_type="latent")
+
+        cap_obj = _FeatureDeltaCapture(n_gen=n_gen)
+        pipe.transformer.set_attn_processor(cap_obj)
+        gen_b = torch.Generator(device=pipe.device).manual_seed(seed)
+        pipe(image=obj_collage, prompt=null_prompt,
+             num_inference_steps=1, guidance_scale=1.0,
+             height=height, width=width, max_sequence_length=512,
+             generator=gen_b, output_type="latent")
+
+        for layer in cap_null.features:
+            if layer in cap_obj.features:
+                feature_delta[layer] = cap_obj.features[layer] - cap_null.features[layer]
+
+        print(f"    [MEM] Feature delta at {len(feature_delta)}/{len(_TIER_A)} TIER_A layers")
+        if feature_delta:
+            sample  = next(iter(feature_delta.values()))
+            d_norms = sample.norm(dim=-1).squeeze()
+            print(f"    [MEM] ||delta|| min={d_norms.min():.3f} "
+                  f"mean={d_norms.mean():.3f} max={d_norms.max():.3f}")
+
+    inject = _MemoryKVInject(
+        n_gen=n_gen, h_lat=h_lat, w_lat=w_lat,
+        feature_delta=feature_delta,
+        obj_memory=obj_memory,
+        edit_weights=edit_weights if edit_weights is not None
+                     else np.ones(n_gen, dtype=np.float32),
+        obj_strength=obj_strength,
+        k_mem_strength=k_mem_strength,
+        v_mem_strength=v_mem_strength,
+        n_steps=num_steps,
+        cutoff_frac=cutoff_frac,
+        freq_low_str=freq_low_str,
+        freq_kernel=freq_kernel,
+    )
+    pipe.transformer.set_attn_processor(inject)
+
+    def _step_cb(pr, si, ts, ck):
+        inject._step = si + 1; inject._layer = 0
+        return ck
+
+    gen_main = torch.Generator(device=pipe.device).manual_seed(seed)
+    result = pipe(
+        image=scene, prompt=prompt,
+        num_inference_steps=num_steps, guidance_scale=guidance,
+        height=height, width=width, max_sequence_length=512,
+        generator=gen_main, output_type="pil",
+        callback_on_step_end=_step_cb,
+        callback_on_step_end_tensor_inputs=[],
+    ).images[0]
+    pipe.transformer.set_attn_processor(orig_procs)
+    return result

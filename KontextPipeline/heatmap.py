@@ -50,12 +50,15 @@ class _HeatmapCapture:
     """
     DAAM-style attention heatmap capture.
 
-    Computes raw Q_gen · K_text[obj_indices] / √d at each TIER_A double-stream
-    layer and accumulates the per-gen-token score across all content-word tokens.
+    Accumulates Q_gen · K_text[obj_indices] / √d only from the second half of
+    denoising steps. Early steps have near-random Q/K (high noise) whose scores
+    average to zero across the spatial grid, producing a uniform blue JET image.
+    The second half is where spatial structure forms and the signal localises.
     """
-    def __init__(self, n_gen: int, obj_token_indices: List[int]):
+    def __init__(self, n_gen: int, obj_token_indices: List[int], n_steps: int):
         self.n_gen             = n_gen
         self.obj_token_indices = obj_token_indices
+        self.n_steps           = n_steps
         self._layer = 0; self._step = 0
         self.heatmap: Optional[np.ndarray] = None
         self._count  = 0
@@ -82,7 +85,8 @@ class _HeatmapCapture:
             q = torch.cat([eq,q],dim=2); k = torch.cat([ek,k],dim=2); v = torch.cat([ev,v],dim=2)
         if image_rotary_emb is not None:
             q = apply_rotary_emb(q,image_rotary_emb); k = apply_rotary_emb(k,image_rotary_emb)
-        if is_double and self._layer in _TIER_A:
+        # Only accumulate from second half — spatial structure is forming there.
+        if is_double and self._step >= self.n_steps // 2 and self._layer in _TIER_A:
             g_lo = txt_len; g_hi = txt_len + self.n_gen
             if q.shape[2] >= g_hi:
                 scale = hd ** -0.5
@@ -180,7 +184,7 @@ def _vlm_predict_placement(
 def run_heatmap_pass(
     pipe, scene: Image.Image, prompt: str, description: str,
     seed: int, height: int, width: int,
-    n_steps: int = 6,
+    n_steps: int = 20,
     occupied_mask: Optional[np.ndarray] = None,
     anchor: Optional[str] = None,
 ) -> np.ndarray:
@@ -205,7 +209,7 @@ def run_heatmap_pass(
     orig_procs        = pipe.transformer.attn_processors
     obj_token_indices = _find_desc_token_indices(pipe, hm_prompt, description)
 
-    cap = _HeatmapCapture(n_gen=n_gen, obj_token_indices=obj_token_indices)
+    cap = _HeatmapCapture(n_gen=n_gen, obj_token_indices=obj_token_indices, n_steps=n_steps)
     pipe.transformer.set_attn_processor(cap)
 
     def _step_cb(pr, si, ts, ck):

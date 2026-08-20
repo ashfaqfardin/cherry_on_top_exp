@@ -3,17 +3,18 @@ run.py — incremental object insertion / removal pipeline entry point.
 
 Flow per insert:
   Stage A    : sketch → LoRA FLUX → obj_img
-  Stage DEPTH: estimate_depth(scene) → find_floor_bbox → mask_np
-  Stage HEAT : DAAM heatmap pass → soft token weights
+  Stage DEPTH: estimate_depth(scene) → occupancy map
+  Stage HEAT : DAAM heatmap (n_steps=20, second-half-only) → largest-blob centroid
   Stage COL  : build_collage_scene → canvas
-  Stage K    : run_with_collage_kv_injection (+ BLD latent callback)
-  Stage BCG  : pixel-wise object mask tracked from result diff
+  Stage K    : run_with_memory_injection
+                 - null-ref feature delta (freq-decomposed)
+                 - K/V memory injection for prior objects (α_K=0.85, α_V=0.50)
+  Stage MEM  : capture_scene_kv → store in object_memory
 
 Flow per remove:
-  Stage DEPTH: reuse tracked insertion bbox or detect_object_on_floor
   Stage COL  : build_removal_collage (Telea inpaint)
-  Stage K    : run_with_collage_kv_injection (+ BLD latent callback)
-  Stage BCG  : pixel-space background restore (removal only)
+  Stage K    : run_with_memory_injection (no delta, memory injection only)
+  Stage BCG  : pixel-space background restore
 """
 
 from __future__ import annotations
@@ -41,7 +42,8 @@ from .depth    import (load_depth_model, estimate_depth,
                        find_floor_bbox, detect_object_on_floor)
 from .heatmap  import run_heatmap_pass, _vlm_predict_placement
 from .kv_inject import (run_with_collage_kv_injection,
-                        run_with_feature_delta_injection)
+                        run_with_memory_injection,
+                        capture_scene_kv)
 from .collage  import (build_collage_scene, build_removal_collage, _collage_obj_mask)
 
 
@@ -82,18 +84,25 @@ def run_collage_chain(
     out_dir:        str,
     device:         str,
     use_kv:         bool  = True,
-    kv_mode:        str   = "collage",   # "collage" | "delta"
-    obj_strength:   float = 0.5,
-    bg_strength:    float = 0.8,
+    obj_strength:   float = 0.35,
     cutoff_frac:    Tuple[float, float] = (0.0, 0.6),
-    heatmap_steps:  int   = 6,
+    heatmap_steps:  int   = 20,
+    k_mem_strength: float = 0.85,
+    v_mem_strength: float = 0.50,
+    freq_low_str:   float = 0.15,
     vlm_model                          = None,
     vlm_processor                      = None,
 ) -> List[Image.Image]:
-    results  = [base]
-    scene    = base
-    _placed:           Dict[str, Tuple[int, int, int, int]] = {}
-    per_object_masks:  Dict[str, np.ndarray]                = {}
+    results       = [base]
+    scene         = base
+    _placed:       Dict[str, Tuple[int, int, int, int]] = {}
+    per_object_masks: Dict[str, np.ndarray] = {}    # pixel-diff masks (H,W) uint8
+    object_memory:    Dict[str, dict]       = {}    # {name: {kv, mask_token}}
+
+    vae_sf = getattr(pipe, "vae_scale_factor", 8)
+    h_lat  = height // (vae_sf * 2)
+    w_lat  = width  // (vae_sf * 2)
+    n_gen  = h_lat * w_lat
 
     for i, edit in enumerate(edits):
         name   = edit["name"]
@@ -158,21 +167,34 @@ def run_collage_chain(
             # Soft per-token injection weights from DAAM heatmap (already [0,1]).
             _heatmap_weights = heatmap.reshape(-1).astype(np.float32)
 
-            # Placement: weighted centroid of heatmap → tight fixed-size bbox.
-            # Avoids the large-bbox problem from using the full heatmap mask region.
-            _hw = heatmap + 1e-8
-            _rr = np.arange(heatmap.shape[0])[:, None]
-            _cc = np.arange(heatmap.shape[1])[None, :]
-            cy_px = int((_hw * _rr).sum() / _hw.sum() / heatmap.shape[0] * height)
-            cx_px = int((_hw * _cc).sum() / _hw.sum() / heatmap.shape[1] * width)
+            # Placement: largest-blob centroid.
+            # Global weighted centroid merges multiple peaks (e.g. floor + window for
+            # bicycle), landing between them. Largest connected blob is the dominant
+            # semantic region — floor area beats the smaller window reflection.
+            _hm_t = (heatmap >= np.percentile(heatmap, 70)).astype(np.uint8)
+            _n, _lbl, _stats, _ctr = cv2.connectedComponentsWithStats(_hm_t)
+            if _n > 1:
+                _largest = 1 + int(np.argmax(_stats[1:, cv2.CC_STAT_AREA]))
+                cx_lat   = float(_ctr[_largest][0])   # col in latent space
+                cy_lat   = float(_ctr[_largest][1])   # row in latent space
+                cx_px    = int(cx_lat / heatmap.shape[1] * width)
+                cy_px    = int(cy_lat / heatmap.shape[0] * height)
+                print(f"    [PLACE] Largest blob ({_n-1} total) centroid: ({cx_px}, {cy_px}) px")
+            else:
+                _hw   = heatmap + 1e-8
+                cy_px = int((_hw * np.arange(heatmap.shape[0])[:,None]).sum()
+                            / _hw.sum() / heatmap.shape[0] * height)
+                cx_px = int((_hw * np.arange(heatmap.shape[1])[None,:]).sum()
+                            / _hw.sum() / heatmap.shape[1] * width)
+                print(f"    [PLACE] Weighted centroid fallback: ({cx_px}, {cy_px}) px")
+
             box_h = height // 3
             box_w = width  // 3
             bx1 = max(0,      cx_px - box_w // 2)
             by1 = max(0,      cy_px - box_h // 2)
             bx2 = min(width,  bx1 + box_w)
             by2 = min(height, by1 + box_h)
-            print(f"    [PLACE] Centroid: ({cx_px}, {cy_px})  "
-                  f"bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
+            print(f"    [PLACE] bbox: x=[{bx1},{bx2}] y=[{by1},{by2}]")
             _placed[name] = (bx1, by1, bx2, by2)
             with open(os.path.join(out_dir, f"bbox_{name}_{action}.txt"), "w") as f:
                 f.write(f"bbox: x1={bx1} y1={by1} x2={bx2} y2={by2}\n")
@@ -189,7 +211,6 @@ def run_collage_chain(
                 target_bbox=(bx1, by1, bx2, by2), collage_mode="full",
             )
             collage_scene.save(os.path.join(out_dir, f"collage_{name}.png"))
-            obj_mask_har = _collage_obj_mask(collage_scene, scene)
 
         else:  # remove
             if name in _placed:
@@ -217,7 +238,6 @@ def run_collage_chain(
             )
             collage_scene.save(os.path.join(out_dir, f"collage_remove_{name}.png"))
 
-            obj_mask_har = (mask_np > 127).astype(np.uint8)
             blend_p = (
                 f"{BASE_PROMPT} "
                 f"The {desc} has been removed. "
@@ -226,42 +246,52 @@ def run_collage_chain(
             )
             _placed.pop(name, None)
             per_object_masks.pop(name, None)
+            object_memory.pop(name, None)
 
-        # Stage K: Kontext integration
+        # ── Stage K: Kontext integration ─────────────────────────────────────
         step_tag = f"{'remove' if action == 'remove' else 'step'}{i+1}_{name}"
-        print(f"  [K] Kontext integration pass  kv={use_kv} mode={kv_mode}  action={action} ...")
+        print(f"  [K] Kontext integration pass  use_kv={use_kv}  action={action} ...")
         with open(os.path.join(out_dir, f"prompt_{step_tag}.txt"), "w") as f:
             f.write(blend_p)
 
-        vae_sf      = getattr(pipe, "vae_scale_factor", 8)
-        n_gen       = (height // (vae_sf * 2)) * (width // (vae_sf * 2))
-        # All tokens are candidates; spatial gating is handled by soft heatmap weights.
-        target_zone = np.ones(n_gen, dtype=bool)
-        _tw = _heatmap_weights if action == "insert" else None
-
         if use_kv:
-            if kv_mode == "delta" and action == "insert":
-                next_scene = run_with_feature_delta_injection(
-                    pipe=pipe, scene=scene, prompt=blend_p,
-                    obj_collage=collage_scene,
-                    target_zone=target_zone,
+            # Objects already in memory (exclude the object currently being inserted)
+            preserve_memory = {k: v for k, v in object_memory.items() if k != name} \
+                              if action == "insert" else dict(object_memory)
+
+            if action == "insert":
+                next_scene = run_with_memory_injection(
+                    pipe=pipe,
+                    scene=scene,                # current scene as Kontext reference
+                    prompt=blend_p,
+                    edit_weights=_heatmap_weights,
+                    obj_memory=preserve_memory,
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
-                    obj_strength=obj_strength, cutoff_frac=cutoff_frac,
-                    bcg_callback=None, target_weights=_tw,
+                    obj_collage=collage_scene,  # used for null-ref delta
+                    obj_strength=obj_strength,
+                    cutoff_frac=cutoff_frac,
+                    freq_low_str=freq_low_str,
+                    k_mem_strength=k_mem_strength,
+                    v_mem_strength=v_mem_strength,
                 )
             else:
-                next_scene = run_with_collage_kv_injection(
-                    pipe=pipe, canvas=collage_scene, prompt=blend_p,
-                    target_zone=target_zone,
+                next_scene = run_with_memory_injection(
+                    pipe=pipe,
+                    scene=collage_scene,        # Telea-inpainted scene
+                    prompt=blend_p,
+                    edit_weights=np.ones(n_gen, dtype=np.float32),
+                    obj_memory=preserve_memory,
                     seed=seed, num_steps=num_steps, guidance=scene_guidance,
                     height=height, width=width,
-                    obj_strength=obj_strength, cutoff_frac=cutoff_frac,
-                    bcg_callback=None, target_weights=_tw,
+                    obj_collage=None,           # no delta for removal
+                    k_mem_strength=k_mem_strength,
+                    v_mem_strength=v_mem_strength,
                 )
         else:
+            canvas = scene if action == "insert" else collage_scene
             next_scene = run_standard(
-                pipe=pipe, canvas=collage_scene, prompt=blend_p,
+                pipe=pipe, canvas=canvas, prompt=blend_p,
                 seed=seed, num_steps=num_steps, guidance=scene_guidance,
                 height=height, width=width,
             )
@@ -270,29 +300,35 @@ def run_collage_chain(
         next_scene.save(result_path)
         print(f"      Saved: {result_path}")
 
+        # ── Track pixel-diff mask + build K/V memory (insert only) ───────────
         if action == "insert":
-            _r   = np.array(next_scene.convert("RGB"), dtype=np.int32)
-            _s   = np.array(scene.convert("RGB"),      dtype=np.int32)
+            _r    = np.array(next_scene.convert("RGB"), dtype=np.int32)
+            _s    = np.array(scene.convert("RGB"),      dtype=np.int32)
             _diff = np.abs(_r - _s).max(axis=2)
-            _px  = (_diff > 15).astype(np.uint8)
-            _px  = cv2.morphologyEx(_px, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-            _px  = cv2.morphologyEx(_px, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+            _px   = (_diff > 15).astype(np.uint8)
+            _px   = cv2.morphologyEx(_px, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            _px   = cv2.morphologyEx(_px, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
             per_object_masks[name] = _px
             print(f"    [MASK] '{name}' pixel mask: {int(_px.sum())} px "
                   f"({_px.mean()*100:.1f}% of frame)")
 
-        _COLORS = [(0, 220, 0), (0, 80, 255), (255, 60, 0),
-                   (255, 200, 0), (0, 220, 220), (200, 0, 255)]
-        _overlay = np.array(next_scene.convert("RGB"), dtype=np.float32)
-        for _ci, (_nm, _m) in enumerate(per_object_masks.items()):
-            _c = np.array(_COLORS[_ci % len(_COLORS)], dtype=np.float32)
-            _overlay[_m > 0] = 0.45 * _overlay[_m > 0] + 0.55 * _c
-        Image.fromarray(np.clip(_overlay, 0, 255).astype(np.uint8)).save(
-            os.path.join(out_dir, f"masks_overlay_{step_tag}.png")
-        )
+            # Convert pixel mask → latent token mask for K/V memory
+            _tok_img  = Image.fromarray((_px * 255).astype(np.uint8)).resize(
+                (w_lat, h_lat), Image.NEAREST)
+            tok_mask  = (np.array(_tok_img) > 127).reshape(-1)  # (n_gen,) bool
 
+            print(f"  [MEM] Capturing K/V from '{name}' result ...")
+            scene_kv = capture_scene_kv(pipe, next_scene, seed, height, width)
+            object_memory[name] = {"kv": scene_kv, "mask_token": tok_mask}
+            print(f"    [MEM] '{name}' stored: {int(tok_mask.sum())}/{n_gen} tokens")
+
+        # ── Background restore (removal only) ─────────────────────────────────
         if action == "remove":
             print(f"  [BCG] Background restore (removal) ...")
+            obj_mask_har = (_rect_mask_from_bbox(bx1, by1, bx2, by2, height, width) > 127
+                            ).astype(np.uint8) if name not in per_object_masks \
+                           else (per_object_masks.get(name, np.zeros((height, width), dtype=np.uint8)) > 0
+                                ).astype(np.uint8)
             bcg_mask  = cv2.dilate(obj_mask_har, np.ones((21, 21), np.uint8), iterations=3)
             bcg_mask  = cv2.GaussianBlur(bcg_mask.astype(np.float32), (41, 41), 15)
             result_np = np.array(next_scene.convert("RGB"), dtype=np.float32)
@@ -319,32 +355,34 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="AnyDoor collage + FLUX Kontext — mask-free via depth + DAAM heatmap."
     )
-    p.add_argument("--sketch_dir",    required=True)
-    p.add_argument("--hf_token",      required=True)
-    p.add_argument("--cache_dir",     default="./models")
-    p.add_argument("--out_dir",       default="results/kontext_pipeline")
+    p.add_argument("--sketch_dir",      required=True)
+    p.add_argument("--hf_token",        required=True)
+    p.add_argument("--cache_dir",       default="./models")
+    p.add_argument("--out_dir",         default="results/kontext_pipeline")
     p.add_argument("--depth_model",
                    default="depth-anything/Depth-Anything-V2-Small-hf")
-    p.add_argument("--config",        default=None,
+    p.add_argument("--config",          default=None,
                    help="JSON list of {name, description, action}. Overrides built-in EDITS.")
-    p.add_argument("--lora_id",       default=LORA_ID)
-    p.add_argument("--lora_guidance", type=float, default=4.0)
-    p.add_argument("--guidance",      type=float, default=2.5)
-    p.add_argument("--heatmap_steps", type=int,   default=6)
-    p.add_argument("--kv_injection",  action="store_true")
-    p.add_argument("--kv_mode",       default="collage", choices=["collage", "delta"],
-                   help="collage: K/V injection from collage reference (default). "
-                        "delta: null-referenced feature-delta injection into residual stream.")
-    p.add_argument("--obj_strength",  type=float, default=0.5)
-    p.add_argument("--bg_strength",   type=float, default=0.8)
-    p.add_argument("--cutoff_frac",   default="0.0,0.6")
-    p.add_argument("--seed",          type=int,   default=42)
-    p.add_argument("--num_steps",     type=int,   default=28)
-    p.add_argument("--height",        type=int,   default=1024)
-    p.add_argument("--width",         type=int,   default=1024)
-    p.add_argument("--device",        default="cuda")
-    p.add_argument("--vlm_model",     default=None)
-    p.add_argument("--vlm_device",    default="cpu")
+    p.add_argument("--lora_id",         default=LORA_ID)
+    p.add_argument("--lora_guidance",   type=float, default=4.0)
+    p.add_argument("--guidance",        type=float, default=2.5)
+    p.add_argument("--heatmap_steps",   type=int,   default=20)
+    p.add_argument("--kv_injection",    action="store_true")
+    p.add_argument("--obj_strength",    type=float, default=0.35)
+    p.add_argument("--cutoff_frac",     default="0.0,0.6")
+    p.add_argument("--k_mem_strength",  type=float, default=0.85,
+                   help="α_K: K injection weight for preserved objects. High = tight routing.")
+    p.add_argument("--v_mem_strength",  type=float, default=0.50,
+                   help="α_V: V injection weight for preserved objects. Lower = soft content blend.")
+    p.add_argument("--freq_low_str",    type=float, default=0.15,
+                   help="Low-freq delta strength (global composition shift, all tokens).")
+    p.add_argument("--seed",            type=int,   default=42)
+    p.add_argument("--num_steps",       type=int,   default=28)
+    p.add_argument("--height",          type=int,   default=1024)
+    p.add_argument("--width",           type=int,   default=1024)
+    p.add_argument("--device",          default="cuda")
+    p.add_argument("--vlm_model",       default=None)
+    p.add_argument("--vlm_device",      default="cpu")
     return p.parse_args()
 
 
@@ -365,8 +403,10 @@ def main():
     print(f"  Depth model  : {args.depth_model}")
     print(f"  VLM model    : {args.vlm_model or 'none (description tokens only)'}")
     print(f"  KV injection : {args.kv_injection}"
-          + (f"  mode={args.kv_mode}  obj={args.obj_strength}  bg={args.bg_strength}"
+          + (f"  obj={args.obj_strength}  k_mem={args.k_mem_strength}"
+             f"  v_mem={args.v_mem_strength}  freq_low={args.freq_low_str}"
              f"  cutoff={args.cutoff_frac}" if args.kv_injection else ""))
+    print(f"  Heatmap steps: {args.heatmap_steps} (second-half accumulation)")
     print(f"  Guidance     : {args.guidance}")
     print(f"  Output       : {args.out_dir}")
     print(f"{_SEP}\n")
@@ -410,11 +450,12 @@ def main():
         height=args.height, width=args.width,
         out_dir=args.out_dir, device=args.device,
         use_kv=args.kv_injection,
-        kv_mode=args.kv_mode,
         obj_strength=args.obj_strength,
-        bg_strength=args.bg_strength,
         cutoff_frac=cutoff_frac,
         heatmap_steps=args.heatmap_steps,
+        k_mem_strength=args.k_mem_strength,
+        v_mem_strength=args.v_mem_strength,
+        freq_low_str=args.freq_low_str,
         vlm_model=vlm_model,
         vlm_processor=vlm_processor,
     )
