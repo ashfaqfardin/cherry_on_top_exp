@@ -1,32 +1,42 @@
-from .loader    import load_kontext_pipeline, load_vlm
-from .utils     import run_standard, save_grid
-from .sketch    import generate_from_sketch, LORA_ID, LORA_TRIGGER
-from .mask_ops  import (_compute_obj_mask, _neutralize_white_bg, _obj_token_mask,
-                        _rect_mask_from_bbox, _token_zone_from_mask_np)
-from .depth     import (load_depth_model, estimate_depth,
-                        find_floor_bbox, detect_object_on_floor)
-from .heatmap   import (run_heatmap_pass, heatmap_to_mask)
-from .kv_inject import (_TIER_A, _spatial_align_k_from_obj,
-                        run_with_dual_kv_injection, run_with_kv_injection,
-                        run_with_collage_kv_injection, _make_bcg_latent_callback,
-                        run_with_feature_delta_injection,
-                        capture_scene_kv, run_with_memory_injection)
-from .collage   import (build_collage_scene, build_removal_collage, _collage_obj_mask)
-from .run       import run_collage_chain, EDITS, BASE_PROMPT
+"""
+KontextPipeline V2 — DAG-based sketch editing with Flow-Guided Trajectory Injection.
+
+Public API
+----------
+  from KontextPipeline.loader       import load_kontext_pipeline, load_vlm, load_sam2
+  from KontextPipeline.grounding    import VLMGrounder
+  from KontextPipeline.segmentation import SAM2Segmenter
+  from KontextPipeline.collage      import paste_object, build_removal_reference
+  from KontextPipeline.flow_inject  import run_flow_guided_injection, run_flow_removal
+  from KontextPipeline.sketch       import generate_from_sketch
+  from KontextPipeline.utils        import run_standard, save_grid
+  from KontextPipeline.orchestrator import EditNode, EditGraph, build_graph, EDITS, main
+"""
+
+from .loader        import load_kontext_pipeline, load_vlm, load_sam2
+from .grounding     import VLMGrounder
+from .segmentation  import SAM2Segmenter
+from .collage       import paste_object, build_removal_reference
+from .flow_inject   import run_flow_guided_injection, run_flow_removal
+from .sketch        import generate_from_sketch
+from .utils         import run_standard, save_grid
+from .orchestrator  import EditNode, EditGraph, build_graph, EDITS
 
 __all__ = [
-    "load_kontext_pipeline", "load_vlm",
+    # Loaders
+    "load_kontext_pipeline", "load_vlm", "load_sam2",
+    # VLM grounding
+    "VLMGrounder",
+    # SAM2 segmentation
+    "SAM2Segmenter",
+    # Image compositing
+    "paste_object", "build_removal_reference",
+    # Flow-guided ODE injection
+    "run_flow_guided_injection", "run_flow_removal",
+    # Sketch → object generation
+    "generate_from_sketch",
+    # Utilities
     "run_standard", "save_grid",
-    "generate_from_sketch", "LORA_ID", "LORA_TRIGGER",
-    "_compute_obj_mask", "_neutralize_white_bg", "_obj_token_mask",
-    "_rect_mask_from_bbox", "_token_zone_from_mask_np",
-    "load_depth_model", "estimate_depth", "find_floor_bbox", "detect_object_on_floor",
-    "run_heatmap_pass", "heatmap_to_mask",
-    "_TIER_A", "_spatial_align_k_from_obj",
-    "run_with_dual_kv_injection", "run_with_kv_injection",
-    "run_with_collage_kv_injection", "_make_bcg_latent_callback",
-    "run_with_feature_delta_injection",
-    "capture_scene_kv", "run_with_memory_injection",
-    "build_collage_scene", "build_removal_collage", "_collage_obj_mask",
-    "run_collage_chain", "EDITS", "BASE_PROMPT",
+    # DAG orchestrator
+    "EditNode", "EditGraph", "build_graph", "EDITS",
 ]

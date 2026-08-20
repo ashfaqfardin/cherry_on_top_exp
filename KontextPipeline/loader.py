@@ -4,6 +4,24 @@ import torch
 from diffusers import FluxKontextPipeline
 
 
+def load_sam2(
+    model_id: str = "facebook/sam2-hiera-small",
+    cache_dir: str = "./models",
+    device: str = "cuda",
+):
+    """Load SAM2 image predictor for zero-shot segmentation."""
+    try:
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        predictor = SAM2ImagePredictor.from_pretrained(model_id, cache_dir=cache_dir)
+        predictor.model.to(device)
+        print(f"  SAM2 loaded: {model_id}")
+        return predictor
+    except ImportError:
+        raise ImportError(
+            "SAM2 not installed. Run: pip install 'git+https://github.com/facebookresearch/sam2.git'"
+        )
+
+
 def load_kontext_pipeline(
     model_path: str = "black-forest-labs/FLUX.1-Kontext-dev",
     hf_token: str | None = None,
