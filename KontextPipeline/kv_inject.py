@@ -313,7 +313,7 @@ def run_kv_guided_insertion(
     width:      int,
     alpha_k:    float = 0.85,
     alpha_v:    float = 0.50,
-    warm_steps: int   = 7,
+    warm_steps: int   = 18,
     top_frac:   float = 0.25,
 ) -> Image.Image:
     """
