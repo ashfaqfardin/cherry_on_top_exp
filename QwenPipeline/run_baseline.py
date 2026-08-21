@@ -128,9 +128,7 @@ def main():
         args.model_id, torch_dtype=torch.bfloat16
     )
     pipe.to(args.device)
-    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipe.scheduler.config, use_dynamic_shifting=False
-    )
+    _patch_scheduler(pipe)
     pipe.set_progress_bar_config(disable=None)
     print("Pipeline loaded.\n")
 
