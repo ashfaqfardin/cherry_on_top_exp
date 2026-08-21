@@ -27,6 +27,7 @@ Modes:
 
 import gc
 import json
+import math
 import os
 import re
 import argparse
@@ -81,14 +82,24 @@ def load_object_images(obj_paths: dict, cell: int) -> dict:
 
 # ── Stitching ─────────────────────────────────────────────────────────────────
 
-def stitch(images: list, cell: int) -> Image.Image:
-    """Horizontal strip: each object gets a cell×cell slot."""
-    if not images:
-        return Image.new("RGB", (cell, cell), (200, 200, 200))
-    strip = Image.new("RGB", (cell * len(images), cell), (255, 255, 255))
+def stitch(images: list, canvas_size: int = 1024) -> Image.Image:
+    """
+    Square grid, always canvas_size × canvas_size.
+    Objects fill left-to-right, top-to-bottom. Empty cells are white.
+
+    N≤4 → 2×2 grid (512×512 per cell)
+    N≤9 → 3×3 grid (341×341 per cell)
+    """
+    n = len(images)
+    if n == 0:
+        return Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
+    grid = max(2, math.ceil(math.sqrt(n)))
+    cell = canvas_size // grid
+    canvas = Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
     for i, img in enumerate(images):
-        strip.paste(img.resize((cell, cell), Image.LANCZOS), (i * cell, 0))
-    return strip
+        row, col = divmod(i, grid)
+        canvas.paste(img.resize((cell, cell), Image.LANCZOS), (col * cell, row * cell))
+    return canvas
 
 
 # ── Prompt building ───────────────────────────────────────────────────────────
@@ -251,7 +262,7 @@ def run_batch(pipe, base: Image.Image, obj_images: dict,
 
     for name in obj_images:
         accumulated.append(name)
-        stitched = stitch([obj_images[n] for n in accumulated], args.cell_size)
+        stitched = stitch([obj_images[n] for n in accumulated], args.width)
         prompt = build_prompt(accumulated, descriptions)
         print(f"\n[ADD] {name}  →  scene: {accumulated}")
         scene = generate_scene(pipe, base, stitched, prompt, args)
@@ -308,7 +319,7 @@ def run_interactive(pipe, base: Image.Image, obj_images: dict,
             base.save(os.path.join(args.out_dir, f"step{step:02d}_empty.png"))
             print(f"  Scene is empty.")
         else:
-            stitched = stitch([obj_images[n] for n in accumulated], args.cell_size)
+            stitched = stitch([obj_images[n] for n in accumulated], args.width)
             prompt   = build_prompt(accumulated, descriptions)
             scene    = generate_scene(pipe, base, stitched, prompt, args)
             save_scene(scene, accumulated, args.out_dir, step, stitched)

@@ -22,6 +22,7 @@ Add / Remove are symmetric — both cost the same 12 steps.
 
 import gc
 import json
+import math
 import os
 import re
 import argparse
@@ -467,13 +468,24 @@ def run_edit(
 # Scene helpers  (shared with run_graph.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def stitch(images: List[Image.Image], cell: int) -> Image.Image:
-    if not images:
-        return Image.new("RGB", (cell, cell), (200, 200, 200))
-    strip = Image.new("RGB", (cell * len(images), cell), (255, 255, 255))
+def stitch(images: List[Image.Image], canvas_size: int = 1024) -> Image.Image:
+    """
+    Square grid, always canvas_size × canvas_size.
+    Objects fill left-to-right, top-to-bottom. Empty cells are white.
+
+    N≤4 → 2×2 grid (512×512 per cell)
+    N≤9 → 3×3 grid (341×341 per cell)
+    """
+    n = len(images)
+    if n == 0:
+        return Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
+    grid = max(2, math.ceil(math.sqrt(n)))
+    cell = canvas_size // grid
+    canvas = Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
     for i, img in enumerate(images):
-        strip.paste(img.resize((cell, cell), Image.LANCZOS), (i * cell, 0))
-    return strip
+        row, col = divmod(i, grid)
+        canvas.paste(img.resize((cell, cell), Image.LANCZOS), (col * cell, row * cell))
+    return canvas
 
 
 def build_prompt(accumulated: List[str], descriptions: Dict[str, str]) -> str:
@@ -611,7 +623,7 @@ def run_batch(pipe, kv_bank, latent_cache, base, obj_images, descriptions, args)
     step = 0
     for name in obj_images:
         accumulated.append(name)
-        stitched = stitch([obj_images[n] for n in accumulated], args.cell_size)
+        stitched = stitch([obj_images[n] for n in accumulated], args.width)
         prompt   = build_prompt(accumulated, descriptions)
         print(f"\n[ADD] {name}  →  scene: {accumulated}")
         scene = run_edit(pipe, kv_bank, latent_cache, base, stitched,
@@ -663,7 +675,7 @@ def run_interactive(pipe, kv_bank, latent_cache, base, obj_images,
             base.save(os.path.join(args.out_dir, f"step{step:02d}_empty.png"))
             print("  Scene is empty (base room).")
         else:
-            stitched = stitch([obj_images[n] for n in accumulated], args.cell_size)
+            stitched = stitch([obj_images[n] for n in accumulated], args.width)
             prompt   = build_prompt(accumulated, descriptions)
             scene    = run_edit(pipe, kv_bank, latent_cache, base, stitched,
                                 prompt, accumulated, args)
