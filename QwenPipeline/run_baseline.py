@@ -12,7 +12,7 @@ EDITS = [
     {"name": "vase",    "description": "black ceramic vase with flowers"},
     {"name": "ball",    "description": "yellow rubber ball"},
     {"name": "chair",   "description": "wooden chair"},
-    {"name": "lamp",    "description": "modern floor lamp"},
+    {"name": "lamp",    "description": "modern lamp"},
     {"name": "plant",   "description": "potted green plant"},
     {"name": "backpack", "description": "blue backpack"}
 ]
@@ -112,7 +112,7 @@ def parse_args():
     p.add_argument("--seed",          type=int,   default=0)
     p.add_argument("--num_steps",     type=int,   default=40)
     p.add_argument("--true_cfg_scale",type=float, default=4.0)
-    p.add_argument("--guidance_scale",type=float, default=1.0)
+    p.add_argument("--guidance_scale",type=float, default=None) # To fix guidance scale warning, set to None to use default value from the model
     p.add_argument("--height",        type=int,   default=1024)
     p.add_argument("--width",         type=int,   default=1024)
     p.add_argument("--device",        default="cuda")
