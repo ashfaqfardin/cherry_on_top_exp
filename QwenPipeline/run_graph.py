@@ -33,7 +33,7 @@ import re
 import argparse
 import torch
 from PIL import Image
-from diffusers import QwenImageEditPlusPipeline
+from diffusers import QwenImageEditPlusPipeline, FlowMatchEulerDiscreteScheduler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -377,7 +377,9 @@ def main():
         args.model_id, torch_dtype=torch.bfloat16
     )
     pipe.enable_model_cpu_offload()
-    pipe.scheduler.config.use_dynamic_shifting = False
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipe.scheduler.config, use_dynamic_shifting=False
+    )
     pipe.set_progress_bar_config(disable=None)
     print("Pipeline ready.\n")
 
